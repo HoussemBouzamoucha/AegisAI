@@ -1,0 +1,31 @@
+# ---------- Build Stage ----------
+FROM rust:1.93 AS builder
+
+WORKDIR /app
+
+# Copy Cargo.toml and Cargo.lock
+COPY Cargo.toml Cargo.lock ./
+
+# Pre-build dependencies (cache layer)
+RUN cargo build --release || true
+
+# Copy Rust source code
+COPY src ./src
+
+# Build release binary
+RUN cargo build --release
+
+# ---------- Runtime Stage ----------
+FROM debian:bullseye-slim
+
+# Optional: create a user for security
+RUN useradd -m rustuser
+USER rustuser
+
+WORKDIR /app
+
+# Copy compiled binary from build stage
+COPY --from=builder /app/target/release/aegisai_rust_binary .
+
+# Default command
+CMD ["./aegisai_rust_binary"]

@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  rust_engine:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile_rust
+    container_name: aegisai-rust_engine
+
+  python_ai_gui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile_python
+    container_name: aegisai-python_ai_gui
+    ports:
+      - "5000:5000"  # if Python GUI is a web app

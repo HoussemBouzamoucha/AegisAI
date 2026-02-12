@@ -1,0 +1,1 @@
+"Sync" in yara rules is a reserved word, needs some treatment to fix
