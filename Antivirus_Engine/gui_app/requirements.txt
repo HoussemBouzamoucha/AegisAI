@@ -1,0 +1,5 @@
+# AegisAI Antivirus GUI - Requirements
+# Python 3.8+
+
+customtkinter==5.2.1
+pillow>=10.3.0
