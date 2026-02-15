@@ -1,238 +1,293 @@
-use crate::core::types::{ScanResult, ThreatLevel};
-use crate::core::utils::compute_sha256;
-use crate::core::file_system::heuristics::run_heuristics;
-use crate::core::file_system::signature::SignatureDatabase;
-use anyhow::Result;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use walkdir::WalkDir;
+// File: src/core/file_system/scanner.rs
+// Multi-Hash Dynamic Scanner with YARA Integration
 
-/// Statistics collected during a scan
-#[derive(Debug, Clone, Default)]
+use crate::core::file_system::signature::SignatureDatabase;
+use crate::core::file_system::heuristics::HeuristicAnalyzer;
+use crate::core::types::{ScanResult, ThreatLevel};
+use std::path::Path;
+use anyhow::Result;
+use sha2::{Sha256, Sha512, Digest};
+use hex;
+
+/// File hash information with multiple algorithms
+#[derive(Debug, Clone)]
+pub struct FileHashes {
+    pub md5: String,
+    pub sha256: String,
+    pub sha512: String,
+}
+
+/// Scanning statistics
+#[derive(Debug, Clone)]
 pub struct ScanStatistics {
     pub total_files: usize,
     pub clean_files: usize,
     pub suspicious_files: usize,
     pub malicious_files: usize,
-    pub errors: usize,
-    pub total_bytes_scanned: u64,
+    pub error_files: usize,
+    pub total_size_scanned: u64,
 }
 
 impl ScanStatistics {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            total_files: 0,
+            clean_files: 0,
+            suspicious_files: 0,
+            malicious_files: 0,
+            error_files: 0,
+            total_size_scanned: 0,
+        }
     }
-
-    pub fn update(&mut self, result: &ScanResult) {
+    
+    pub fn update(&mut self, result: &ScanResult, file_size: u64) {
         self.total_files += 1;
+        self.total_size_scanned += file_size;
         
         match result.level {
             ThreatLevel::Clean => self.clean_files += 1,
             ThreatLevel::Suspicious => self.suspicious_files += 1,
             ThreatLevel::Malicious => self.malicious_files += 1,
-            ThreatLevel::Error => self.errors += 1,
         }
     }
+    
+    pub fn add_error(&mut self) {
+        self.error_files += 1;
+    }
+}
 
-    pub fn threat_count(&self) -> usize {
-        self.suspicious_files + self.malicious_files
+impl Default for ScanStatistics {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 pub struct FileSystemScanner {
     signatures: SignatureDatabase,
-    stats: Arc<Mutex<ScanStatistics>>,
-    max_file_size: Option<u64>, // Optional limit for scanning large files
+    heuristics: HeuristicAnalyzer,
+    enable_multi_hash: bool,
+    enable_deep_scan: bool,
 }
 
 impl FileSystemScanner {
-    /// Create a new scanner with default settings
     pub fn new() -> Self {
-        FileSystemScanner {
+        Self::with_options(true, true)
+    }
+    
+    pub fn with_options(enable_multi_hash: bool, enable_deep_scan: bool) -> Self {
+        Self {
             signatures: SignatureDatabase::new(),
-            stats: Arc::new(Mutex::new(ScanStatistics::new())),
-            max_file_size: Some(100 * 1024 * 1024), // 100 MB default limit
+            heuristics: HeuristicAnalyzer::new(),
+            enable_multi_hash,
+            enable_deep_scan,
         }
     }
 
-    /// Create a scanner with custom signature database
-    pub fn with_signatures(signatures: SignatureDatabase) -> Self {
-        FileSystemScanner {
-            signatures,
-            stats: Arc::new(Mutex::new(ScanStatistics::new())),
-            max_file_size: Some(100 * 1024 * 1024),
-        }
-    }
-
-    /// Set maximum file size for scanning (in bytes)
-    /// Files larger than this will be skipped with a warning
-    pub fn set_max_file_size(&mut self, size: Option<u64>) {
-        self.max_file_size = size;
-    }
-
-    /// Get current scan statistics
-    pub fn get_statistics(&self) -> ScanStatistics {
-        self.stats.lock().unwrap().clone()
-    }
-
-    /// Reset scan statistics
-    pub fn reset_statistics(&self) {
-        *self.stats.lock().unwrap() = ScanStatistics::new();
-    }
-
-    /// Scan a single file (does not scan directories)
+    /// Main file scanning entry point with comprehensive analysis
     pub fn scan_file(&self, path: &Path) -> Result<ScanResult> {
-        if !path.is_file() {
-            let result = ScanResult::clean(path.to_path_buf());
-            self.update_stats(&result);
-            return Ok(result);
+        // 0. Get file metadata
+        let _metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                return Ok(ScanResult {
+                    path: path.to_path_buf(),
+                    level: ThreatLevel::Clean,
+                    reason: format!("Cannot access file: {}", e),
+                    hash: None,
+                    signature: None,
+                });
+            }
+        };
+        
+        // 1. Calculate file hashes (multi-algorithm support)
+        let hashes = if self.enable_multi_hash {
+            self.calculate_all_hashes(path)?
+        } else {
+            FileHashes {
+                md5: String::new(),
+                sha256: self.calculate_sha256(path)?,
+                sha512: String::new(),
+            }
+        };
+
+        // 2. Check signature database (all hash types)
+        if let Some(signature) = self.check_all_hashes(&hashes) {
+            return Ok(ScanResult {
+                path: path.to_path_buf(),
+                level: ThreatLevel::Malicious,
+                reason: format!("Known malware signature: {}", signature),
+                hash: Some(hashes.sha256.clone()),
+                signature: Some(signature.to_string()),
+            });
         }
 
-        // Check file size limit
-        if let Some(max_size) = self.max_file_size {
-            if let Ok(metadata) = path.metadata() {
-                if metadata.len() > max_size {
-                    let result = ScanResult::error(
-                        path.to_path_buf(),
-                        format!(
-                            "File too large to scan ({} bytes, limit: {} bytes)",
-                            metadata.len(),
-                            max_size
-                        ),
-                    );
-                    self.update_stats(&result);
-                    return Ok(result);
+        // 3. DYNAMIC HEURISTIC ANALYSIS (Behavioral patterns)
+        if self.enable_deep_scan {
+            match self.heuristics.analyze(path) {
+                Ok(heuristic_result) => {
+                    if heuristic_result.level != ThreatLevel::Clean {
+                        return Ok(ScanResult {
+                            path: path.to_path_buf(),
+                            level: heuristic_result.level,
+                            reason: heuristic_result.reason,
+                            hash: Some(hashes.sha256),
+                            signature: heuristic_result.signature,
+                        });
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Heuristic analysis error for {}: {}", path.display(), e);
                 }
             }
         }
 
-        // 1. Compute hash
-        let hash = match compute_sha256(path) {
-            Ok(h) => h,
-            Err(e) => {
-                let result = ScanResult::error(
-                    path.to_path_buf(),
-                    format!("Failed to compute hash: {}", e),
-                );
-                self.update_stats(&result);
-                return Ok(result);
+        // 4. File is clean
+        Ok(ScanResult {
+            path: path.to_path_buf(),
+            level: ThreatLevel::Clean,
+            reason: "No threats detected (multi-layer scan)".to_string(),
+            hash: Some(hashes.sha256),
+            signature: None,
+        })
+    }
+    
+    /// Calculate all hash types for comprehensive detection
+    fn calculate_all_hashes(&self, path: &Path) -> Result<FileHashes> {
+        let data = std::fs::read(path)?;
+        
+        // MD5 hash
+        let md5 = format!("{:x}", md5::compute(&data));
+        
+        // SHA-256 hash
+        let mut sha256_hasher = Sha256::new();
+        sha256_hasher.update(&data);
+        let sha256 = hex::encode(sha256_hasher.finalize());
+        
+        // SHA-512 hash
+        let mut sha512_hasher = Sha512::new();
+        sha512_hasher.update(&data);
+        let sha512 = hex::encode(sha512_hasher.finalize());
+        
+        Ok(FileHashes {
+            md5,
+            sha256,
+            sha512,
+        })
+    }
+    
+    /// Calculate SHA-256 hash only (faster for basic checks)
+    fn calculate_sha256(&self, path: &Path) -> Result<String> {
+        let data = std::fs::read(path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        Ok(hex::encode(hasher.finalize()))
+    }
+    
+    /// Check all hash types against signature database
+    fn check_all_hashes(&self, hashes: &FileHashes) -> Option<&str> {
+        // Check SHA-256 first (most common)
+        if let Some(sig) = self.signatures.check_hash(&hashes.sha256) {
+            return Some(sig);
+        }
+        
+        // Check MD5
+        if !hashes.md5.is_empty() {
+            if let Some(sig) = self.signatures.check_hash(&hashes.md5) {
+                return Some(sig);
             }
-        };
-
-        // 2. Check known signatures
-        if let Some(malware) = self.signatures.check_hash(&hash) {
-            let result = ScanResult::malicious(
-                path.to_path_buf(),
-                format!("Known hash signature: {}", malware),
-                Some(malware.to_string()),
-            );
-            self.update_stats(&result);
-            return Ok(result);
         }
-
-        // 3. Run file-specific heuristics
-        let heuristic_result = run_heuristics(path);
-        if heuristic_result.level != ThreatLevel::Clean {
-            self.update_stats(&heuristic_result);
-            return Ok(heuristic_result);
+        
+        // Check SHA-512
+        if !hashes.sha512.is_empty() {
+            if let Some(sig) = self.signatures.check_hash(&hashes.sha512) {
+                return Some(sig);
+            }
         }
-
-        // 4. Clean file
-        let mut result = ScanResult::clean(path.to_path_buf());
-        result.hash = Some(hash);
-        self.update_stats(&result);
-        Ok(result)
+        
+        None
     }
 
-    /// Scan a directory (recursive or non-recursive)
-    pub fn scan_directory(
+    /// Scan directory with statistics tracking
+    pub fn scan_directory_with_stats(
         &self,
         dir: &Path,
         recursive: bool,
-    ) -> impl Iterator<Item = Result<ScanResult>> + '_ {
-        let dir_path = dir.to_path_buf(); // Clone the path to avoid lifetime issues
+    ) -> (Vec<ScanResult>, ScanStatistics) {
+        let mut results = Vec::new();
+        let mut stats = ScanStatistics::new();
         
+        for result in self.scan_directory(dir, recursive) {
+            match result {
+                Ok(scan_result) => {
+                    let file_size = std::fs::metadata(&scan_result.path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    
+                    stats.update(&scan_result, file_size);
+                    results.push(scan_result);
+                }
+                Err(e) => {
+                    stats.add_error();
+                    eprintln!("Scan error: {}", e);
+                }
+            }
+        }
+        
+        (results, stats)
+    }
+
+    pub fn scan_directory<'a>(
+        &'a self,
+        dir: &Path,
+        recursive: bool,
+    ) -> impl Iterator<Item = Result<ScanResult>> + 'a {
+        use walkdir::WalkDir;
+
         let walker = if recursive {
-            WalkDir::new(dir).follow_links(false)
+            WalkDir::new(dir)
         } else {
-            WalkDir::new(dir).max_depth(1).follow_links(false)
+            WalkDir::new(dir).max_depth(1)
         };
 
-        walker
-            .into_iter()
-            .filter_map(move |entry| {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(e) => {
-                        // Create error result for failed directory entry
-                        let path = e.path()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_else(|| dir_path.clone());
-                        let result = ScanResult::error(
-                            path,
-                            format!("Failed to read directory entry: {}", e),
-                        );
-                        return Some(Ok(result));
-                    }
-                };
+        let dir_path = dir.to_path_buf();
 
-                if !entry.file_type().is_file() {
-                    return None;
+        walker.into_iter().filter_map(move |entry| {
+            match entry {
+                Ok(e) if e.file_type().is_file() => {
+                    Some(self.scan_file(e.path()))
                 }
-
-                Some(self.scan_file(entry.path()))
-            })
-    }
-
-    /// Scan multiple paths (can be files or directories)
-    pub fn scan_paths(
-        &self,
-        paths: &[PathBuf],
-        recursive: bool,
-    ) -> Vec<Result<ScanResult>> {
-        let mut results = Vec::new();
-
-        for path in paths {
-            if path.is_file() {
-                results.push(self.scan_file(path));
-            } else if path.is_dir() {
-                results.extend(self.scan_directory(path, recursive));
-            } else {
-                results.push(Ok(ScanResult::error(
-                    path.clone(),
-                    "Path does not exist or is not accessible".to_string(),
-                )));
+                Ok(_) => None,
+                Err(e) => Some(Ok(ScanResult {
+                    path: e.path()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| dir_path.clone()),
+                    level: ThreatLevel::Clean,
+                    reason: format!("Directory scan error: {}", e),
+                    hash: None,
+                    signature: None,
+                })),
             }
-        }
-
-        results
+        })
     }
-
-    /// Add a signature to the database
-    pub fn add_signature(&mut self, hash: String, malware_name: String) {
-        self.signatures.add_signature(hash, malware_name);
+    
+    /// Get file hashes for a specific file
+    pub fn get_file_hashes(&self, path: &Path) -> Result<FileHashes> {
+        self.calculate_all_hashes(path)
     }
-
-    /// Load signatures from a file
-    pub fn load_signatures_from_file(&mut self, path: &Path) -> Result<usize> {
-        self.signatures.load_from_file(path)
+    
+    /// Enable or disable deep scanning
+    pub fn set_deep_scan(&mut self, enabled: bool) {
+        self.enable_deep_scan = enabled;
     }
-
-    /// Save signatures to a file
-    pub fn save_signatures_to_file(&self, path: &Path) -> Result<()> {
-        self.signatures.save_to_file(path)
+    
+    /// Enable or disable multi-hash calculation
+    pub fn set_multi_hash(&mut self, enabled: bool) {
+        self.enable_multi_hash = enabled;
     }
-
-    /// Helper to update statistics
-    fn update_stats(&self, result: &ScanResult) {
-        if let Ok(mut stats) = self.stats.lock() {
-            stats.update(result);
-            
-            // Update bytes scanned if available
-            if let Ok(metadata) = result.path.metadata() {
-                stats.total_bytes_scanned += metadata.len();
-            }
-        }
+    
+    /// Get signature database for manual updates
+    pub fn get_signatures_mut(&mut self) -> &mut SignatureDatabase {
+        &mut self.signatures
     }
 }
 
@@ -245,62 +300,95 @@ impl Default for FileSystemScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::io::Write;
-
+    use std::fs::File;
+    
     #[test]
-    fn test_scan_clean_file() {
+    fn test_multi_hash_calculation() {
         let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("test_clean.txt");
+        let test_file = temp_dir.join("hash_test.txt");
         
-        let mut file = fs::File::create(&test_file).unwrap();
-        file.write_all(b"This is a clean test file").unwrap();
+        let mut file = File::create(&test_file).unwrap();
+        writeln!(file, "Test content for hashing").unwrap();
         
         let scanner = FileSystemScanner::new();
-        let result = scanner.scan_file(&test_file).unwrap();
+        let hashes = scanner.calculate_all_hashes(&test_file).unwrap();
         
-        assert_eq!(result.level, ThreatLevel::Clean);
-        assert!(result.hash.is_some());
+        assert!(!hashes.md5.is_empty());
+        assert!(!hashes.sha256.is_empty());
+        assert!(!hashes.sha512.is_empty());
+        assert_eq!(hashes.md5.len(), 32);
+        assert_eq!(hashes.sha256.len(), 64);
+        assert_eq!(hashes.sha512.len(), 128);
         
-        fs::remove_file(&test_file).unwrap();
+        std::fs::remove_file(test_file).ok();
     }
-
+    
     #[test]
-    fn test_scan_eicar() {
+    fn test_eicar_detection() {
         let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("eicar.com");
+        let eicar_file = temp_dir.join("eicar.txt");
         
         // EICAR test string
-        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
-        
-        let mut file = fs::File::create(&test_file).unwrap();
-        file.write_all(eicar).unwrap();
+        let eicar = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+        std::fs::write(&eicar_file, eicar).unwrap();
         
         let scanner = FileSystemScanner::new();
-        let result = scanner.scan_file(&test_file).unwrap();
+        let result = scanner.scan_file(&eicar_file).unwrap();
         
+        // Should be detected by hash
         assert_eq!(result.level, ThreatLevel::Malicious);
         
-        fs::remove_file(&test_file).unwrap();
+        std::fs::remove_file(eicar_file).ok();
     }
-
+    
     #[test]
-    fn test_statistics() {
-        let scanner = FileSystemScanner::new();
-        scanner.reset_statistics();
-        
+    fn test_clean_file_scan() {
         let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("stats_test.txt");
+        let clean_file = temp_dir.join("clean.txt");
         
-        let mut file = fs::File::create(&test_file).unwrap();
-        file.write_all(b"test content").unwrap();
+        let mut file = File::create(&clean_file).unwrap();
+        writeln!(file, "This is a completely clean file.").unwrap();
+        writeln!(file, "No malicious content here.").unwrap();
         
-        let _result = scanner.scan_file(&test_file).unwrap();
+        let scanner = FileSystemScanner::new();
+        let result = scanner.scan_file(&clean_file).unwrap();
         
-        let stats = scanner.get_statistics();
-        assert_eq!(stats.total_files, 1);
-        assert!(stats.total_bytes_scanned > 0);
+        assert_eq!(result.level, ThreatLevel::Clean);
         
-        fs::remove_file(&test_file).unwrap();
+        std::fs::remove_file(clean_file).ok();
+    }
+    
+    #[test]
+    fn test_directory_scan_with_stats() {
+        let temp_dir = std::env::temp_dir().join("scan_test");
+        std::fs::create_dir_all(&temp_dir).ok();
+        
+        // Create test files
+        let clean1 = temp_dir.join("clean1.txt");
+        let clean2 = temp_dir.join("clean2.txt");
+        
+        std::fs::write(&clean1, "Clean content 1").unwrap();
+        std::fs::write(&clean2, "Clean content 2").unwrap();
+        
+        let scanner = FileSystemScanner::new();
+        let (results, stats) = scanner.scan_directory_with_stats(&temp_dir, false);
+        
+        assert_eq!(stats.total_files, 2);
+        assert_eq!(stats.clean_files, 2);
+        assert_eq!(results.len(), 2);
+        
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+    
+    #[test]
+    fn test_scanner_options() {
+        let scanner1 = FileSystemScanner::with_options(true, true);
+        assert!(scanner1.enable_multi_hash);
+        assert!(scanner1.enable_deep_scan);
+        
+        let scanner2 = FileSystemScanner::with_options(false, false);
+        assert!(!scanner2.enable_multi_hash);
+        assert!(!scanner2.enable_deep_scan);
     }
 }

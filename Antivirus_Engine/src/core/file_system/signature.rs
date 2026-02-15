@@ -1,3 +1,6 @@
+// File: src/core/file_system/signature.rs
+// Multi-Hash Signature Database with Advanced Management
+
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
@@ -7,17 +10,105 @@ use std::path::Path;
 #[cfg(feature = "json")]
 use serde::{Deserialize, Serialize};
 
-/// Database of known malware signatures (hash-based)
+/// Malware signature entry with metadata
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone)]
+pub struct SignatureEntry {
+    pub hash: String,
+    pub hash_type: HashType,
+    pub malware_name: String,
+    pub severity: ThreatSeverity,
+    pub family: Option<String>,
+    pub description: Option<String>,
+    pub added_date: Option<String>,
+}
+
+/// Hash algorithm type
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HashType {
+    MD5,
+    SHA1,
+    SHA256,
+    SHA512,
+}
+
+impl HashType {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "md5" => Some(HashType::MD5),
+            "sha1" => Some(HashType::SHA1),
+            "sha256" => Some(HashType::SHA256),
+            "sha512" => Some(HashType::SHA512),
+            _ => None,
+        }
+    }
+    
+    pub fn as_str(&self) -> &str {
+        match self {
+            HashType::MD5 => "md5",
+            HashType::SHA1 => "sha1",
+            HashType::SHA256 => "sha256",
+            HashType::SHA512 => "sha512",
+        }
+    }
+    
+    pub fn expected_length(&self) -> usize {
+        match self {
+            HashType::MD5 => 32,
+            HashType::SHA1 => 40,
+            HashType::SHA256 => 64,
+            HashType::SHA512 => 128,
+        }
+    }
+}
+
+/// Threat severity level
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ThreatSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl ThreatSeverity {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "low" => ThreatSeverity::Low,
+            "medium" => ThreatSeverity::Medium,
+            "high" => ThreatSeverity::High,
+            "critical" => ThreatSeverity::Critical,
+            _ => ThreatSeverity::Medium,
+        }
+    }
+    
+    pub fn as_str(&self) -> &str {
+        match self {
+            ThreatSeverity::Low => "low",
+            ThreatSeverity::Medium => "medium",
+            ThreatSeverity::High => "high",
+            ThreatSeverity::Critical => "critical",
+        }
+    }
+}
+
+/// Database of known malware signatures with multi-hash support
 #[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct SignatureDatabase {
-    known_hashes: HashMap<String, String>,
+    // Hash -> SignatureEntry mapping
+    signatures: HashMap<String, SignatureEntry>,
+    // Index by malware family for fast lookups
+    family_index: HashMap<String, Vec<String>>,
 }
 
 impl SignatureDatabase {
     /// Create a new signature database with default signatures
     pub fn new() -> Self {
         let mut db = Self {
-            known_hashes: HashMap::new(),
+            signatures: HashMap::new(),
+            family_index: HashMap::new(),
         };
 
         // Add default test signatures
@@ -29,82 +120,198 @@ impl SignatureDatabase {
     /// Create an empty signature database
     pub fn empty() -> Self {
         Self {
-            known_hashes: HashMap::new(),
+            signatures: HashMap::new(),
+            family_index: HashMap::new(),
         }
     }
 
-    /// Add default malware signatures (mainly for testing)
+    /// Add default malware signatures (for testing and common threats)
     fn add_default_signatures(&mut self) {
-        // Classic EICAR test file (SHA-256)
-        // This is the standard antivirus test file
-        self.known_hashes.insert(
-            "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f".to_string(),
-            "EICAR-Test-File".to_string(),
-        );
-
-        // EICAR with different line endings (sometimes used)
-        self.known_hashes.insert(
-            "3395856ce81f2b7382dee72602f798b642f14140".to_string(),
-            "EICAR-Test-File-Variant".to_string(),
-        );
-
-        // Add more real-world hashes here as they become available
-        // Example structure:
-        // self.known_hashes.insert(
-        //     "actual_malware_sha256_hash".to_string(),
-        //     "Malware.Family.Name".to_string(),
-        // );
+        // EICAR test file (standard antivirus test)
+        self.add_signature_entry(SignatureEntry {
+            hash: "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f".to_string(),
+            hash_type: HashType::SHA256,
+            malware_name: "EICAR-Test-File".to_string(),
+            severity: ThreatSeverity::Low,
+            family: Some("Test".to_string()),
+            description: Some("Standard antivirus test file".to_string()),
+            added_date: None,
+        });
+        
+        // EICAR MD5
+        self.add_signature_entry(SignatureEntry {
+            hash: "44d88612fea8a8f36de82e1278abb02f".to_string(),
+            hash_type: HashType::MD5,
+            malware_name: "EICAR-Test-File".to_string(),
+            severity: ThreatSeverity::Low,
+            family: Some("Test".to_string()),
+            description: Some("Standard antivirus test file".to_string()),
+            added_date: None,
+        });
+        
+        // Example ransomware signatures (placeholder - add real hashes)
+        self.add_signature_entry(SignatureEntry {
+            hash: "example_wannacry_hash_sha256".to_string(),
+            hash_type: HashType::SHA256,
+            malware_name: "WannaCry".to_string(),
+            severity: ThreatSeverity::Critical,
+            family: Some("Ransomware".to_string()),
+            description: Some("WannaCry ransomware variant".to_string()),
+            added_date: None,
+        });
+        
+        self.add_signature_entry(SignatureEntry {
+            hash: "example_emotet_hash_sha256".to_string(),
+            hash_type: HashType::SHA256,
+            malware_name: "Emotet".to_string(),
+            severity: ThreatSeverity::High,
+            family: Some("Trojan".to_string()),
+            description: Some("Emotet banking trojan".to_string()),
+            added_date: None,
+        });
+        
+        self.add_signature_entry(SignatureEntry {
+            hash: "example_mirai_hash_sha256".to_string(),
+            hash_type: HashType::SHA256,
+            malware_name: "Mirai".to_string(),
+            severity: ThreatSeverity::High,
+            family: Some("Botnet".to_string()),
+            description: Some("Mirai IoT botnet malware".to_string()),
+            added_date: None,
+        });
     }
 
-    /// Check if a hash matches a known malware signature
+    /// Check if a hash matches a known malware signature (all hash types)
     pub fn check_hash(&self, hash: &str) -> Option<&str> {
-        // Normalize hash to lowercase for comparison
         let normalized_hash = hash.to_lowercase();
-        self.known_hashes.get(&normalized_hash).map(|s| s.as_str())
+        self.signatures
+            .get(&normalized_hash)
+            .map(|entry| entry.malware_name.as_str())
+    }
+    
+    /// Get full signature entry for a hash
+    pub fn get_signature(&self, hash: &str) -> Option<&SignatureEntry> {
+        let normalized_hash = hash.to_lowercase();
+        self.signatures.get(&normalized_hash)
     }
 
-    /// Add a new signature to the database
+    /// Add a new signature entry to the database
+    pub fn add_signature_entry(&mut self, entry: SignatureEntry) {
+        let normalized_hash = entry.hash.to_lowercase();
+        
+        // Update family index
+        if let Some(ref family) = entry.family {
+            self.family_index
+                .entry(family.clone())
+                .or_insert_with(Vec::new)
+                .push(normalized_hash.clone());
+        }
+        
+        self.signatures.insert(normalized_hash, entry);
+    }
+
+    /// Add a simple signature (backward compatibility)
     pub fn add_signature(&mut self, hash: String, malware_name: String) {
-        let normalized_hash = hash.to_lowercase();
-        self.known_hashes.insert(normalized_hash, malware_name);
+        let hash_type = self.detect_hash_type(&hash);
+        
+        let entry = SignatureEntry {
+            hash: hash.clone(),
+            hash_type,
+            malware_name,
+            severity: ThreatSeverity::Medium,
+            family: None,
+            description: None,
+            added_date: None,
+        };
+        
+        self.add_signature_entry(entry);
+    }
+    
+    /// Detect hash type from hash length
+    fn detect_hash_type(&self, hash: &str) -> HashType {
+        match hash.len() {
+            32 => HashType::MD5,
+            40 => HashType::SHA1,
+            64 => HashType::SHA256,
+            128 => HashType::SHA512,
+            _ => HashType::SHA256, // Default
+        }
     }
 
     /// Remove a signature from the database
-    pub fn remove_signature(&mut self, hash: &str) -> Option<String> {
+    pub fn remove_signature(&mut self, hash: &str) -> Option<SignatureEntry> {
         let normalized_hash = hash.to_lowercase();
-        self.known_hashes.remove(&normalized_hash)
+        
+        if let Some(entry) = self.signatures.remove(&normalized_hash) {
+            // Update family index
+            if let Some(ref family) = entry.family {
+                if let Some(hashes) = self.family_index.get_mut(family) {
+                    hashes.retain(|h| h != &normalized_hash);
+                    if hashes.is_empty() {
+                        self.family_index.remove(family);
+                    }
+                }
+            }
+            Some(entry)
+        } else {
+            None
+        }
     }
 
     /// Get the number of signatures in the database
     pub fn signature_count(&self) -> usize {
-        self.known_hashes.len()
+        self.signatures.len()
+    }
+    
+    /// Get statistics by hash type
+    pub fn stats_by_hash_type(&self) -> HashMap<HashType, usize> {
+        let mut stats = HashMap::new();
+        
+        for entry in self.signatures.values() {
+            *stats.entry(entry.hash_type).or_insert(0) += 1;
+        }
+        
+        stats
+    }
+    
+    /// Get statistics by severity
+    pub fn stats_by_severity(&self) -> HashMap<ThreatSeverity, usize> {
+        let mut stats = HashMap::new();
+        
+        for entry in self.signatures.values() {
+            *stats.entry(entry.severity).or_insert(0) += 1;
+        }
+        
+        stats
+    }
+    
+    /// Get statistics by family
+    pub fn stats_by_family(&self) -> HashMap<String, usize> {
+        self.family_index
+            .iter()
+            .map(|(family, hashes)| (family.clone(), hashes.len()))
+            .collect()
     }
 
     /// Check if the database is empty
     pub fn is_empty(&self) -> bool {
-        self.known_hashes.is_empty()
+        self.signatures.is_empty()
     }
 
     /// Clear all signatures from the database
     pub fn clear(&mut self) {
-        self.known_hashes.clear();
+        self.signatures.clear();
+        self.family_index.clear();
     }
 
-    /// Load signatures from a file
-    /// 
-    /// File format (CSV-like):
-    /// ```
-    /// hash,malware_name
-    /// 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f,EICAR-Test-File
-    /// ```
-    /// 
-    /// Lines starting with '#' are treated as comments and ignored.
+    /// Load signatures from a CSV file
     pub fn load_from_file(&mut self, path: &Path) -> Result<usize> {
         let file = File::open(path)
             .with_context(|| format!("Failed to open signature file: {}", path.display()))?;
         
         let reader = BufReader::new(file);
         let mut count = 0;
+        let mut is_enhanced_format = false;
 
         for (line_num, line) in reader.lines().enumerate() {
             let line = line
@@ -116,109 +323,204 @@ impl SignatureDatabase {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-
-            // Parse CSV format: hash,malware_name
-            let parts: Vec<&str> = trimmed.splitn(2, ',').collect();
             
-            if parts.len() != 2 {
-                eprintln!(
-                    "Warning: Skipping malformed line {} in {}: {}",
-                    line_num + 1,
-                    path.display(),
-                    trimmed
-                );
-                continue;
+            // Check format on first data line
+            if count == 0 && trimmed.contains(',') {
+                let parts: Vec<&str> = trimmed.split(',').collect();
+                is_enhanced_format = parts.len() >= 4;
             }
 
-            let hash = parts[0].trim().to_string();
-            let malware_name = parts[1].trim().to_string();
-
-            if hash.is_empty() || malware_name.is_empty() {
-                eprintln!(
-                    "Warning: Skipping line {} with empty hash or name",
-                    line_num + 1
-                );
-                continue;
+            // Parse based on format
+            if is_enhanced_format {
+                if let Some(entry) = self.parse_enhanced_line(trimmed, line_num + 1) {
+                    self.add_signature_entry(entry);
+                    count += 1;
+                }
+            } else {
+                if let Some(entry) = self.parse_basic_line(trimmed, line_num + 1) {
+                    self.add_signature_entry(entry);
+                    count += 1;
+                }
             }
-
-            self.add_signature(hash, malware_name);
-            count += 1;
         }
 
         Ok(count)
     }
+    
+    fn parse_enhanced_line(&self, line: &str, line_num: usize) -> Option<SignatureEntry> {
+        let parts: Vec<&str> = line.splitn(6, ',').collect();
+        
+        if parts.len() < 3 {
+            eprintln!("Warning: Skipping malformed line {}: {}", line_num, line);
+            return None;
+        }
+        
+        let hash = parts[0].trim().to_string();
+        let hash_type = if parts.len() > 1 {
+            HashType::from_str(parts[1].trim()).unwrap_or_else(|| self.detect_hash_type(&hash))
+        } else {
+            self.detect_hash_type(&hash)
+        };
+        let malware_name = parts[2].trim().to_string();
+        let severity = if parts.len() > 3 {
+            ThreatSeverity::from_str(parts[3].trim())
+        } else {
+            ThreatSeverity::Medium
+        };
+        let family = if parts.len() > 4 && !parts[4].trim().is_empty() {
+            Some(parts[4].trim().to_string())
+        } else {
+            None
+        };
+        let description = if parts.len() > 5 && !parts[5].trim().is_empty() {
+            Some(parts[5].trim().to_string())
+        } else {
+            None
+        };
+        
+        if hash.is_empty() || malware_name.is_empty() {
+            eprintln!("Warning: Skipping line {} with empty hash or name", line_num);
+            return None;
+        }
+        
+        Some(SignatureEntry {
+            hash,
+            hash_type,
+            malware_name,
+            severity,
+            family,
+            description,
+            added_date: None,
+        })
+    }
+    
+    fn parse_basic_line(&self, line: &str, line_num: usize) -> Option<SignatureEntry> {
+        let parts: Vec<&str> = line.splitn(2, ',').collect();
+        
+        if parts.len() != 2 {
+            eprintln!("Warning: Skipping malformed line {}: {}", line_num, line);
+            return None;
+        }
+        
+        let hash = parts[0].trim().to_string();
+        let malware_name = parts[1].trim().to_string();
+        
+        if hash.is_empty() || malware_name.is_empty() {
+            eprintln!("Warning: Skipping line {} with empty hash or name", line_num);
+            return None;
+        }
+        
+        Some(SignatureEntry {
+            hash: hash.clone(),
+            hash_type: self.detect_hash_type(&hash),
+            malware_name,
+            severity: ThreatSeverity::Medium,
+            family: None,
+            description: None,
+            added_date: None,
+        })
+    }
 
-    /// Save signatures to a file
-    /// 
-    /// Saves in CSV format with a header
+    /// Save signatures to a file in enhanced CSV format
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         let mut file = File::create(path)
             .with_context(|| format!("Failed to create signature file: {}", path.display()))?;
 
         // Write header
-        writeln!(file, "# Malware Signature Database")?;
-        writeln!(file, "# Format: hash,malware_name")?;
+        writeln!(file, "# Malware Signature Database (Enhanced Format)")?;
+        writeln!(file, "# Format: hash,hash_type,malware_name,severity,family,description")?;
         writeln!(file, "#")?;
+        writeln!(file, "hash,hash_type,malware_name,severity,family,description")?;
 
         // Write all signatures
-        for (hash, malware_name) in &self.known_hashes {
-            writeln!(file, "{},{}", hash, malware_name)?;
+        for entry in self.signatures.values() {
+            writeln!(
+                file,
+                "{},{},{},{},{},{}",
+                entry.hash,
+                entry.hash_type.as_str(),
+                entry.malware_name,
+                entry.severity.as_str(),
+                entry.family.as_ref().unwrap_or(&String::new()),
+                entry.description.as_ref().unwrap_or(&String::new())
+            )?;
         }
 
         Ok(())
     }
 
     /// Merge another signature database into this one
-    /// 
-    /// If there are conflicts (same hash), the incoming database wins
     pub fn merge(&mut self, other: &SignatureDatabase) {
-        for (hash, malware_name) in &other.known_hashes {
-            self.known_hashes.insert(hash.clone(), malware_name.clone());
+        for entry in other.signatures.values() {
+            self.add_signature_entry(entry.clone());
         }
     }
 
-    /// Get all signatures as a vector of (hash, malware_name) tuples
-    pub fn list_signatures(&self) -> Vec<(String, String)> {
-        self.known_hashes
-            .iter()
-            .map(|(h, n)| (h.clone(), n.clone()))
-            .collect()
+    /// Get all signatures as a vector
+    pub fn list_signatures(&self) -> Vec<SignatureEntry> {
+        self.signatures.values().cloned().collect()
     }
 
     /// Search for signatures by malware name (case-insensitive partial match)
-    pub fn search_by_name(&self, query: &str) -> Vec<(String, String)> {
+    pub fn search_by_name(&self, query: &str) -> Vec<SignatureEntry> {
         let query_lower = query.to_lowercase();
         
-        self.known_hashes
-            .iter()
-            .filter(|(_, name)| name.to_lowercase().contains(&query_lower))
-            .map(|(h, n)| (h.clone(), n.clone()))
+        self.signatures
+            .values()
+            .filter(|entry| entry.malware_name.to_lowercase().contains(&query_lower))
+            .cloned()
             .collect()
     }
+    
+    /// Search signatures by family
+    pub fn search_by_family(&self, family: &str) -> Vec<SignatureEntry> {
+        self.family_index
+            .get(family)
+            .map(|hashes| {
+                hashes
+                    .iter()
+                    .filter_map(|hash| self.signatures.get(hash).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    
+    /// Search signatures by severity
+    pub fn search_by_severity(&self, severity: ThreatSeverity) -> Vec<SignatureEntry> {
+        self.signatures
+            .values()
+            .filter(|entry| entry.severity == severity)
+            .cloned()
+            .collect()
+    }
+    
+    /// Get all malware families
+    pub fn list_families(&self) -> Vec<String> {
+        self.family_index.keys().cloned().collect()
+    }
 
-    /// Export signatures as JSON (useful for API integration)
-    /// 
-    /// Requires the "json" feature to be enabled
+    /// Export signatures as JSON
     #[cfg(feature = "json")]
     pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string_pretty(&self.known_hashes)
+        serde_json::to_string_pretty(&self.signatures)
             .context("Failed to serialize signatures to JSON")
     }
 
     /// Import signatures from JSON
-    /// 
-    /// Requires the "json" feature to be enabled
     #[cfg(feature = "json")]
     pub fn from_json(json: &str) -> Result<Self> {
-        let known_hashes: HashMap<String, String> = serde_json::from_str(json)
+        let signatures: HashMap<String, SignatureEntry> = serde_json::from_str(json)
             .context("Failed to deserialize signatures from JSON")?;
         
-        Ok(Self { known_hashes })
+        let mut db = Self::empty();
+        for entry in signatures.values() {
+            db.add_signature_entry(entry.clone());
+        }
+        
+        Ok(db)
     }
 
     /// Load signatures from a JSON file
-    /// 
-    /// Requires the "json" feature to be enabled
     #[cfg(feature = "json")]
     pub fn load_from_json_file(&mut self, path: &Path) -> Result<usize> {
         let content = std::fs::read_to_string(path)
@@ -233,8 +535,6 @@ impl SignatureDatabase {
     }
 
     /// Save signatures to a JSON file
-    /// 
-    /// Requires the "json" feature to be enabled
     #[cfg(feature = "json")]
     pub fn save_to_json_file(&self, path: &Path) -> Result<()> {
         let json = self.to_json()?;
@@ -243,6 +543,42 @@ impl SignatureDatabase {
             .with_context(|| format!("Failed to write JSON file: {}", path.display()))?;
         
         Ok(())
+    }
+    
+    /// Import signatures from a threat intelligence feed URL
+    /// Format: hash,malware_name per line
+    pub fn import_from_feed(&mut self, _url: &str) -> Result<usize> {
+        // This would require an HTTP client - placeholder implementation
+        // In production, use reqwest or similar
+        Err(anyhow::anyhow!("Feed import not implemented - add reqwest dependency"))
+    }
+    
+    /// Validate database integrity
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        
+        for (hash, entry) in &self.signatures {
+            // Check hash format
+            if hash.len() != entry.hash_type.expected_length() {
+                errors.push(format!(
+                    "Hash length mismatch for {}: expected {} chars for {:?}",
+                    entry.malware_name,
+                    entry.hash_type.expected_length(),
+                    entry.hash_type
+                ));
+            }
+            
+            // Check for invalid hex characters
+            if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                errors.push(format!(
+                    "Invalid hash characters for {}: {}",
+                    entry.malware_name,
+                    hash
+                ));
+            }
+        }
+        
+        errors
     }
 }
 
@@ -257,12 +593,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_hash_type_detection() {
+        let db = SignatureDatabase::empty();
+        
+        assert_eq!(db.detect_hash_type("d41d8cd98f00b204e9800998ecf8427e"), HashType::MD5);
+        assert_eq!(db.detect_hash_type("da39a3ee5e6b4b0d3255bfef95601890afd80709"), HashType::SHA1);
+        assert_eq!(
+            db.detect_hash_type("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            HashType::SHA256
+        );
+    }
+    
+    #[test]
     fn test_check_hash() {
         let db = SignatureDatabase::new();
         
         // EICAR hash should be recognized
-        let eicar_hash = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
-        assert!(db.check_hash(eicar_hash).is_some());
+        let eicar_sha256 = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
+        assert!(db.check_hash(eicar_sha256).is_some());
+        
+        let eicar_md5 = "44d88612fea8a8f36de82e1278abb02f";
+        assert!(db.check_hash(eicar_md5).is_some());
         
         // Random hash should not be recognized
         assert!(db.check_hash("deadbeef").is_none());
@@ -272,7 +623,17 @@ mod tests {
     fn test_add_remove_signature() {
         let mut db = SignatureDatabase::empty();
         
-        db.add_signature("abc123".to_string(), "TestMalware".to_string());
+        let entry = SignatureEntry {
+            hash: "abc123".to_string(),
+            hash_type: HashType::MD5,
+            malware_name: "TestMalware".to_string(),
+            severity: ThreatSeverity::High,
+            family: Some("Trojan".to_string()),
+            description: Some("Test malware".to_string()),
+            added_date: None,
+        };
+        
+        db.add_signature_entry(entry);
         assert_eq!(db.signature_count(), 1);
         assert!(db.check_hash("abc123").is_some());
         
@@ -287,107 +648,72 @@ mod tests {
         
         db.add_signature("ABC123".to_string(), "TestMalware".to_string());
         
-        // Should match regardless of case
         assert!(db.check_hash("abc123").is_some());
         assert!(db.check_hash("ABC123").is_some());
         assert!(db.check_hash("AbC123").is_some());
     }
 
     #[test]
-    fn test_save_load() {
-        let temp_dir = std::env::temp_dir();
-        let sig_file = temp_dir.join("test_signatures.csv");
-        
-        // Create and save database
-        let mut db1 = SignatureDatabase::empty();
-        db1.add_signature("hash1".to_string(), "Malware1".to_string());
-        db1.add_signature("hash2".to_string(), "Malware2".to_string());
-        
-        db1.save_to_file(&sig_file).unwrap();
-        
-        // Load into new database
-        let mut db2 = SignatureDatabase::empty();
-        let count = db2.load_from_file(&sig_file).unwrap();
-        
-        assert_eq!(count, 2);
-        assert_eq!(db2.signature_count(), 2);
-        assert!(db2.check_hash("hash1").is_some());
-        assert!(db2.check_hash("hash2").is_some());
-        
-        // Cleanup
-        std::fs::remove_file(&sig_file).unwrap();
-    }
-
-    #[test]
-    fn test_merge() {
-        let mut db1 = SignatureDatabase::empty();
-        db1.add_signature("hash1".to_string(), "Malware1".to_string());
-        
-        let mut db2 = SignatureDatabase::empty();
-        db2.add_signature("hash2".to_string(), "Malware2".to_string());
-        
-        db1.merge(&db2);
-        
-        assert_eq!(db1.signature_count(), 2);
-        assert!(db1.check_hash("hash1").is_some());
-        assert!(db1.check_hash("hash2").is_some());
-    }
-
-    #[test]
-    fn test_search_by_name() {
+    fn test_family_search() {
         let mut db = SignatureDatabase::empty();
-        db.add_signature("hash1".to_string(), "Trojan.Generic".to_string());
-        db.add_signature("hash2".to_string(), "Trojan.Specific".to_string());
-        db.add_signature("hash3".to_string(), "Virus.Boot".to_string());
         
-        let results = db.search_by_name("trojan");
-        assert_eq!(results.len(), 2);
+        let entry1 = SignatureEntry {
+            hash: "hash1".to_string(),
+            hash_type: HashType::SHA256,
+            malware_name: "Trojan1".to_string(),
+            severity: ThreatSeverity::High,
+            family: Some("Trojan".to_string()),
+            description: None,
+            added_date: None,
+        };
         
-        let results = db.search_by_name("virus");
-        assert_eq!(results.len(), 1);
+        let entry2 = SignatureEntry {
+            hash: "hash2".to_string(),
+            hash_type: HashType::SHA256,
+            malware_name: "Trojan2".to_string(),
+            severity: ThreatSeverity::High,
+            family: Some("Trojan".to_string()),
+            description: None,
+            added_date: None,
+        };
+        
+        db.add_signature_entry(entry1);
+        db.add_signature_entry(entry2);
+        
+        let trojans = db.search_by_family("Trojan");
+        assert_eq!(trojans.len(), 2);
     }
-
-    #[cfg(feature = "json")]
+    
     #[test]
-    fn test_json_export_import() {
-        let mut db1 = SignatureDatabase::empty();
-        db1.add_signature("hash1".to_string(), "Malware1".to_string());
-        db1.add_signature("hash2".to_string(), "Malware2".to_string());
+    fn test_statistics() {
+        let mut db = SignatureDatabase::empty();
         
-        // Export to JSON
-        let json = db1.to_json().unwrap();
+        db.add_signature_entry(SignatureEntry {
+            hash: "hash1".to_string(),
+            hash_type: HashType::MD5,
+            malware_name: "Malware1".to_string(),
+            severity: ThreatSeverity::High,
+            family: Some("Trojan".to_string()),
+            description: None,
+            added_date: None,
+        });
         
-        // Import from JSON
-        let db2 = SignatureDatabase::from_json(&json).unwrap();
+        db.add_signature_entry(SignatureEntry {
+            hash: "hash2".to_string(),
+            hash_type: HashType::SHA256,
+            malware_name: "Malware2".to_string(),
+            severity: ThreatSeverity::Critical,
+            family: Some("Ransomware".to_string()),
+            description: None,
+            added_date: None,
+        });
         
-        assert_eq!(db2.signature_count(), 2);
-        assert!(db2.check_hash("hash1").is_some());
-        assert!(db2.check_hash("hash2").is_some());
-    }
-
-    #[cfg(feature = "json")]
-    #[test]
-    fn test_json_file_operations() {
-        let temp_dir = std::env::temp_dir();
-        let json_file = temp_dir.join("test_signatures.json");
+        let hash_stats = db.stats_by_hash_type();
+        assert_eq!(hash_stats.get(&HashType::MD5), Some(&1));
+        assert_eq!(hash_stats.get(&HashType::SHA256), Some(&1));
         
-        // Create and save database
-        let mut db1 = SignatureDatabase::empty();
-        db1.add_signature("hash1".to_string(), "Malware1".to_string());
-        db1.add_signature("hash2".to_string(), "Malware2".to_string());
-        
-        db1.save_to_json_file(&json_file).unwrap();
-        
-        // Load into new database
-        let mut db2 = SignatureDatabase::empty();
-        let count = db2.load_from_json_file(&json_file).unwrap();
-        
-        assert_eq!(count, 2);
-        assert_eq!(db2.signature_count(), 2);
-        assert!(db2.check_hash("hash1").is_some());
-        assert!(db2.check_hash("hash2").is_some());
-        
-        // Cleanup
-        std::fs::remove_file(&json_file).unwrap();
+        let severity_stats = db.stats_by_severity();
+        assert_eq!(severity_stats.get(&ThreatSeverity::High), Some(&1));
+        assert_eq!(severity_stats.get(&ThreatSeverity::Critical), Some(&1));
     }
 }

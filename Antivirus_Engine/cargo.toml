@@ -1,33 +1,50 @@
+# Cargo.toml - Antivirus Engine (Without YARA)
+# This version compiles without requiring LLVM/Clang
+
 [package]
 name = "antivirus_engine"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-authors = ["AegisAI Team <team@aegisai.com>"]
-description = "AegisAI Rust-based antivirus engine"
+authors = ["Your Name <your.email@example.com>"]
+description = "Multi-layer malware detection engine with dynamic behavioral analysis"
 license = "MIT"
-repository = "https://github.com/yourusername/AegisAI"
 
 [dependencies]
-# Core utilities
-anyhow = "1.0"
-walkdir = "2.5"
-sha2 = "0.10"
-hex = "0.4"
-entropy = "0.1"
+# Core dependencies - always required
+anyhow = "1.0"           # Error handling
+hex = "0.4"              # Hex encoding for hashes
+walkdir = "2.5"          # Directory traversal
 
-# CLI argument parsing
-clap = { version = "4.5", features = ["derive"] }
+# Hashing algorithms
+sha2 = "0.10"            # SHA-256, SHA-512
+md5 = "0.7"              # MD5 (legacy support)
 
-# Serde for optional JSON support
+# Optional features
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 
+# YARA support (commented out - uncomment after installing LLVM)
+# yara = { version = "0.27", optional = true }
+
+[dev-dependencies]
+tempfile = "3.10"        # For tests
+
 [features]
-default = ["json"]        # Enable JSON support by default
-json = ["serde", "serde_json"]
+default = ["json"]  # Enable JSON by default for Python integration
+json = ["dep:serde", "dep:serde_json"]
+# yara = ["dep:yara"]      # Uncomment after LLVM installation
+# full = ["json", "yara"]  # Uncomment for all features
+
+[profile.dev]
+opt-level = 0
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[[bin]]
+name = "antivirus"
+path = "src/main.rs"
+required-features = []

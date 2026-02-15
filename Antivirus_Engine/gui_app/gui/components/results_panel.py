@@ -20,7 +20,7 @@ class ResultsPanel(ctk.CTkFrame):
         
         # Configure grid
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(1, weight=1)  # Make results area expandable
         
         # Create widgets
         self._create_widgets()
@@ -60,19 +60,20 @@ class ResultsPanel(ctk.CTkFrame):
                 width=80,
                 height=30,
                 command=lambda f=filter_key: self._apply_filter(f),
-                fg_color="transparent" if idx != 0 else None,
+                fg_color="transparent" if idx != 0 else ("gray75", "gray25"),
                 border_width=2 if idx == 0 else 0,
                 text_color=color if color else None
             )
             button.pack(side="left", padx=3)
             self.filter_buttons[filter_key] = button
         
-        # Results scrollable frame
+        # Results scrollable frame - BIGGER with explicit height
         self.results_scroll = ctk.CTkScrollableFrame(
             self,
-            fg_color=("gray85", "gray20")
+            fg_color=("gray85", "gray20"),
+            height=500  # Explicit minimum height
         )
-        self.results_scroll.grid(row=1, column=0, sticky="nsew")
+        self.results_scroll.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         self.results_scroll.grid_columnconfigure(0, weight=1)
         
         # Empty state
@@ -86,7 +87,7 @@ class ResultsPanel(ctk.CTkFrame):
         
         # Summary frame (hidden initially)
         self.summary_frame = ctk.CTkFrame(self)
-        self.summary_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=(10, 0))
+        self.summary_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=(0, 0))
         self.summary_frame.grid_remove()
     
     def add_results(self, new_results):
@@ -97,23 +98,38 @@ class ResultsPanel(ctk.CTkFrame):
             new_results: List of ScanResult objects
         """
         self.results.extend(new_results)
+        
+        # Force UI update
         self._apply_filter(self.current_filter)
+        self.update_idletasks()
     
     def clear_results(self):
         """Clear all results."""
+        # Clear data
         self.results.clear()
         self.filtered_results.clear()
         
-        # Destroy all result items
-        for widget in self.results_scroll.winfo_children():
+        # Destroy all result items (except empty label)
+        for widget in list(self.results_scroll.winfo_children()):
             if widget != self.empty_label:
                 widget.destroy()
         
         # Show empty label
-        self.empty_label.grid()
+        self.empty_label.grid(row=0, column=0, pady=50)
         
         # Hide summary
         self.summary_frame.grid_remove()
+        
+        # Reset filter to "all"
+        self.current_filter = "all"
+        for key, button in self.filter_buttons.items():
+            if key == "all":
+                button.configure(border_width=2, fg_color=("gray75", "gray25"))
+            else:
+                button.configure(border_width=0, fg_color="transparent")
+        
+        # Force UI refresh
+        self.update_idletasks()
     
     def _apply_filter(self, filter_key):
         """
@@ -127,8 +143,10 @@ class ResultsPanel(ctk.CTkFrame):
         # Update filter button states
         for key, button in self.filter_buttons.items():
             if key == filter_key:
-                button.configure(fg_color=None, border_width=2)
+                # Active filter - use default theme color with border
+                button.configure(border_width=2, fg_color=("gray75", "gray25"))
             else:
+                # Inactive filters - transparent
                 button.configure(fg_color="transparent", border_width=0)
         
         # Filter results
@@ -149,12 +167,12 @@ class ResultsPanel(ctk.CTkFrame):
     def _refresh_display(self):
         """Refresh the results display."""
         # Clear existing items (except empty label)
-        for widget in self.results_scroll.winfo_children():
+        for widget in list(self.results_scroll.winfo_children()):
             if widget != self.empty_label:
                 widget.destroy()
         
         if not self.filtered_results:
-            self.empty_label.grid()
+            self.empty_label.grid(row=0, column=0, pady=50)
             return
         
         # Hide empty label
@@ -163,6 +181,9 @@ class ResultsPanel(ctk.CTkFrame):
         # Create result items
         for idx, result in enumerate(self.filtered_results):
             self._create_result_item(result, idx)
+        
+        # Force update
+        self.results_scroll.update_idletasks()
     
     def _create_result_item(self, result, row):
         """Create a visual item for a scan result."""
@@ -254,7 +275,7 @@ class ResultsPanel(ctk.CTkFrame):
         # Create summary
         summary_label = ctk.CTkLabel(
             self.summary_frame,
-            text="Scan Complete",
+            text="✅ Scan Complete",
             font=ctk.CTkFont(size=14, weight="bold")
         )
         summary_label.pack(side="left", padx=20, pady=15)

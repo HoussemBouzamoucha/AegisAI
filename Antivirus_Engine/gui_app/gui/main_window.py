@@ -1,7 +1,5 @@
 """
-Main Window
-===========
-Main application window with modern UI and animations.
+DIAGNOSTIC VERSION - Main Window with Extensive Logging
 """
 
 import customtkinter as ctk
@@ -10,14 +8,16 @@ from gui.components.scan_panel import ScanPanel
 from gui.components.results_panel import ResultsPanel
 from gui.components.sidebar import SidebarFrame
 from utils.rust_bridge import RustEngine
-
+import traceback
+from engine_wrapper import AntivirusEngine
 
 class MainWindow(ctk.CTk):
     """Main application window."""
     
     def __init__(self, config):
         super().__init__()
-        
+        self.engine = AntivirusEngine(config.engine_path)
+
         self.config = config
         self.rust_engine = RustEngine(config.rust_engine_path)
         self.current_results = []
@@ -83,6 +83,11 @@ class MainWindow(ctk.CTk):
         # Results panel (output)
         self.results_panel = ResultsPanel(self.content_frame)
         self.results_panel.grid(row=1, column=0, sticky="nsew")
+        
+        print("=" * 80)
+        print("DIAGNOSTIC: Main window created successfully")
+        print(f"DIAGNOSTIC: Results panel object: {self.results_panel}")
+        print("=" * 80)
     
     def _bind_events(self):
         """Bind keyboard shortcuts and events."""
@@ -109,23 +114,35 @@ class MainWindow(ctk.CTk):
         """Show settings dialog."""
         from gui.dialogs.settings_dialog import SettingsDialog
         dialog = SettingsDialog(self, self.config)
-        dialog.grab_set()  # Make modal
+        dialog.grab_set()
     
     def _start_scan(self):
         """Start the scanning process."""
+        print("\n" + "=" * 80)
+        print("DIAGNOSTIC: _start_scan called")
+        
         # Get scan targets from scan panel
         targets = self.scan_panel.get_scan_targets()
+        print(f"DIAGNOSTIC: Scan targets: {targets}")
         
         if not targets:
+            print("DIAGNOSTIC: No targets selected, showing error")
             self._show_error("No scan targets selected")
             return
         
         # Clear previous results
+        print("DIAGNOSTIC: Clearing previous results")
         self.results_panel.clear_results()
+        self.current_results = []
+        
+        # Reset header statistics
+        self.header.reset_statistics()
         
         # Update UI to scanning state
         self.scan_panel.set_scanning_state(True)
         self.sidebar.set_scanning_state(True)
+        
+        print(f"DIAGNOSTIC: Starting background scan thread for {len(targets)} targets")
         
         # Start scan in background thread
         import threading
@@ -135,83 +152,156 @@ class MainWindow(ctk.CTk):
             daemon=True
         )
         thread.start()
+        print("DIAGNOSTIC: Background thread started")
+        print("=" * 80 + "\n")
     
     def _perform_scan(self, targets):
         """
         Perform the actual scan (runs in background thread).
-        
-        Args:
-            targets: List of file/directory paths to scan
         """
-        all_results = []
-        
-        for target in targets:
-            from pathlib import Path
-            path = Path(target)
+        try:
+            print("\n" + "=" * 80)
+            print("DIAGNOSTIC: _perform_scan started (in background thread)")
+            print(f"DIAGNOSTIC: Targets to scan: {targets}")
             
-            if path.is_file():
-                result = self.rust_engine.scan_file(target)
-                self._update_results([result])
-                all_results.append(result)
-            elif path.is_dir():
-                results = self.rust_engine.scan_directory(
-                    target,
-                    recursive=self.config.recursive_scan,
-                    callback=self._scan_progress_callback
-                )
-                all_results.extend(results)
-            else:
-                # Invalid path
-                from utils.rust_bridge import ScanResult, ThreatLevel
-                result = ScanResult(
-                    path=target,
-                    level=ThreatLevel.ERROR,
-                    reason="Path does not exist"
-                )
-                self._update_results([result])
-                all_results.append(result)
-        
-        # Scan complete
-        self.current_results = all_results
-        self._scan_complete(all_results)
+            all_results = []
+            
+            for idx, target in enumerate(targets):
+                from pathlib import Path
+                path = Path(target)
+                
+                print(f"\nDIAGNOSTIC: Processing target {idx + 1}/{len(targets)}: {target}")
+                print(f"DIAGNOSTIC: Path exists: {path.exists()}")
+                print(f"DIAGNOSTIC: Is file: {path.is_file()}")
+                print(f"DIAGNOSTIC: Is dir: {path.is_dir()}")
+                
+                if path.is_file():
+                    print("DIAGNOSTIC: Scanning as file")
+                    result = self.rust_engine.scan_file(target)
+                    print(f"DIAGNOSTIC: File scan result: {result}")
+                    
+                    # Update UI immediately
+                    self.after(0, lambda r=result: self._update_results([r]))
+                    all_results.append(result)
+                    
+                elif path.is_dir():
+                    print("DIAGNOSTIC: Scanning as directory")
+                    print(f"DIAGNOSTIC: Recursive: {self.config.recursive_scan}")
+                    
+                    results = self.rust_engine.scan_directory(
+                        target,
+                        recursive=self.config.recursive_scan,
+                        callback=self._scan_progress_callback
+                    )
+                    
+                    print(f"DIAGNOSTIC: Directory scan returned {len(results)} results")
+                    
+                    if results:
+                        print(f"DIAGNOSTIC: First result: {results[0]}")
+                        print(f"DIAGNOSTIC: Last result: {results[-1]}")
+                    else:
+                        print("DIAGNOSTIC: WARNING - No results returned from directory scan!")
+                    
+                    all_results.extend(results)
+                    
+                else:
+                    print("DIAGNOSTIC: Path is neither file nor directory - creating error result")
+                    from utils.rust_bridge import ScanResult, ThreatLevel
+                    result = ScanResult(
+                        path=target,
+                        level=ThreatLevel.ERROR,
+                        reason="Path does not exist"
+                    )
+                    self.after(0, lambda r=result: self._update_results([r]))
+                    all_results.append(result)
+            
+            print(f"\nDIAGNOSTIC: Scan loop complete")
+            print(f"DIAGNOSTIC: Total results collected: {len(all_results)}")
+            
+            # Store results
+            self.current_results = all_results
+            
+            # Call scan complete
+            print("DIAGNOSTIC: Calling _scan_complete")
+            self.after(0, lambda: self._scan_complete(all_results))
+            
+            print("=" * 80 + "\n")
+            
+        except Exception as e:
+            print("\n" + "!" * 80)
+            print(f"DIAGNOSTIC ERROR in _perform_scan: {e}")
+            print("DIAGNOSTIC Traceback:")
+            traceback.print_exc()
+            print("!" * 80 + "\n")
     
     def _scan_progress_callback(self, current, total, result):
         """
         Callback for scan progress updates.
-        
-        Args:
-            current: Current file number
-            total: Total files to scan
-            result: ScanResult for current file
         """
-        # Update progress in UI (must use after() for thread safety)
+        print(f"DIAGNOSTIC: Progress callback: {current}/{total} - {result.path}")
+        
+        # Update progress in UI
         self.after(0, lambda: self.scan_panel.update_progress(current, total))
-        self.after(0, lambda: self._update_results([result]))
+        
+        # Add result to display
+        self.after(0, lambda r=result: self._update_results([r]))
     
     def _update_results(self, results):
         """
         Update results panel with new results.
-        
-        Args:
-            results: List of ScanResult objects
         """
-        self.results_panel.add_results(results)
+        try:
+            print(f"\nDIAGNOSTIC: _update_results called")
+            print(f"DIAGNOSTIC: Number of results: {len(results)}")
+            print(f"DIAGNOSTIC: Results panel object: {self.results_panel}")
+            
+            if results:
+                print(f"DIAGNOSTIC: First result details:")
+                print(f"  - Path: {results[0].path}")
+                print(f"  - Level: {results[0].level}")
+                print(f"  - Reason: {results[0].reason}")
+            
+            print(f"DIAGNOSTIC: Calling results_panel.add_results()")
+            self.results_panel.add_results(results)
+            print(f"DIAGNOSTIC: add_results() completed")
+            
+        except Exception as e:
+            print("\n" + "!" * 80)
+            print(f"DIAGNOSTIC ERROR in _update_results: {e}")
+            print("DIAGNOSTIC Traceback:")
+            traceback.print_exc()
+            print("!" * 80 + "\n")
     
     def _scan_complete(self, results):
         """
         Handle scan completion.
-        
-        Args:
-            results: All scan results
         """
-        # Update UI state (must use after() for thread safety)
-        self.after(0, lambda: self.scan_panel.set_scanning_state(False))
-        self.after(0, lambda: self.sidebar.set_scanning_state(False))
-        
-        # Calculate and display statistics
-        stats = self.rust_engine.get_statistics(results)
-        self.after(0, lambda: self.header.update_statistics(stats))
-        self.after(0, lambda: self.results_panel.show_summary(stats))
+        try:
+            print(f"\n" + "=" * 80)
+            print(f"DIAGNOSTIC: _scan_complete called")
+            print(f"DIAGNOSTIC: Total results: {len(results)}")
+            
+            # Update UI state
+            self.scan_panel.set_scanning_state(False)
+            self.sidebar.set_scanning_state(False)
+            
+            # Calculate statistics
+            stats = self.rust_engine.get_statistics(results)
+            print(f"DIAGNOSTIC: Statistics calculated: {stats}")
+            
+            # Update UI
+            self.header.update_statistics(stats)
+            self.results_panel.show_summary(stats)
+            
+            print("DIAGNOSTIC: Scan complete - UI updated")
+            print("=" * 80 + "\n")
+            
+        except Exception as e:
+            print("\n" + "!" * 80)
+            print(f"DIAGNOSTIC ERROR in _scan_complete: {e}")
+            print("DIAGNOSTIC Traceback:")
+            traceback.print_exc()
+            print("!" * 80 + "\n")
     
     def _show_error(self, message):
         """Show error message to user."""

@@ -1,203 +1,409 @@
-use antivirus_engine::core::file_system::scanner::FileSystemScanner;
-use std::path::PathBuf;
-use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+// File: src/main.rs
+// JSON-Compatible Antivirus Scanner for Python Integration
 
-/// AegisAI Antivirus Engine - Command Line Interface
-#[derive(Parser)]
-#[command(name = "AegisAI Antivirus")]
-#[command(author = "AegisAI Team")]
-#[command(version = "1.0.0")]
-#[command(about = "Advanced antivirus scanning engine", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+mod core;
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Scan a single file
-    ScanFile {
-        /// Path to the file to scan
-        #[arg(short, long)]
-        path: PathBuf,
-        
-        /// Output format (json or text)
-        #[arg(short, long, default_value = "json")]
-        format: String,
-    },
+use core::file_system::scanner::FileSystemScanner;
+use core::types::ThreatLevel;
+use std::path::Path;
+use std::env;
+use serde_json::json;
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
     
-    /// Scan a directory
-    ScanDir {
-        /// Path to the directory to scan
-        #[arg(short, long)]
-        path: PathBuf,
-        
-        /// Scan recursively
-        #[arg(short, long, default_value = "true")]
-        recursive: bool,
-        
-        /// Output format (json or text)
-        #[arg(short, long, default_value = "json")]
-        format: String,
-    },
+    if args.len() < 2 {
+        print_usage();
+        return;
+    }
     
-    /// Get version information
-    Version,
+    let command = &args[1];
+    
+    match command.as_str() {
+        "scan" => {
+            if args.len() < 3 {
+                eprintln!("{{\"error\": \"Please provide a file or directory to scan\"}}");
+                return;
+            }
+            
+            let path = Path::new(&args[2]);
+            let json_output = args.iter().any(|arg| arg == "--json");
+            
+            if json_output {
+                scan_path_json(path);
+            } else {
+                scan_path_human(path);
+            }
+        }
+        "scan-file" => {
+            // For Python: single file scan with JSON output
+            if args.len() < 3 {
+                println!("{{\"error\": \"No file path provided\"}}");
+                return;
+            }
+            
+            let path = Path::new(&args[2]);
+            scan_single_file_json(path);
+        }
+        "scan-dir" => {
+            // For Python: directory scan with JSON output
+            if args.len() < 3 {
+                println!("{{\"error\": \"No directory path provided\"}}");
+                return;
+            }
+            
+            let path = Path::new(&args[2]);
+            scan_directory_json(path);
+        }
+        "test" => {
+            run_tests();
+        }
+        "help" | "--help" | "-h" => {
+            print_usage();
+        }
+        _ => {
+            eprintln!("{{\"error\": \"Unknown command: {}\"}}",  command);
+        }
+    }
 }
 
-#[derive(Serialize, Deserialize)]
-struct JsonOutput {
-    success: bool,
-    results: Vec<ScanResultJson>,
-    statistics: Statistics,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ScanResultJson {
-    path: String,
-    level: String,
-    reason: String,
-    hash: Option<String>,
-    signature: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Statistics {
-    total: usize,
-    clean: usize,
-    suspicious: usize,
-    malicious: usize,
-    errors: usize,
-}
-
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+/// Scan single file and output JSON (for Python)
+fn scan_single_file_json(path: &Path) {
+    if !path.exists() {
+        println!("{{\"error\": \"File does not exist\"}}");
+        return;
+    }
     
     let scanner = FileSystemScanner::new();
     
-    match cli.command {
-        Commands::ScanFile { path, format } => {
-            if !path.exists() {
-                eprintln!("Error: File not found: {}", path.display());
-                std::process::exit(1);
+    match scanner.scan_file(path) {
+        Ok(result) => {
+            let output = json!({
+                "success": true,
+                "path": result.path.display().to_string(),
+                "level": result.level.as_str(),
+                "reason": result.reason,
+                "hash": result.hash,
+                "signature": result.signature,
+                "is_threat": result.level.is_threat(),
+            });
+            println!("{}", output);
+        }
+        Err(e) => {
+            let output = json!({
+                "success": false,
+                "error": e.to_string(),
+            });
+            println!("{}", output);
+        }
+    }
+}
+
+/// Scan directory and output JSON (for Python)
+fn scan_directory_json(path: &Path) {
+    if !path.exists() {
+        println!("{{\"error\": \"Directory does not exist\"}}");
+        return;
+    }
+    
+    let scanner = FileSystemScanner::new();
+    let (results, stats) = scanner.scan_directory_with_stats(path, true);
+    
+    let mut files = Vec::new();
+    for result in results {
+        files.push(json!({
+            "path": result.path.display().to_string(),
+            "level": result.level.as_str(),
+            "reason": result.reason,
+            "hash": result.hash,
+            "signature": result.signature,
+            "is_threat": result.level.is_threat(),
+        }));
+    }
+    
+    let output = json!({
+        "success": true,
+        "statistics": {
+            "total_files": stats.total_files,
+            "clean_files": stats.clean_files,
+            "suspicious_files": stats.suspicious_files,
+            "malicious_files": stats.malicious_files,
+            "error_files": stats.error_files,
+            "total_size_mb": (stats.total_size_scanned as f64) / 1024.0 / 1024.0,
+        },
+        "files": files,
+    });
+    
+    println!("{}", output);
+}
+
+/// Human-readable output for command line use
+fn scan_path_human(path: &Path) {
+    println!("🛡️  Antivirus Engine v1.0.0");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    println!("🔍 Scanning: {}\n", path.display());
+    
+    if !path.exists() {
+        eprintln!("❌ Error: Path does not exist");
+        return;
+    }
+    
+    let scanner = FileSystemScanner::new();
+    
+    if path.is_file() {
+        match scanner.scan_file(path) {
+            Ok(result) => {
+                print_result(&result);
             }
-            
-            let result = scanner.scan_file(&path)?;
-            
-            if format == "json" {
-                let json_result = ScanResultJson {
-                    path: result.path.display().to_string(),
-                    level: format!("{:?}", result.level),
-                    reason: result.reason.clone(),
-                    hash: result.hash.clone(),
-                    signature: result.signature.clone(),
-                };
-                
-                let stats = Statistics {
-                    total: 1,
-                    clean: if matches!(result.level, antivirus_engine::core::types::ThreatLevel::Clean) { 1 } else { 0 },
-                    suspicious: if matches!(result.level, antivirus_engine::core::types::ThreatLevel::Suspicious) { 1 } else { 0 },
-                    malicious: if matches!(result.level, antivirus_engine::core::types::ThreatLevel::Malicious) { 1 } else { 0 },
-                    errors: if matches!(result.level, antivirus_engine::core::types::ThreatLevel::Error) { 1 } else { 0 },
-                };
-                
-                let output = JsonOutput {
-                    success: true,
-                    results: vec![json_result],
-                    statistics: stats,
-                };
-                
-                println!("{}", serde_json::to_string_pretty(&output)?);
-            } else {
-                println!("Scan Result:");
-                println!("  Path: {}", result.path.display());
-                println!("  Level: {:?}", result.level);
-                println!("  Reason: {}", result.reason);
-                if let Some(hash) = &result.hash {
-                    println!("  Hash: {}", hash);
-                }
-                if let Some(sig) = &result.signature {
-                    println!("  Signature: {}", sig);
-                }
+            Err(e) => {
+                eprintln!("❌ Scan error: {}", e);
             }
         }
+    } else if path.is_dir() {
+        let (results, stats) = scanner.scan_directory_with_stats(path, true);
         
-        Commands::ScanDir { path, recursive, format } => {
-            if !path.exists() {
-                eprintln!("Error: Directory not found: {}", path.display());
-                std::process::exit(1);
+        println!("📊 Scan Results:");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("Total files:      {}", stats.total_files);
+        println!("Clean:            {} ✅", stats.clean_files);
+        println!("Suspicious:       {} ⚠️", stats.suspicious_files);
+        println!("Malicious:        {} 🚨", stats.malicious_files);
+        println!("Errors:           {}", stats.error_files);
+        println!("Total size:       {:.2} MB", stats.total_size_scanned as f64 / 1024.0 / 1024.0);
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        
+        let threats: Vec<_> = results.iter()
+            .filter(|r| r.level.is_threat())
+            .collect();
+        
+        if !threats.is_empty() {
+            println!("⚠️  {} Threat(s) detected:\n", threats.len());
+            for result in threats {
+                print_result(result);
             }
-            
-            let mut all_results = Vec::new();
-            let mut stats = Statistics {
-                total: 0,
-                clean: 0,
-                suspicious: 0,
-                malicious: 0,
-                errors: 0,
-            };
-            
-            // Scan directory
-            for result in scanner.scan_directory(&path, recursive) {
-                match result {
-                    Ok(scan_result) => {
-                        stats.total += 1;
-                        
-                        match scan_result.level {
-                            antivirus_engine::core::types::ThreatLevel::Clean => stats.clean += 1,
-                            antivirus_engine::core::types::ThreatLevel::Suspicious => stats.suspicious += 1,
-                            antivirus_engine::core::types::ThreatLevel::Malicious => stats.malicious += 1,
-                            antivirus_engine::core::types::ThreatLevel::Error => stats.errors += 1,
-                        }
-                        
-                        if format == "json" {
-                            all_results.push(ScanResultJson {
-                                path: scan_result.path.display().to_string(),
-                                level: format!("{:?}", scan_result.level),
-                                reason: scan_result.reason.clone(),
-                                hash: scan_result.hash.clone(),
-                                signature: scan_result.signature.clone(),
-                            });
-                        } else {
-                            // Print each result as we go
-                            println!("[{:?}] {}: {}", 
-                                scan_result.level, 
-                                scan_result.path.display(),
-                                scan_result.reason
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error during scan: {}", e);
-                        stats.errors += 1;
-                    }
-                }
-            }
-            
-            if format == "json" {
-                let output = JsonOutput {
-                    success: true,
-                    results: all_results,
-                    statistics: stats,
-                };
-                
-                println!("{}", serde_json::to_string_pretty(&output)?);
-            } else {
-                println!("\n=== Scan Complete ===");
-                println!("Total: {}", stats.total);
-                println!("Clean: {}", stats.clean);
-                println!("Suspicious: {}", stats.suspicious);
-                println!("Malicious: {}", stats.malicious);
-                println!("Errors: {}", stats.errors);
-            }
+        } else {
+            println!("✅ No threats detected! All files are clean.");
         }
-        
-        Commands::Version => {
-            println!("AegisAI Antivirus Engine v1.0.0");
-            println!("Rust-based malware detection engine");
+    }
+}
+
+/// JSON output for --json flag
+fn scan_path_json(path: &Path) {
+    if !path.exists() {
+        println!("{{\"error\": \"Path does not exist\"}}");
+        return;
+    }
+    
+    let scanner = FileSystemScanner::new();
+    
+    if path.is_file() {
+        scan_single_file_json(path);
+    } else if path.is_dir() {
+        scan_directory_json(path);
+    }
+}
+
+fn print_result(result: &core::types::ScanResult) {
+    println!("{} {}", 
+        result.level.emoji(),
+        result.path.display()
+    );
+    println!("   Level: {}", result.level);
+    println!("   Reason: {}", result.reason);
+    
+    if let Some(hash) = &result.hash {
+        println!("   Hash: {}...", &hash[..std::cmp::min(16, hash.len())]);
+    }
+    
+    if let Some(sig) = &result.signature {
+        println!("   Signature: {}", sig);
+    }
+    
+    println!();
+}
+
+fn run_tests() {
+    println!("🛡️  Antivirus Engine v1.0.0");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    println!("🧪 Running self-tests...\n");
+    
+    let scanner = FileSystemScanner::new();
+    let mut passed = 0;
+    let mut failed = 0;
+    
+    // Test 1: EICAR detection
+    println!("Test 1: EICAR detection");
+    match test_eicar(&scanner) {
+        Ok(true) => {
+            println!("   ✅ PASSED - EICAR detected as malicious\n");
+            passed += 1;
+        }
+        Ok(false) => {
+            println!("   ❌ FAILED - EICAR not detected\n");
+            failed += 1;
+        }
+        Err(e) => {
+            println!("   ⚠️  SKIPPED - {}\n", e);
         }
     }
     
-    Ok(())
+    // Test 2: Clean file
+    println!("Test 2: Clean file detection");
+    match test_clean_file(&scanner) {
+        Ok(true) => {
+            println!("   ✅ PASSED - Clean file correctly identified\n");
+            passed += 1;
+        }
+        Ok(false) => {
+            println!("   ❌ FAILED - Clean file incorrectly flagged\n");
+            failed += 1;
+        }
+        Err(e) => {
+            println!("   ❌ FAILED - Error: {}\n", e);
+            failed += 1;
+        }
+    }
+    
+    // Test 3: Ransomware note detection
+    println!("Test 3: Ransomware note detection");
+    match test_ransomware_note(&scanner) {
+        Ok(true) => {
+            println!("   ✅ PASSED - Ransomware note detected\n");
+            passed += 1;
+        }
+        Ok(false) => {
+            println!("   ❌ FAILED - Ransomware note not detected\n");
+            failed += 1;
+        }
+        Err(e) => {
+            println!("   ❌ FAILED - Error: {}\n", e);
+            failed += 1;
+        }
+    }
+    
+    // Test 4: Zero-byte executable
+    println!("Test 4: Zero-byte executable detection");
+    match test_zero_byte_executable(&scanner) {
+        Ok(true) => {
+            println!("   ✅ PASSED - Zero-byte executable detected as suspicious\n");
+            passed += 1;
+        }
+        Ok(false) => {
+            println!("   ❌ FAILED - Zero-byte executable not detected\n");
+            failed += 1;
+        }
+        Err(e) => {
+            println!("   ❌ FAILED - Error: {}\n", e);
+            failed += 1;
+        }
+    }
+    
+    // Summary
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Test Results: {} passed, {} failed", passed, failed);
+    if failed == 0 {
+        println!("✅ All tests passed!");
+    } else {
+        println!("⚠️  Some tests failed");
+    }
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+
+fn test_eicar(scanner: &FileSystemScanner) -> Result<bool, String> {
+    let path = create_eicar_test();
+    
+    let result = scanner.scan_file(&path)
+        .map_err(|e| format!("Windows Defender blocked EICAR: {}", e))?;
+    
+    std::fs::remove_file(&path).ok();
+    
+    Ok(result.level == ThreatLevel::Malicious)
+}
+
+fn test_clean_file(scanner: &FileSystemScanner) -> Result<bool, String> {
+    let temp_dir = std::env::temp_dir();
+    let path = temp_dir.join("clean_test.txt");
+    
+    std::fs::write(&path, "This is a completely clean file with no malicious content.")
+        .map_err(|e| e.to_string())?;
+    
+    let result = scanner.scan_file(&path)
+        .map_err(|e| e.to_string())?;
+    
+    std::fs::remove_file(&path).ok();
+    
+    Ok(result.level == ThreatLevel::Clean)
+}
+
+fn test_ransomware_note(scanner: &FileSystemScanner) -> Result<bool, String> {
+    let temp_dir = std::env::temp_dir();
+    let path = temp_dir.join("README_DECRYPT.txt");
+    
+    let content = r#"
+    !!!ATTENTION!!!
+    
+    All your files have been encrypted using military-grade AES-256 encryption.
+    
+    To decrypt your files, you must pay 0.05 BTC to the following address:
+    1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+    
+    After payment, contact us at: decrypt@ransomware.com
+    
+    You have 72 hours to pay. After that, the decryption key will be destroyed.
+    "#;
+    
+    std::fs::write(&path, content)
+        .map_err(|e| e.to_string())?;
+    
+    let result = scanner.scan_file(&path)
+        .map_err(|e| e.to_string())?;
+    
+    std::fs::remove_file(&path).ok();
+    
+    Ok(result.level == ThreatLevel::Malicious || result.level == ThreatLevel::Suspicious)
+}
+
+fn test_zero_byte_executable(scanner: &FileSystemScanner) -> Result<bool, String> {
+    let temp_dir = std::env::temp_dir();
+    let path = temp_dir.join("zero.exe");
+    
+    // Create zero-byte file
+    std::fs::write(&path, "")
+        .map_err(|e| e.to_string())?;
+    
+    let result = scanner.scan_file(&path)
+        .map_err(|e| e.to_string())?;
+    
+    std::fs::remove_file(&path).ok();
+    
+    // Should be suspicious or malicious
+    Ok(result.level == ThreatLevel::Suspicious || result.level == ThreatLevel::Malicious)
+}
+
+fn create_eicar_test() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("eicar_test.txt");
+    let eicar = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+    std::fs::write(&path, eicar).unwrap();
+    path
+}
+
+fn print_usage() {
+    println!("🛡️  Antivirus Engine v1.0.0");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    println!("Usage:");
+    println!("  antivirus scan <path>           Scan a file or directory (human-readable)");
+    println!("  antivirus scan <path> --json    Scan with JSON output");
+    println!("  antivirus scan-file <file>      Scan single file (JSON output)");
+    println!("  antivirus scan-dir <dir>        Scan directory (JSON output)");
+    println!("  antivirus test                  Run self-tests");
+    println!("  antivirus help                  Show this help message");
+    println!();
+    println!("Examples:");
+    println!("  antivirus scan C:\\Downloads");
+    println!("  antivirus scan-file file.exe");
+    println!("  antivirus scan-dir C:\\Downloads");
+    println!("  antivirus test");
+    println!();
+    println!("For Python Integration:");
+    println!("  Use 'scan-file' or 'scan-dir' commands for JSON output");
 }

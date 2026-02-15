@@ -90,7 +90,8 @@ class ScanPanel(ctk.CTkFrame):
             height=40,
             font=ctk.CTkFont(size=14),
             fg_color="transparent",
-            hover_color=("gray70", "gray30")
+            hover_color=("gray70", "gray30"),
+            border_width=2
         )
         self.clear_button.grid(row=0, column=2, padx=5, sticky="ew")
         
@@ -213,19 +214,27 @@ class ScanPanel(ctk.CTkFrame):
         
         # Show empty label if no targets
         if not self.scan_targets:
-            self.empty_label.grid()
+            self.empty_label.grid(row=0, column=0, pady=30)
     
     def _clear_targets(self):
         """Clear all scan targets."""
+        print("DEBUG: Clear All button clicked")
+        
+        # Clear the list
         self.scan_targets.clear()
         
         # Destroy all target items
-        for widget in self.targets_scroll.winfo_children():
+        for widget in list(self.targets_scroll.winfo_children()):
             if widget != self.empty_label:
                 widget.destroy()
         
         # Show empty label
-        self.empty_label.grid()
+        self.empty_label.grid(row=0, column=0, pady=30)
+        
+        # Force UI update
+        self.targets_scroll.update_idletasks()
+        
+        print(f"DEBUG: Targets cleared. Remaining: {len(self.scan_targets)}")
     
     def get_scan_targets(self):
         """Get list of scan targets."""
