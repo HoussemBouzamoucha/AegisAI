@@ -120,7 +120,7 @@ fn scan_directory_json(path: &Path) {
             "is_threat": result.level.is_threat(),
         }));
     }
-    
+
     let output = json!({
         "success": true,
         "statistics": {

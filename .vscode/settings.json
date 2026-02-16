@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./Antivirus_Engine/src",
+        "./Antivirus_Engine/src"
+    ]
+}
