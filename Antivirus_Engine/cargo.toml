@@ -48,3 +48,5 @@ strip = true
 name = "antivirus"
 path = "src/main.rs"
 required-features = []
+
+sysinfo = "0.30"

@@ -194,6 +194,114 @@ class AntivirusEngine:
         except Exception as e:
             print(f"Error running tests: {e}")
             return False
+    
+    def scan_processes(self) -> Dict:
+        """
+        Scan all running processes for threats
+        
+        Returns:
+            Dict with process scan results:
+            {
+                "success": bool,
+                "statistics": {
+                    "total_processes": int,
+                    "safe_processes": int,
+                    "suspicious_processes": int,
+                    "malicious_processes": int,
+                    "critical_processes": int,
+                    "total_memory_mb": str
+                },
+                "processes": [
+                    {
+                        "pid": int,
+                        "name": str,
+                        "path": Optional[str],
+                        "memory_mb": str,
+                        "cpu_usage": float,
+                        "threat_level": str,
+                        "suspicious_behaviors": List[str],
+                        "is_threat": bool
+                    },
+                    ...
+                ]
+            }
+        """
+        try:
+            result = subprocess.run(
+                [self.binary_path, "scan-processes"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30
+            )
+            
+            if result.returncode != 0 and not result.stdout:
+                return {
+                    "success": False,
+                    "error": f"Scanner returned error code {result.returncode}: {result.stderr}"
+                }
+            
+            # Parse JSON output
+            return json.loads(result.stdout)
+            
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Process scan timeout (30s)"}
+        except json.JSONDecodeError as e:
+            return {"success": False, "error": f"Invalid JSON response: {e}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    def kill_process(self, pid: int) -> Dict:
+        """
+        Terminate a malicious process
+        
+        Args:
+            pid: Process ID to terminate
+            
+        Returns:
+            Dict with termination result:
+            {
+                "success": bool,
+                "message": Optional[str],
+                "error": Optional[str]
+            }
+        """
+        try:
+            result = subprocess.run(
+                [self.binary_path, "kill-process", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10
+            )
+            
+            if result.stdout:
+                return json.loads(result.stdout)
+            else:
+                return {"success": False, "error": "No response from engine"}
+            
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Timeout terminating process"}
+        except json.JSONDecodeError as e:
+            return {"success": False, "error": f"Invalid JSON response: {e}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    def get_process_threats(self, scan_result: Dict) -> List[Dict]:
+        """
+        Extract only threatening processes from scan result
+        
+        Args:
+            scan_result: Result from scan_processes()
+            
+        Returns:
+            List of processes that are threats
+        """
+        if not scan_result.get("success"):
+            return []
+        
+        processes = scan_result.get("processes", [])
+        return [p for p in processes if p.get("is_threat", False)]
 
 
 # Example usage and integration helper

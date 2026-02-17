@@ -1,9 +1,10 @@
 // File: src/main.rs
-// JSON-Compatible Antivirus Scanner for Python Integration
+// JSON-Compatible Antivirus Scanner with Process Monitoring
 
 mod core;
 
 use core::file_system::scanner::FileSystemScanner;
+use core::process::scanner::ProcessScanner;
 use core::types::ThreatLevel;
 use std::path::Path;
 use std::env;
@@ -36,7 +37,6 @@ fn main() {
             }
         }
         "scan-file" => {
-            // For Python: single file scan with JSON output
             if args.len() < 3 {
                 println!("{{\"error\": \"No file path provided\"}}");
                 return;
@@ -46,7 +46,6 @@ fn main() {
             scan_single_file_json(path);
         }
         "scan-dir" => {
-            // For Python: directory scan with JSON output
             if args.len() < 3 {
                 println!("{{\"error\": \"No directory path provided\"}}");
                 return;
@@ -54,6 +53,23 @@ fn main() {
             
             let path = Path::new(&args[2]);
             scan_directory_json(path);
+        }
+        "scan-processes" => {
+            // NEW: Scan all running processes
+            scan_processes_json();
+        }
+        "kill-process" => {
+            // NEW: Terminate a malicious process
+            if args.len() < 3 {
+                println!("{{\"error\": \"No PID provided\"}}");
+                return;
+            }
+            
+            if let Ok(pid) = args[2].parse::<u32>() {
+                kill_process_json(pid);
+            } else {
+                println!("{{\"error\": \"Invalid PID\"}}");
+            }
         }
         "test" => {
             run_tests();
@@ -63,6 +79,62 @@ fn main() {
         }
         _ => {
             eprintln!("{{\"error\": \"Unknown command: {}\"}}",  command);
+        }
+    }
+}
+
+/// Scan all running processes and output JSON
+fn scan_processes_json() {
+    let scanner = ProcessScanner::new();
+    
+    match scanner.scan_all_processes() {
+        Ok(processes) => {
+            let stats = scanner.get_statistics(&processes);
+            
+            let process_list: Vec<_> = processes.iter().map(|p| {
+                json!({
+                    "pid": p.pid,
+                    "name": p.name,
+                    "path": p.path,
+                    "memory_mb": format!("{:.2}", p.memory_mb),
+                    "cpu_usage": p.cpu_usage,
+                    "threat_level": p.threat_level.as_str(),
+                    "suspicious_behaviors": p.suspicious_behaviors,
+                    "is_threat": p.threat_level != core::process::scanner::ProcessThreatLevel::Safe,
+                })
+            }).collect();
+            
+            let output = json!({
+                "success": true,
+                "statistics": {
+                    "total_processes": stats.total_processes,
+                    "safe_processes": stats.safe_processes,
+                    "suspicious_processes": stats.suspicious_processes,
+                    "malicious_processes": stats.malicious_processes,
+                    "critical_processes": stats.critical_processes,
+                    "total_memory_mb": format!("{:.2}", stats.total_memory_mb),
+                },
+                "processes": process_list,
+            });
+            
+            println!("{}", output);
+        }
+        Err(e) => {
+            println!("{{\"success\": false, \"error\": \"{}\"}}", e);
+        }
+    }
+}
+
+/// Terminate a process by PID
+fn kill_process_json(pid: u32) {
+    let scanner = ProcessScanner::new();
+    
+    match scanner.terminate_process(pid) {
+        Ok(()) => {
+            println!("{{\"success\": true, \"message\": \"Process {} terminated\"}}", pid);
+        }
+        Err(e) => {
+            println!("{{\"success\": false, \"error\": \"{}\"}}", e);
         }
     }
 }
@@ -120,7 +192,7 @@ fn scan_directory_json(path: &Path) {
             "is_threat": result.level.is_threat(),
         }));
     }
-
+    
     let output = json!({
         "success": true,
         "statistics": {
@@ -395,6 +467,8 @@ fn print_usage() {
     println!("  antivirus scan <path> --json    Scan with JSON output");
     println!("  antivirus scan-file <file>      Scan single file (JSON output)");
     println!("  antivirus scan-dir <dir>        Scan directory (JSON output)");
+    println!("  antivirus scan-processes        Scan all running processes (JSON output)");
+    println!("  antivirus kill-process <PID>    Terminate a process");
     println!("  antivirus test                  Run self-tests");
     println!("  antivirus help                  Show this help message");
     println!();
@@ -402,8 +476,10 @@ fn print_usage() {
     println!("  antivirus scan C:\\Downloads");
     println!("  antivirus scan-file file.exe");
     println!("  antivirus scan-dir C:\\Downloads");
+    println!("  antivirus scan-processes");
+    println!("  antivirus kill-process 1234");
     println!("  antivirus test");
     println!();
     println!("For Python Integration:");
-    println!("  Use 'scan-file' or 'scan-dir' commands for JSON output");
+    println!("  Use 'scan-file', 'scan-dir', or 'scan-processes' commands for JSON output");
 }

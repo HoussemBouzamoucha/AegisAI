@@ -1,5 +1,5 @@
 """
-Main Window - Fixed to use AntivirusEngine wrapper
+Main Window - With File Scanner and Process Monitor Tabs
 """
 
 import customtkinter as ctk
@@ -10,14 +10,15 @@ from gui.components.sidebar import SidebarFrame
 from engine_wrapper import AntivirusEngine
 import traceback
 from pathlib import Path
+import threading
 
 class MainWindow(ctk.CTk):
-    """Main application window."""
+    """Main application window with file scanner and process monitor."""
     
     def __init__(self, config):
         super().__init__()
         
-        # Initialize the NEW engine wrapper
+        # Initialize the engine
         self.engine = AntivirusEngine(config.rust_engine_path)
         print(f"✅ Rust engine initialized at: {config.rust_engine_path}")
 
@@ -69,24 +70,68 @@ class MainWindow(ctk.CTk):
         self.header = HeaderFrame(self, config=self.config)
         self.header.grid(row=0, column=1, sticky="ew", padx=20, pady=(20, 0))
         
-        # Main content frame
+        # Main content frame with tabs
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.content_frame.grid(row=1, column=1, sticky="nsew", padx=20, pady=20)
         self.content_frame.grid_columnconfigure(0, weight=1)
-        self.content_frame.grid_rowconfigure(1, weight=1)
+        self.content_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create tabview
+        self.tabview = ctk.CTkTabview(self.content_frame)
+        self.tabview.pack(fill="both", expand=True)
+        
+        # Tab 1: File Scanner
+        self.file_tab = self.tabview.add("📁 File Scanner")
+        self._create_file_scanner_tab()
+        
+        # Tab 2: Process Monitor
+        self.process_tab = self.tabview.add("🖥️ Process Monitor")
+        self._create_process_monitor_tab()
+        
+        print("✅ Main window created successfully with tabs")
+    
+    def _create_file_scanner_tab(self):
+        """Create file scanner tab content"""
+        # Configure tab grid
+        self.file_tab.grid_columnconfigure(0, weight=1)
+        self.file_tab.grid_rowconfigure(1, weight=1)
         
         # Scan panel (input)
         self.scan_panel = ScanPanel(
-            self.content_frame,
+            self.file_tab,
             on_scan=self._start_scan
         )
-        self.scan_panel.grid(row=0, column=0, sticky="ew", pady=(0, 20))
+        self.scan_panel.grid(row=0, column=0, sticky="ew", pady=(0, 20), padx=10)
         
         # Results panel (output)
-        self.results_panel = ResultsPanel(self.content_frame)
-        self.results_panel.grid(row=1, column=0, sticky="nsew")
-        
-        print("✅ Main window created successfully")
+        self.results_panel = ResultsPanel(self.file_tab)
+        self.results_panel.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+    
+    def _create_process_monitor_tab(self):
+        """Create process monitor tab content"""
+        try:
+            from gui.components.process_panel import ProcessPanel
+            
+            # Process monitoring panel
+            self.process_panel = ProcessPanel(
+                self.process_tab,
+                on_refresh=self._scan_processes,
+                on_kill=self._kill_process
+            )
+            self.process_panel.pack(fill="both", expand=True, padx=10, pady=10)
+            
+            print("✅ Process monitor tab created")
+            
+        except ImportError as e:
+            print(f"⚠️  Process panel not available: {e}")
+            # Create placeholder
+            placeholder = ctk.CTkLabel(
+                self.process_tab,
+                text="🚧 Process Monitor\n\nProcess monitoring feature is not yet available.\nPlease add process_panel.py to gui/components/",
+                font=ctk.CTkFont(size=16),
+                text_color="gray"
+            )
+            placeholder.pack(expand=True)
     
     def _bind_events(self):
         """Bind keyboard shortcuts and events."""
@@ -107,18 +152,27 @@ class MainWindow(ctk.CTk):
     
     def _handle_scan(self):
         """Handle scan button click from sidebar."""
+        # Switch to file scanner tab
+        self.tabview.set("📁 File Scanner")
         self._start_scan()
     
     def _show_settings(self):
         """Show settings dialog."""
-        from gui.dialogs.settings_dialog import SettingsDialog
-        dialog = SettingsDialog(self, self.config)
-        dialog.grab_set()
+        try:
+            from gui.dialogs.settings_dialog import SettingsDialog
+            dialog = SettingsDialog(self, self.config)
+            dialog.grab_set()
+        except ImportError:
+            print("⚠️  Settings dialog not available")
+    
+    # ========================================
+    # FILE SCANNING METHODS
+    # ========================================
     
     def _start_scan(self):
-        """Start the scanning process."""
+        """Start the file scanning process."""
         print("\n" + "=" * 80)
-        print("Starting scan...")
+        print("Starting file scan...")
         
         # Get scan targets from scan panel
         targets = self.scan_panel.get_scan_targets()
@@ -140,7 +194,6 @@ class MainWindow(ctk.CTk):
         self.sidebar.set_scanning_state(True)
         
         # Start scan in background thread
-        import threading
         thread = threading.Thread(
             target=self._perform_scan,
             args=(targets,),
@@ -150,12 +203,9 @@ class MainWindow(ctk.CTk):
         print("=" * 80 + "\n")
     
     def _perform_scan(self, targets):
-        """
-        Perform the actual scan (runs in background thread).
-        Uses the new AntivirusEngine wrapper.
-        """
+        """Perform the actual scan (runs in background thread)."""
         try:
-            print("Scanning with new engine wrapper...")
+            print("Scanning with engine wrapper...")
             all_results = []
             
             for idx, target in enumerate(targets):
@@ -259,11 +309,6 @@ class MainWindow(ctk.CTk):
             signature=json_data.get("signature")
         )
     
-    def _scan_progress_callback(self, current, total, result):
-        """Callback for scan progress updates."""
-        self.after(0, lambda: self.scan_panel.update_progress(current, total))
-        self.after(0, lambda r=result: self._update_results([r]))
-    
     def _update_results(self, results):
         """Update results panel with new results."""
         try:
@@ -319,6 +364,86 @@ class MainWindow(ctk.CTk):
         
         return stats
     
+    # ========================================
+    # PROCESS MONITORING METHODS
+    # ========================================
+    
+    def _scan_processes(self):
+        """Scan all running processes"""
+        print("Scanning processes...")
+        
+        # Disable refresh button
+        if hasattr(self, 'process_panel'):
+            self.process_panel.set_scanning_state(True)
+        
+        def scan_thread():
+            try:
+                result = self.engine.scan_processes()
+                
+                if result.get("success"):
+                    processes = result.get("processes", [])
+                    stats = result.get("statistics", {})
+                    
+                    print(f"Found {len(processes)} processes")
+                    print(f"Statistics: {stats}")
+                    
+                    # Update UI on main thread
+                    self.after(0, lambda: self._update_process_display(processes, stats))
+                else:
+                    error = result.get("error", "Unknown error")
+                    print(f"Process scan error: {error}")
+                    self.after(0, lambda: self._show_error(f"Process scan failed: {error}"))
+                    
+            except Exception as e:
+                print(f"ERROR scanning processes: {e}")
+                traceback.print_exc()
+                self.after(0, lambda: self._show_error(f"Process scan error: {e}"))
+            
+            # Re-enable refresh button
+            if hasattr(self, 'process_panel'):
+                self.after(0, lambda: self.process_panel.set_scanning_state(False))
+        
+        threading.Thread(target=scan_thread, daemon=True).start()
+    
+    def _update_process_display(self, processes, stats):
+        """Update process panel with scan results"""
+        try:
+            if hasattr(self, 'process_panel'):
+                self.process_panel.update_processes(processes, stats)
+                print(f"Process panel updated with {len(processes)} processes")
+        except Exception as e:
+            print(f"ERROR updating process display: {e}")
+            traceback.print_exc()
+    
+    def _kill_process(self, pid: int):
+        """Terminate a malicious process"""
+        print(f"Terminating process PID: {pid}")
+        
+        def kill_thread():
+            try:
+                result = self.engine.kill_process(pid)
+                
+                if result.get("success"):
+                    print(f"Process {pid} terminated successfully")
+                    # Refresh process list after 1 second
+                    self.after(1000, self._scan_processes)
+                    self.after(0, lambda: self._show_success(f"Process {pid} terminated"))
+                else:
+                    error = result.get("error", "Unknown error")
+                    print(f"Failed to kill process: {error}")
+                    self.after(0, lambda: self._show_error(f"Failed to kill process: {error}"))
+                    
+            except Exception as e:
+                print(f"ERROR killing process: {e}")
+                traceback.print_exc()
+                self.after(0, lambda: self._show_error(f"Error: {e}"))
+        
+        threading.Thread(target=kill_thread, daemon=True).start()
+    
+    # ========================================
+    # UTILITY METHODS
+    # ========================================
+    
     def _show_error(self, message):
         """Show error message to user."""
         try:
@@ -333,3 +458,23 @@ class MainWindow(ctk.CTk):
         except:
             # Fallback if dialog doesn't exist
             print(f"ERROR: {message}")
+            # Show in a simple dialog
+            import tkinter.messagebox as messagebox
+            messagebox.showerror("Error", message)
+    
+    def _show_success(self, message):
+        """Show success message to user."""
+        try:
+            from gui.dialogs.message_dialog import MessageDialog
+            dialog = MessageDialog(
+                self,
+                title="Success",
+                message=message,
+                icon="success"
+            )
+            dialog.grab_set()
+        except:
+            # Fallback
+            print(f"SUCCESS: {message}")
+            import tkinter.messagebox as messagebox
+            messagebox.showinfo("Success", message)

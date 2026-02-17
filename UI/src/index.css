@@ -1,0 +1,79 @@
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=IBM+Plex+Mono:wght@300;400;500&family=Barlow:wght@300;400;500;600&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --void:       #030508;
+  --base:       #070b12;
+  --surface:    #0b1120;
+  --elevated:   #0f1830;
+  --hover:      #152040;
+
+  --border:     rgba(0, 255, 136, 0.12);
+  --border-md:  rgba(0, 255, 136, 0.25);
+  --border-hi:  rgba(0, 255, 136, 0.5);
+
+  --green:      #00ff88;
+  --green-dim:  #00cc6a;  
+  --green-glow: rgba(0, 255, 136, 0.15);
+  --amber:      #ffb300;
+  --amber-glow: rgba(255, 179, 0, 0.15);
+  --red:        #ff3355;
+  --red-glow:   rgba(255, 51, 85, 0.15);
+  --cyan:       #00d4ff;
+  --cyan-glow:  rgba(0, 212, 255, 0.12);
+
+  --text:       #c8e6d4;
+  --text-dim:   #4a6b57;
+  --text-bright:#e8fff2;
+
+  --font-hud:   'Orbitron', monospace;
+  --font-mono:  'IBM Plex Mono', monospace;
+  --font-body:  'Barlow', sans-serif;
+}
+
+html, body, #root {
+  width: 100%; height: 100%;
+  background: var(--void);
+  color: var(--text);
+  font-family: var(--font-body);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* Subtle grid background */
+body {
+  background-image:
+    linear-gradient(rgba(0,255,136,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,255,136,0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-track { background: var(--base); }
+::-webkit-scrollbar-thumb { background: var(--green-dim); border-radius: 2px; }
+
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+@keyframes scan  { 0%{transform:translateY(-100%)} 100%{transform:translateY(200%)} }
+@keyframes spin  { to{transform:rotate(360deg)} }
+@keyframes glow-pulse {
+  0%,100% { box-shadow: 0 0 8px var(--green-glow); }
+  50%      { box-shadow: 0 0 24px rgba(0,255,136,0.4); }
+}
+@keyframes fadeUp {
+  from { opacity:0; transform:translateY(8px); }
+  to   { opacity:1; transform:translateY(0); }
+}
+@keyframes slideIn {
+  from { opacity:0; transform:translateX(-8px); }
+  to   { opacity:1; transform:translateX(0); }
+}
+@keyframes countUp {
+  from { opacity:0; transform:scale(.9); }
+  to   { opacity:1; transform:scale(1); }
+}
+
+.anim-fade  { animation: fadeUp  0.25s ease forwards; }
+.anim-slide { animation: slideIn 0.25s ease forwards; }
+.anim-count { animation: countUp 0.3s ease forwards; }
