@@ -20,6 +20,13 @@ export interface ScanStats {
   error_files: number;
   total_size_mb: number;
 }
+export interface ScanOutput {
+  success: boolean;
+  files: ScanResult[];
+  statistics: ScanStats;
+  error?: string;
+}
+
 
 export interface DirectoryScanResult {
   success: boolean;

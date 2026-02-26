@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useStore } from '../store/store';
+import { useStore } from '../store';
 import { RefreshCw, Cpu, Trash2, AlertTriangle, CheckCircle, Loader, Search } from 'lucide-react';
 import type { ProcessInfo } from '../types';
 

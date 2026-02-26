@@ -1,4 +1,4 @@
-import { useStore } from '../store/store';
+import { useStore } from '../store';
 import { Clock, FolderOpen, FileText, CheckCircle, AlertTriangle, Trash2 } from 'lucide-react';
 
 export default function History() {

@@ -1,6 +1,6 @@
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Minus, Square, X, Shield } from 'lucide-react';
-import { useStore } from '../store/store';
+import { useStore } from '../store';
 
 export default function TitleBar() {
   const engineReady = useStore(s => s.engineReady);

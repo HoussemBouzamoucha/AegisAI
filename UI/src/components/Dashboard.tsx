@@ -1,4 +1,4 @@
-import { useStore } from '../store/store';
+import { useStore } from '../store';
 import { Shield, AlertTriangle, CheckCircle, Cpu, FolderSearch, Clock } from 'lucide-react';
 import { RadialBarChart, RadialBar, ResponsiveContainer, PolarAngleAxis } from 'recharts';
 

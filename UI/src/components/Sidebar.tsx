@@ -1,6 +1,7 @@
 import { LayoutDashboard, FolderSearch, Cpu, ClockIcon } from 'lucide-react';
-import { useStore } from '../store/store';
+import { useStore } from '../store';
 import type { View } from '../types';
+
 
 const NAV: { id: View; label: string; icon: React.ReactNode; }[] = [
   { id: 'dashboard',  label: 'OVERVIEW',  icon: <LayoutDashboard size={18} /> },

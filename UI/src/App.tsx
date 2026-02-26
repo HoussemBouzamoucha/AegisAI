@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useStore } from './store/store';
+import { useStore } from './store/index';
 import TitleBar from './components/TitleBar';
 import Sidebar from './components/Sidebar';
 import Dashboard from './components/Dashboard';

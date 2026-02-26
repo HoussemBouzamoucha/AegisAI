@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useStore } from '../store/store';
+import { useStore } from '../store';
 import { FolderOpen, FileSearch, X, AlertTriangle, CheckCircle, Loader, ChevronDown, ChevronRight } from 'lucide-react';
 import type { ScanResult } from '../types';
 
