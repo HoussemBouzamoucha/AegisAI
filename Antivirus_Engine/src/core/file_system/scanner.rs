@@ -1,16 +1,85 @@
 // File: src/core/file_system/scanner.rs
-// Multi-Hash Dynamic Scanner with YARA Integration
+// Multi-layer scanner with unified scoring + directory context analysis.
+//
+// Detection pipeline (single file):
+//   1. Hash signature DB  → instant Malicious (definitive)
+//   2. YARA rules         → score contribution
+//                            strong rule  +10  (named malware families)
+//                            weak/FP rule  +1  (generic patterns)
+//   3. Heuristics         → score contribution (see heuristics.rs)
+//   4. Score decision     → MALICIOUS(>=10) / SUSPICIOUS(>=4) / CLEAN
+//
+// Directory scan adds a 5th pass:
+//   5. Context analysis   → escalation + context_flags + YARA/filename correlation
+//
+// All results carry ML classification fields:
+//   confidence_score, detection_signals, file_category, context_flags
 
-use crate::core::file_system::signature::SignatureDatabase;
+use crate::core::file_system::context::ContextAnalyzer;
 use crate::core::file_system::heuristics::HeuristicAnalyzer;
+use crate::core::file_system::signature::SignatureDatabase;
 use crate::core::file_system::yara_engine::YaraEngine;
-use crate::core::types::{ScanResult, ThreatLevel};
+use crate::core::types::{DetectionSignal, FileCategory, ScanResult, ThreatLevel};
 use std::path::Path;
 use anyhow::Result;
-use sha2::{Sha256, Sha512, Digest};
+use sha2::{Digest, Sha256, Sha512};
 use hex;
 
-/// File hash information with multiple algorithms
+// ─── Score thresholds ────────────────────────────────────────────────────────
+
+const MALICIOUS_THRESHOLD: i32 = 10;
+const SUSPICIOUS_THRESHOLD: i32 = 4;
+
+// ─── YARA scoring policy ─────────────────────────────────────────────────────
+
+const YARA_STRONG_SCORE: i32 = 10;
+const YARA_WEAK_SCORE: i32 = 1;
+
+const YARA_WEAK_RULES: &[&str] = &[
+    // Generic pattern rules
+    "contains_base64", "base64_encoded", "Base64_Encoded_String",
+    "long_string", "BigFiles", "suspicious_strings", "generic",
+    // Network indicator rules — belong in network scanner
+    "domain", "ip", "ip_address", "url", "network", "http", "email",
+    // Tool name rules — too generic, firing on any script that calls the tool
+    "powershell",
+    "cmd",
+    "wscript",
+    "mshta",
+    // Misc catch-all rules — not specific enough
+    "misc_suspicious",
+    "miscellaneous",
+];
+
+/// Extensions YARA will scan — executables and scripts only.
+/// Documents excluded to prevent false positives from generic rules.
+const YARA_SCAN_EXTENSIONS: &[&str] = &[
+    "exe", "dll", "sys", "drv", "ocx", "cpl", "scr",
+    "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse", "wsf", "wsh",
+    "msi", "msp", "com", "pif", "lnk",
+    "xlsm", "docm", "pptm", "xlam",
+    "elf", "so", "dylib", "sh",
+    "py", "rb", "pl",
+];
+
+fn should_yara_scan(path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => YARA_SCAN_EXTENSIONS.contains(&ext.to_lowercase().as_str()),
+        None => true,
+    }
+}
+
+fn yara_rule_score(rule_name: &str) -> i32 {
+    let lower = rule_name.to_lowercase();
+    if YARA_WEAK_RULES.iter().any(|w| lower.contains(&w.to_lowercase())) {
+        YARA_WEAK_SCORE
+    } else {
+        YARA_STRONG_SCORE
+    }
+}
+
+// ─── Statistics ───────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct FileHashes {
     pub md5: String,
@@ -18,7 +87,6 @@ pub struct FileHashes {
     pub sha512: String,
 }
 
-/// Scanning statistics
 #[derive(Debug, Clone)]
 pub struct ScanStatistics {
     pub total_files: usize,
@@ -44,29 +112,27 @@ impl ScanStatistics {
     pub fn update(&mut self, result: &ScanResult, file_size: u64) {
         self.total_files += 1;
         self.total_size_scanned += file_size;
-
         match result.level {
-            ThreatLevel::Clean => self.clean_files += 1,
+            ThreatLevel::Clean      => self.clean_files += 1,
             ThreatLevel::Suspicious => self.suspicious_files += 1,
-            ThreatLevel::Malicious => self.malicious_files += 1,
+            ThreatLevel::Malicious  => self.malicious_files += 1,
         }
     }
 
-    pub fn add_error(&mut self) {
-        self.error_files += 1;
-    }
+    pub fn add_error(&mut self) { self.error_files += 1; }
 }
 
 impl Default for ScanStatistics {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
+
+// ─── Scanner ──────────────────────────────────────────────────────────────────
 
 pub struct FileSystemScanner {
     signatures: SignatureDatabase,
     heuristics: HeuristicAnalyzer,
     yara: YaraEngine,
+    context: ContextAnalyzer,
     enable_multi_hash: bool,
     enable_deep_scan: bool,
     enable_yara: bool,
@@ -78,45 +144,34 @@ impl FileSystemScanner {
     }
 
     pub fn with_options(enable_multi_hash: bool, enable_deep_scan: bool, enable_yara: bool) -> Self {
-        let yara = if enable_yara {
-            YaraEngine::default()
-        } else {
-            YaraEngine::disabled()
-        };
-
+        let yara = if enable_yara { YaraEngine::default() } else { YaraEngine::disabled() };
         Self {
             signatures: SignatureDatabase::new(),
             heuristics: HeuristicAnalyzer::new(),
             yara,
+            context: ContextAnalyzer::new(),
             enable_multi_hash,
             enable_deep_scan,
             enable_yara,
         }
     }
 
-    /// Load YARA rules from a specific directory
     pub fn load_yara_rules(&mut self, rules_dir: &Path) -> Result<usize> {
         self.yara = YaraEngine::load_from_directory(rules_dir)?;
         Ok(self.yara.rules_loaded)
     }
 
-    /// Main file scanning entry point with comprehensive analysis
+    // ── Single file scan ──────────────────────────────────────────────────────
+
     pub fn scan_file(&self, path: &Path) -> Result<ScanResult> {
-        // 0. Get file metadata
         let _metadata = match std::fs::metadata(path) {
             Ok(m) => m,
-            Err(e) => {
-                return Ok(ScanResult {
-                    path: path.to_path_buf(),
-                    level: ThreatLevel::Clean,
-                    reason: format!("Cannot access file: {}", e),
-                    hash: None,
-                    signature: None,
-                });
-            }
+            Err(e) => return Ok(ScanResult::error(
+                path.to_path_buf(),
+                format!("Cannot access file: {}", e),
+            )),
         };
 
-        // 1. Calculate file hashes
         let hashes = if self.enable_multi_hash {
             self.calculate_all_hashes(path)?
         } else {
@@ -127,148 +182,129 @@ impl FileSystemScanner {
             }
         };
 
-        // 2. Check hash signature database
+        // ── Layer 1: Hash DB (definitive — bypasses scoring) ──────────────────
         if let Some(signature) = self.check_all_hashes(&hashes) {
-            return Ok(ScanResult {
-                path: path.to_path_buf(),
-                level: ThreatLevel::Malicious,
-                reason: format!("Known malware signature: {}", signature),
-                hash: Some(hashes.sha256.clone()),
-                signature: Some(signature.to_string()),
-            });
+            let category = FileCategory::from_path(path);
+            return Ok(ScanResult::from_parts(
+                path.to_path_buf(),
+                ThreatLevel::Malicious,
+                format!("Known malware signature: {}", signature),
+                Some(hashes.sha256),
+                Some(signature.to_string()),
+                1.0,
+                vec![DetectionSignal::new("hash", format!("Hash match: {}", signature), 100)],
+            ));
         }
 
-        // 3. YARA rule matching
-        if self.enable_yara && self.yara.is_ready() {
+        // ── Unified scoring: YARA + Heuristics ───────────────────────────────
+        let mut total_score: i32 = 0;
+        let mut all_signals: Vec<DetectionSignal> = Vec::new();
+        let mut score_reasons: Vec<String> = Vec::new();
+        let mut primary_signature: Option<String> = None;
+
+        // ── Layer 2: YARA ─────────────────────────────────────────────────────
+        if self.enable_yara && self.yara.is_ready() && should_yara_scan(path) {
             match self.yara.scan_file(path) {
                 Ok(matches) if !matches.is_empty() => {
-                    // Default to Malicious — YARA rules are explicit detections.
-                    // Only downgrade to Suspicious if the rule is explicitly
-                    // tagged as informational or low-confidence.
-                    let is_low_confidence = matches.iter().all(|m| {
-                        m.tags.iter().any(|t| {
-                            let t = t.to_lowercase();
-                            t == "suspicious" || t == "info" || t == "informational"
-                                || t == "low" || t == "fp_prone"
-                        })
-                    });
+                    let mut yara_score = 0i32;
+                    let mut rule_names: Vec<String> = Vec::new();
 
-                    let level = if is_low_confidence {
-                        ThreatLevel::Suspicious
-                    } else {
-                        ThreatLevel::Malicious
-                    };
+                    for m in &matches {
+                        let rs = yara_rule_score(&m.rule_name);
+                        yara_score += rs;
+                        rule_names.push(m.rule_name.clone());
 
-                    let rule_names: Vec<String> = matches
-                        .iter()
-                        .map(|m| m.rule_name.clone())
-                        .collect();
+                        let desc = m.meta_description.clone()
+                            .unwrap_or_else(|| m.rule_name.clone());
+                        all_signals.push(DetectionSignal::new("yara", desc, rs));
+                    }
 
-                    let description = matches
-                        .first()
-                        .and_then(|m| m.meta_description.clone())
-                        .unwrap_or_else(|| format!("Matched {} YARA rule(s)", matches.len()));
-
-                    return Ok(ScanResult {
-                        path: path.to_path_buf(),
-                        level,
-                        reason: format!("YARA match — {}: {}", rule_names.join(", "), description),
-                        hash: Some(hashes.sha256.clone()),
-                        signature: Some(rule_names.join(", ")),
-                    });
+                    if yara_score > 0 {
+                        total_score += yara_score;
+                        let description = matches.first()
+                            .and_then(|m| m.meta_description.clone())
+                            .unwrap_or_else(|| format!("{} rule(s)", matches.len()));
+                        score_reasons.push(format!(
+                            "YARA +{} ({}): {}",
+                            yara_score, rule_names.join(", "), description
+                        ));
+                        primary_signature = Some(rule_names.join(", "));
+                    }
                 }
-                Err(e) => {
-                    eprintln!("YARA scan error for {}: {}", path.display(), e);
-                }
+                Err(e) => eprintln!("YARA error for {}: {}", path.display(), e),
                 _ => {}
             }
         }
 
-        // 4. Dynamic heuristic analysis
+        // ── Layer 3: Heuristics ───────────────────────────────────────────────
         if self.enable_deep_scan {
             match self.heuristics.analyze(path) {
                 Ok(heuristic_result) => {
                     if heuristic_result.level != ThreatLevel::Clean {
-                        return Ok(ScanResult {
-                            path: path.to_path_buf(),
-                            level: heuristic_result.level,
-                            reason: heuristic_result.reason,
-                            hash: Some(hashes.sha256),
-                            signature: heuristic_result.signature,
-                        });
+                        let h_score = Self::extract_heuristic_score(&heuristic_result.reason);
+                        total_score += h_score;
+                        score_reasons.push(heuristic_result.reason.clone());
+                        // Carry over heuristic signals
+                        all_signals.extend(heuristic_result.detection_signals.clone());
+                        if primary_signature.is_none() {
+                            primary_signature = heuristic_result.signature.clone();
+                        }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Heuristic analysis error for {}: {}", path.display(), e);
-                }
+                Err(e) => eprintln!("Heuristic error for {}: {}", path.display(), e),
             }
         }
 
-        // 5. File is clean
-        Ok(ScanResult {
-            path: path.to_path_buf(),
-            level: ThreatLevel::Clean,
-            reason: "No threats detected (multi-layer scan)".to_string(),
-            hash: Some(hashes.sha256),
-            signature: None,
-        })
-    }
+        // ── Decision ──────────────────────────────────────────────────────────
+        let level = if total_score >= MALICIOUS_THRESHOLD {
+            ThreatLevel::Malicious
+        } else if total_score >= SUSPICIOUS_THRESHOLD {
+            ThreatLevel::Suspicious
+        } else {
+            ThreatLevel::Clean
+        };
 
-    fn calculate_all_hashes(&self, path: &Path) -> Result<FileHashes> {
-        let data = std::fs::read(path)?;
+        let confidence_score = match level {
+            ThreatLevel::Clean      => 1.0,
+            ThreatLevel::Suspicious => 0.55 + (total_score as f32 / 40.0).min(0.25),
+            ThreatLevel::Malicious  => 0.70 + (total_score as f32 / 60.0).min(0.25),
+        };
 
-        let md5 = format!("{:x}", md5::compute(&data));
-
-        let mut sha256_hasher = Sha256::new();
-        sha256_hasher.update(&data);
-        let sha256 = hex::encode(sha256_hasher.finalize());
-
-        let mut sha512_hasher = Sha512::new();
-        sha512_hasher.update(&data);
-        let sha512 = hex::encode(sha512_hasher.finalize());
-
-        Ok(FileHashes { md5, sha256, sha512 })
-    }
-
-    fn calculate_sha256(&self, path: &Path) -> Result<String> {
-        let data = std::fs::read(path)?;
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        Ok(hex::encode(hasher.finalize()))
-    }
-
-    fn check_all_hashes(&self, hashes: &FileHashes) -> Option<&str> {
-        if let Some(sig) = self.signatures.check_hash(&hashes.sha256) {
-            return Some(sig);
+        if level == ThreatLevel::Clean {
+            return Ok(ScanResult::clean(path.to_path_buf(), Some(hashes.sha256)));
         }
-        if !hashes.md5.is_empty() {
-            if let Some(sig) = self.signatures.check_hash(&hashes.md5) {
-                return Some(sig);
-            }
-        }
-        if !hashes.sha512.is_empty() {
-            if let Some(sig) = self.signatures.check_hash(&hashes.sha512) {
-                return Some(sig);
-            }
-        }
-        None
+
+        Ok(ScanResult::from_parts(
+            path.to_path_buf(),
+            level,
+            format!("Score {}: {}", total_score, score_reasons.join(" | ")),
+            Some(hashes.sha256),
+            primary_signature,
+            confidence_score,
+            all_signals,
+        ))
     }
 
+    // ── Directory scan with context ───────────────────────────────────────────
+
+    /// Full directory scan with context analysis.
+    /// Performs individual file scans then applies directory-level
+    /// context (ransom note counting, mass modification, YARA correlation etc.)
     pub fn scan_directory_with_stats(
         &self,
         dir: &Path,
         recursive: bool,
     ) -> (Vec<ScanResult>, ScanStatistics) {
-        let mut results = Vec::new();
+        // Pass 1: scan all files individually
+        let mut results: Vec<ScanResult> = Vec::new();
         let mut stats = ScanStatistics::new();
 
-        for result in self.scan_directory(dir, recursive) {
+        for result in self.scan_directory_iter(dir, recursive) {
             match result {
                 Ok(scan_result) => {
-                    let file_size = std::fs::metadata(&scan_result.path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    stats.update(&scan_result, file_size);
+                    let size = std::fs::metadata(&scan_result.path)
+                        .map(|m| m.len()).unwrap_or(0);
+                    stats.update(&scan_result, size);
                     results.push(scan_result);
                 }
                 Err(e) => {
@@ -278,10 +314,21 @@ impl FileSystemScanner {
             }
         }
 
-        (results, stats)
+        // Pass 2: directory context analysis
+        // Annotates context_flags, escalates levels, adds context signals
+        self.context.analyze(&mut results, dir);
+
+        // Recount stats after context escalation
+        let mut final_stats = ScanStatistics::new();
+        for r in &results {
+            let size = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
+            final_stats.update(r, size);
+        }
+
+        (results, final_stats)
     }
 
-    pub fn scan_directory<'a>(
+    fn scan_directory_iter<'a>(
         &'a self,
         dir: &Path,
         recursive: bool,
@@ -300,85 +347,176 @@ impl FileSystemScanner {
             match entry {
                 Ok(e) if e.file_type().is_file() => Some(self.scan_file(e.path())),
                 Ok(_) => None,
-                Err(e) => Some(Ok(ScanResult {
-                    path: e.path()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| dir_path.clone()),
-                    level: ThreatLevel::Clean,
-                    reason: format!("Directory scan error: {}", e),
-                    hash: None,
-                    signature: None,
-                })),
+                Err(e) => Some(Ok(ScanResult::error(
+                    e.path().map(|p| p.to_path_buf()).unwrap_or_else(|| dir_path.clone()),
+                    format!("Directory scan error: {}", e),
+                ))),
             }
         })
     }
 
-    pub fn get_signatures_mut(&mut self) -> &mut SignatureDatabase {
-        &mut self.signatures
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn extract_heuristic_score(reason: &str) -> i32 {
+        reason
+            .find("score: ")
+            .and_then(|i| {
+                let rest = &reason[i + 7..];
+                let end = rest.find(')').unwrap_or(rest.len());
+                rest[..end].trim().parse::<i32>().ok()
+            })
+            .unwrap_or(0)
     }
 
-    pub fn set_deep_scan(&mut self, enabled: bool) {
-        self.enable_deep_scan = enabled;
+    fn calculate_all_hashes(&self, path: &Path) -> Result<FileHashes> {
+        let data = std::fs::read(path)?;
+        let md5 = format!("{:x}", md5::compute(&data));
+        let mut h256 = Sha256::new(); h256.update(&data);
+        let sha256 = hex::encode(h256.finalize());
+        let mut h512 = Sha512::new(); h512.update(&data);
+        let sha512 = hex::encode(h512.finalize());
+        Ok(FileHashes { md5, sha256, sha512 })
     }
 
-    pub fn set_multi_hash(&mut self, enabled: bool) {
-        self.enable_multi_hash = enabled;
+    fn calculate_sha256(&self, path: &Path) -> Result<String> {
+        let data = std::fs::read(path)?;
+        let mut h = Sha256::new(); h.update(&data);
+        Ok(hex::encode(h.finalize()))
     }
 
-    pub fn set_yara(&mut self, enabled: bool) {
-        self.enable_yara = enabled;
+    fn check_all_hashes(&self, hashes: &FileHashes) -> Option<&str> {
+        if let Some(s) = self.signatures.check_hash(&hashes.sha256) { return Some(s); }
+        if !hashes.md5.is_empty() {
+            if let Some(s) = self.signatures.check_hash(&hashes.md5) { return Some(s); }
+        }
+        if !hashes.sha512.is_empty() {
+            if let Some(s) = self.signatures.check_hash(&hashes.sha512) { return Some(s); }
+        }
+        None
     }
 
-    pub fn yara_rules_loaded(&self) -> usize {
-        self.yara.rules_loaded
-    }
+    pub fn get_signatures_mut(&mut self) -> &mut SignatureDatabase { &mut self.signatures }
+    pub fn set_deep_scan(&mut self, enabled: bool)  { self.enable_deep_scan = enabled; }
+    pub fn set_multi_hash(&mut self, enabled: bool) { self.enable_multi_hash = enabled; }
+    pub fn set_yara(&mut self, enabled: bool)       { self.enable_yara = enabled; }
+    pub fn yara_rules_loaded(&self) -> usize        { self.yara.rules_loaded }
 }
 
 impl Default for FileSystemScanner {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use std::fs::File;
+    use std::fs;
 
     #[test]
-    fn test_eicar_detection() {
-        let temp_dir = std::env::temp_dir();
-        let eicar_file = temp_dir.join("eicar.txt");
-        let eicar = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
-        std::fs::write(&eicar_file, eicar).unwrap();
-
-        let scanner = FileSystemScanner::new();
-        let result = scanner.scan_file(&eicar_file).unwrap();
+    fn test_eicar_malicious() {
+        let path = std::env::temp_dir().join("eicar_scanner_final.txt");
+        fs::write(&path,
+            "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+        ).unwrap();
+        let result = FileSystemScanner::new().scan_file(&path).unwrap();
         assert_eq!(result.level, ThreatLevel::Malicious);
-
-        std::fs::remove_file(eicar_file).ok();
+        assert_eq!(result.confidence_score, 1.0);
+        assert!(result.detection_signals.iter().any(|s| s.source == "hash"));
+        fs::remove_file(path).ok();
     }
 
     #[test]
-    fn test_clean_file_scan() {
-        let temp_dir = std::env::temp_dir();
-        let clean_file = temp_dir.join("clean_test.txt");
-        let mut file = File::create(&clean_file).unwrap();
-        writeln!(file, "This is a completely clean file.").unwrap();
-
-        let scanner = FileSystemScanner::new();
-        let result = scanner.scan_file(&clean_file).unwrap();
-        assert_eq!(result.level, ThreatLevel::Clean);
-
-        std::fs::remove_file(clean_file).ok();
+    fn test_ml_notes_clean() {
+        let path = std::env::temp_dir().join("ml_scanner_final.txt");
+        fs::write(&path,
+            "Batch Normalization: Standardizes outputs of each layer. \
+             Not strictly a regularizer but often has a regularization effect. \
+             Neural network-HowTo: gradient descent optimizer learning rate."
+        ).unwrap();
+        let result = FileSystemScanner::new().scan_file(&path).unwrap();
+        assert_eq!(result.level, ThreatLevel::Clean,
+            "ML notes should be Clean. Got: {} — {}", result.level, result.reason);
+        assert_eq!(result.file_category, FileCategory::Document);
+        assert!(result.context_flags.is_empty());
+        fs::remove_file(path).ok();
     }
 
     #[test]
-    fn test_yara_engine_loads() {
+    fn test_yara_weak_score() {
+        assert_eq!(yara_rule_score("contains_base64"), 1);
+        assert_eq!(yara_rule_score("Base64_Encoded_String"), 1);
+    }
+
+    #[test]
+    fn test_yara_strong_score() {
+        assert_eq!(yara_rule_score("Wanna_Cry_Ransomware_Generic"), 10);
+        assert_eq!(yara_rule_score("RAT_PlugX"), 10);
+    }
+
+    #[test]
+    fn test_no_yara_on_documents() {
+        assert!(!should_yara_scan(Path::new("notes.txt")));
+        assert!(!should_yara_scan(Path::new("readme.md")));
+        assert!(!should_yara_scan(Path::new("data.csv")));
+    }
+
+    #[test]
+    fn test_yara_on_executables() {
+        assert!(should_yara_scan(Path::new("malware.exe")));
+        assert!(should_yara_scan(Path::new("script.ps1")));
+        assert!(should_yara_scan(Path::new("dropper.bat")));
+    }
+
+    #[test]
+    fn test_extract_heuristic_score() {
+        assert_eq!(FileSystemScanner::extract_heuristic_score(
+            "Dynamic analysis (score: 7): something bad"), 7);
+        assert_eq!(FileSystemScanner::extract_heuristic_score(
+            "No threats detected"), 0);
+    }
+
+    #[test]
+    fn test_directory_context_applied() {
+        let temp = std::env::temp_dir().join("ctx_test_dir");
+        fs::create_dir_all(&temp).unwrap();
+
+        // Write 3 ransom notes + 1 clean file
+        fs::write(temp.join("how_to_decrypt.txt"), "pay bitcoin to recover your files").unwrap();
+        fs::write(temp.join("ransom_note.txt"), "all your files have been encrypted").unwrap();
+        fs::write(temp.join("files_encrypted.txt"), "pay btc to decrypt your files").unwrap();
+        fs::write(temp.join("clean.txt"), "ordinary content").unwrap();
+
         let scanner = FileSystemScanner::new();
-        // Just verify it initializes without panicking
-        // rules_loaded may be 0 if yara_rules dir isn't relative to test runner
-        println!("YARA rules loaded: {}", scanner.yara_rules_loaded());
+        let (results, _stats) = scanner.scan_directory_with_stats(&temp, false);
+
+        // At least one file should have MultipleRansomNotes flag
+        let has_flag = results.iter().any(|r|
+            r.context_flags.contains(&crate::core::types::ContextFlag::MultipleRansomNotes));
+        assert!(has_flag, "Directory with 3 ransom notes should set MultipleRansomNotes flag");
+
+        fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn test_clean_file_gets_context_flag_not_escalated() {
+        // Clean files near ransom notes should get flag but NOT be escalated
+        let temp = std::env::temp_dir().join("ctx_clean_test_dir");
+        fs::create_dir_all(&temp).unwrap();
+
+        fs::write(temp.join("how_to_decrypt.txt"), "pay bitcoin").unwrap();
+        fs::write(temp.join("ransom_note.txt"), "all your files encrypted").unwrap();
+        fs::write(temp.join("files_encrypted.txt"), "pay btc ransom demand").unwrap();
+        fs::write(temp.join("my_document.txt"), "completely normal document").unwrap();
+
+        let scanner = FileSystemScanner::new();
+        let (results, _) = scanner.scan_directory_with_stats(&temp, false);
+
+        let doc = results.iter().find(|r| r.path.ends_with("my_document.txt"));
+        if let Some(d) = doc {
+            // Clean file should stay clean — only get annotated
+            assert_eq!(d.level, ThreatLevel::Clean,
+                "Clean file should not be escalated, got: {} — {}", d.level, d.reason);
+        }
+
+        fs::remove_dir_all(&temp).ok();
     }
 }
