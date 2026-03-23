@@ -1,6 +1,0 @@
-Store and Types
-index.Ts
-store.ts
-
-index.ts
-types.ts
