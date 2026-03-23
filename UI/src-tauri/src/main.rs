@@ -13,51 +13,72 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
-// ─── Types (must match types/index.ts and engine JSON output) ─────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct DetectionSignal {
-    pub source: String,
+    pub source:      String,
     pub description: String,
-    pub score: i32,
+    pub score:       i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct ScanResult {
-    // Core verdict
-    pub path: String,
-    pub level: String,
-    pub reason: String,
-    pub hash: Option<String>,
-    pub signature: Option<String>,
-    pub is_threat: bool,
-    // ML classification fields
-    pub confidence_score: f32,
+    pub path:              String,
+    pub level:             String,
+    pub reason:            String,
+    pub hash:              Option<String>,
+    pub signature:         Option<String>,
+    pub is_threat:         bool,
+    pub confidence_score:  f32,
     pub detection_signals: Vec<DetectionSignal>,
-    pub file_category: String,
-    pub context_flags: Vec<String>,
+    pub file_category:     String,
+    pub context_flags:     Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ScanStats {
-    pub total_files: u64,
-    pub clean_files: u64,
+    pub total_files:      u64,
+    pub clean_files:      u64,
     pub suspicious_files: u64,
-    pub malicious_files: u64,
-    pub error_files: u64,
-    pub total_size_mb: f64,
+    pub malicious_files:  u64,
+    pub error_files:      u64,
+    pub total_size_mb:    f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ScanOutput {
-    pub success: bool,
-    pub files: Vec<ScanResult>,
+    pub success:    bool,
+    pub files:      Vec<ScanResult>,
     pub statistics: ScanStats,
-    pub error: Option<String>,
+    pub error:      Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProcessStats {
+    pub total_processes:      u64,
+    pub safe_processes:       u64,
+    pub suspicious_processes: u64,
+    pub malicious_processes:  u64,
+    pub critical_processes:   u64,
+    pub total_memory_mb:      String,
+    pub total_threads:        u64,
+    pub avg_cpu_usage:        String,
+    pub scan_duration_ms:     u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProcessScanOutput {
+    pub success:    bool,
+    pub processes:  Vec<serde_json::Value>,
+    pub statistics: ProcessStats,
+    pub error:      Option<String>,
 }
 
 // ─── Daemon state ─────────────────────────────────────────────────────────────
@@ -90,7 +111,7 @@ fn get_engine_dir() -> PathBuf {
 // ─── Spawn daemon ─────────────────────────────────────────────────────────────
 
 fn spawn_daemon() -> Result<AppState, String> {
-    let engine = get_engine_path();
+    let engine     = get_engine_path();
     let engine_dir = get_engine_dir();
 
     let mut child = Command::new(&engine)
@@ -105,7 +126,7 @@ fn spawn_daemon() -> Result<AppState, String> {
     let stdin  = child.stdin.take().ok_or("Could not get daemon stdin")?;
     let stdout = child.stdout.take().ok_or("Could not get daemon stdout")?;
 
-    // Timeout on ready phase — Tauri won't freeze if daemon hangs
+    // Timeout on ready phase — prevents Tauri freeze if daemon hangs
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<BufReader<std::process::ChildStdout>, String>>();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -127,7 +148,7 @@ fn spawn_daemon() -> Result<AppState, String> {
     std::thread::spawn(move || {
         for line in reader.lines() {
             match line {
-                Ok(l) => { if tx.send(l).is_err() { break; } }
+                Ok(l)  => { if tx.send(l).is_err() { break; } }
                 Err(_) => break,
             }
         }
@@ -191,10 +212,10 @@ fn daemon_request(state: &AppState, request: serde_json::Value) -> Result<serde_
     }
 }
 
-// ─── Helper: parse a ScanResult from daemon JSON ──────────────────────────────
+// ─── Helper: parse ScanResult from daemon JSON ────────────────────────────────
 
 fn parse_scan_result(f: &serde_json::Value, fallback_path: &str) -> ScanResult {
-    let level    = f["level"].as_str().unwrap_or("Clean").to_string();
+    let level     = f["level"].as_str().unwrap_or("Clean").to_string();
     let is_threat = f["is_threat"].as_bool()
         .unwrap_or(level == "Suspicious" || level == "Malicious");
 
@@ -219,9 +240,8 @@ fn parse_scan_result(f: &serde_json::Value, fallback_path: &str) -> ScanResult {
         hash:             f["hash"].as_str().map(String::from),
         signature:        f["signature"].as_str().map(String::from),
         is_threat,
-        confidence_score: f["confidence_score"].as_f64().unwrap_or(
-            if is_threat { 0.6 } else { 1.0 }
-        ) as f32,
+        confidence_score: f["confidence_score"].as_f64()
+            .unwrap_or(if is_threat { 0.6 } else { 1.0 }) as f32,
         detection_signals,
         file_category:    f["file_category"].as_str().unwrap_or("unknown").to_string(),
         context_flags,
@@ -238,16 +258,11 @@ async fn scan_file(
     let request = serde_json::json!({
         "id": next_id(), "cmd": "scan-file", "path": path,
     });
-
     let json = daemon_request(&state, request)?;
-
-    if let Some(err) = json["error"].as_str() {
-        return Err(err.to_string());
-    }
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
 
     let file  = parse_scan_result(&json, &path);
     let level = file.level.clone();
-
     let stats = ScanStats {
         total_files:      1,
         clean_files:      if level == "Clean"      { 1 } else { 0 },
@@ -256,7 +271,6 @@ async fn scan_file(
         error_files:      if level == "Error"      { 1 } else { 0 },
         total_size_mb:    0.0,
     };
-
     Ok(ScanOutput { success: true, files: vec![file], statistics: stats, error: None })
 }
 
@@ -268,16 +282,11 @@ async fn scan_directory(
     let request = serde_json::json!({
         "id": next_id(), "cmd": "scan-dir", "path": path,
     });
-
     let json = daemon_request(&state, request)?;
-
-    if let Some(err) = json["error"].as_str() {
-        return Err(err.to_string());
-    }
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
 
     let files_arr = json["files"].as_array()
         .ok_or("No files array in daemon response")?;
-
     let files: Vec<ScanResult> = files_arr.iter()
         .map(|f| parse_scan_result(f, ""))
         .collect();
@@ -291,22 +300,63 @@ async fn scan_directory(
         error_files:      s["error_files"].as_u64().unwrap_or(0),
         total_size_mb:    s["total_size_mb"].as_f64().unwrap_or(0.0),
     };
-
     Ok(ScanOutput { success: true, files, statistics: stats, error: None })
+}
+
+#[tauri::command]
+async fn scan_processes(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<ProcessScanOutput, String> {
+    let request = serde_json::json!({
+        "id": next_id(), "cmd": "scan-processes",
+    });
+    let json = daemon_request(&state, request)?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+
+    let processes = json["processes"].as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let s = &json["statistics"];
+    let stats = ProcessStats {
+        total_processes:      s["total_processes"].as_u64().unwrap_or(0),
+        safe_processes:       s["safe_processes"].as_u64().unwrap_or(0),
+        suspicious_processes: s["suspicious_processes"].as_u64().unwrap_or(0),
+        malicious_processes:  s["malicious_processes"].as_u64().unwrap_or(0),
+        critical_processes:   s["critical_processes"].as_u64().unwrap_or(0),
+        total_memory_mb:      s["total_memory_mb"].as_str().unwrap_or("0.00").to_string(),
+        total_threads:        s["total_threads"].as_u64().unwrap_or(0),
+        avg_cpu_usage:        s["avg_cpu_usage"].as_str().unwrap_or("0.00").to_string(),
+        scan_duration_ms:     s["scan_duration_ms"].as_u64().unwrap_or(0),
+    };
+    Ok(ProcessScanOutput { success: true, processes, statistics: stats, error: None })
+}
+
+#[tauri::command]
+async fn kill_process(
+    pid: u32,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id": next_id(), "cmd": "kill-process", "pid": pid,
+    });
+    let json = daemon_request(&state, request)?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
 }
 
 #[tauri::command]
 async fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    Ok(app.dialog().file().set_title("Select File to Scan").blocking_pick_file()
-        .map(|p| p.to_string()))
+    Ok(app.dialog().file().set_title("Select File to Scan")
+        .blocking_pick_file().map(|p| p.to_string()))
 }
 
 #[tauri::command]
 async fn open_dir_dialog(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    Ok(app.dialog().file().set_title("Select Directory to Scan").blocking_pick_folder()
-        .map(|p| p.to_string()))
+    Ok(app.dialog().file().set_title("Select Directory to Scan")
+        .blocking_pick_folder().map(|p| p.to_string()))
 }
 
 #[tauri::command]
@@ -319,7 +369,10 @@ async fn get_engine_status(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
     let path  = get_engine_path();
-    let alive = { let mut c = state.child.lock().unwrap(); matches!(c.try_wait(), Ok(None)) };
+    let alive = {
+        let mut c = state.child.lock().unwrap();
+        matches!(c.try_wait(), Ok(None))
+    };
     Ok(serde_json::json!({
         "available":    path.exists(),
         "daemon_alive": alive,
@@ -355,6 +408,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             scan_file,
             scan_directory,
+            scan_processes,
+            kill_process,
             open_file_dialog,
             open_dir_dialog,
             check_engine,

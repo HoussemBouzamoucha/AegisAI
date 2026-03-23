@@ -10,6 +10,11 @@
 //   4. Encrypted copy detection    — original + .locked/.enc copy side by side
 //   5. YARA + filename correlation — YARA ransomware hit AND ransom note nearby
 //   6. YARA + filename hybrid      — YARA match corroborated by filename pattern
+//
+// IMPORTANT: analyze() operates on a group of files from the SAME directory.
+// Cross-directory isolation is handled by scanner.rs which groups results
+// by parent directory before calling analyze() — preventing ransom notes
+// in one subdirectory from escalating files in sibling directories.
 
 use crate::core::types::{
     ContextFlag, DetectionSignal, FileCategory, ScanResult, ThreatLevel,
@@ -26,8 +31,14 @@ const RANSOM_NOTE_ESCALATION_THRESHOLD: usize = 3;
 /// Ratio of ransomware-extension files that triggers directory-wide flag
 const RANSOMWARE_EXTENSION_RATIO_THRESHOLD: f32 = 0.20;
 
-const MASS_MODIFICATION_WINDOW_SECS: u64 = 5;  // tighter window
-const MASS_MODIFICATION_MIN_FILES: usize = 20;  // needs many more files
+/// Time window (seconds) for mass-modification detection.
+/// Real ransomware encrypts hundreds of files per second.
+/// Set high enough to not trigger on normal file creation by scripts.
+const MASS_MODIFICATION_WINDOW_SECS: u64 = 5;
+
+/// Minimum files modified in window to count as mass modification.
+/// Raised from 5 to 20 — avoids triggering on test file creation.
+const MASS_MODIFICATION_MIN_FILES: usize = 20;
 
 // ─── Known ransomware file extensions ─────────────────────────────────────────
 
@@ -38,10 +49,13 @@ const RANSOMWARE_EXTENSIONS: &[&str] = &[
     "wncry", "wncryt", "ecc", "ezz", "exx",
 ];
 
-/// Ransom note filename substrings (compound phrases only — no single words)
+/// Ransom note filename substrings — compound phrases only.
+/// Single words like "decrypt", "recovery", "readme" excluded
+/// to prevent false positives on legitimate files.
 const RANSOM_NOTE_PATTERNS: &[&str] = &[
     "read_me", "read-me",
-    "how_to_decrypt", "how-to-decrypt", "howto_decrypt", "howto_recover",
+    "how_to_decrypt", "how-to-decrypt",
+    "howto_decrypt", "howto_recover",
     "decrypt_instructions", "decrypt_files",
     "recovery_instructions", "ransom_note",
     "your_files_encrypted", "files_encrypted",
@@ -99,15 +113,16 @@ pub struct ContextAnalyzer;
 impl ContextAnalyzer {
     pub fn new() -> Self { Self }
 
-    /// Main entry point. Takes the results of a directory scan and applies
-    /// directory-level context analysis, mutating results in place.
+    /// Analyze a group of files from the SAME directory.
     ///
-    /// Call this after `scan_directory_with_stats` to enrich results.
+    /// This must only be called with files sharing the same parent directory.
+    /// scanner.rs groups results by parent dir before calling this — ensuring
+    /// ransom notes in one subdirectory do not escalate files in siblings.
     pub fn analyze(&self, results: &mut Vec<ScanResult>, dir: &Path) {
-        // ── Pass 1: collect directory-level facts ─────────────────────────────
+        // Pass 1: collect directory-level facts
         let facts = self.collect_facts(results, dir);
 
-        // ── Pass 2: annotate and escalate each result ─────────────────────────
+        // Pass 2: annotate and escalate each result
         for result in results.iter_mut() {
             self.annotate(result, &facts);
         }
@@ -115,30 +130,28 @@ impl ContextAnalyzer {
 
     // ── Fact collection ───────────────────────────────────────────────────────
 
-    fn collect_facts(&self, results: &[ScanResult], dir: &Path) -> DirectoryFacts {
+    fn collect_facts(&self, results: &[ScanResult], _dir: &Path) -> DirectoryFacts {
         let total = results.len();
 
-        // Count ransom notes
+        // Count ransom notes in this directory only
         let ransom_note_paths: Vec<PathBuf> = results.iter()
             .map(|r| r.path.clone())
             .filter(|p| is_ransom_note(p))
             .collect();
         let ransom_note_count = ransom_note_paths.len();
 
-        // Count ransomware extensions
+        // Count ransomware extensions in this directory only
         let ransomware_ext_count = results.iter()
             .filter(|r| has_ransomware_extension(&r.path))
             .count();
+
         let ransomware_ext_ratio = if total > 0 {
             ransomware_ext_count as f32 / total as f32
         } else {
             0.0
         };
 
-        // Detect mass modification
-        let mass_mod = self.detect_mass_modification(results);
-
-        // Detect encrypted copies (original + .locked/.enc version side by side)
+        let mass_modification_detected = self.detect_mass_modification(results);
         let encrypted_copy_pairs = self.detect_encrypted_copies(results);
 
         DirectoryFacts {
@@ -146,13 +159,12 @@ impl ContextAnalyzer {
             ransom_note_count,
             ransom_note_paths,
             ransomware_ext_ratio,
-            mass_modification_detected: mass_mod,
+            mass_modification_detected,
             encrypted_copy_pairs,
         }
     }
 
     fn detect_mass_modification(&self, results: &[ScanResult]) -> bool {
-        // Collect modification timestamps
         let mut timestamps: Vec<u64> = results.iter()
             .filter_map(|r| {
                 std::fs::metadata(&r.path).ok()
@@ -168,7 +180,7 @@ impl ContextAnalyzer {
 
         timestamps.sort_unstable();
 
-        // Sliding window: count files modified within MASS_MODIFICATION_WINDOW_SECS
+        // Sliding window
         let mut max_in_window = 0usize;
         let mut left = 0;
         for right in 0..timestamps.len() {
@@ -182,7 +194,6 @@ impl ContextAnalyzer {
     }
 
     fn detect_encrypted_copies(&self, results: &[ScanResult]) -> Vec<(PathBuf, PathBuf)> {
-        // Build a set of all file stems in the directory
         let stem_map: HashMap<String, PathBuf> = results.iter()
             .filter_map(|r| {
                 let stem = r.path.file_stem()?.to_str()?.to_lowercase();
@@ -194,7 +205,6 @@ impl ContextAnalyzer {
 
         for result in results {
             if has_ransomware_extension(&result.path) {
-                // Check if original file (without ransomware ext) also exists
                 if let Some(stem) = result.path.file_stem().and_then(|s| s.to_str()) {
                     let original_stem = stem.to_lowercase();
                     if stem_map.contains_key(&original_stem) {
@@ -219,7 +229,8 @@ impl ContextAnalyzer {
         if facts.ransom_note_count >= RANSOM_NOTE_ESCALATION_THRESHOLD {
             result.add_context_flag(ContextFlag::MultipleRansomNotes);
 
-            // Escalate non-clean files to Malicious when 3+ ransom notes present
+            // Only escalate files that already have a threat signal
+            // Clean files stay Clean — they are annotated only
             if result.level == ThreatLevel::Suspicious {
                 result.escalate(
                     ThreatLevel::Malicious,
@@ -246,7 +257,6 @@ impl ContextAnalyzer {
         {
             result.add_context_flag(ContextFlag::HighRansomwareExtensionRatio);
 
-            // Escalate suspicious files
             if result.level == ThreatLevel::Suspicious {
                 result.escalate(
                     ThreatLevel::Malicious,
@@ -267,7 +277,6 @@ impl ContextAnalyzer {
         if facts.mass_modification_detected {
             result.add_context_flag(ContextFlag::MassModificationDetected);
 
-            // Any file with existing threat signals gets escalated
             if result.level == ThreatLevel::Suspicious {
                 result.escalate(
                     ThreatLevel::Malicious,
@@ -289,7 +298,7 @@ impl ContextAnalyzer {
         if is_in_pair {
             result.add_context_flag(ContextFlag::EncryptedCopyDetected);
             if result.level == ThreatLevel::Clean {
-                // Original file sitting next to its encrypted copy — annotate only
+                // Annotate only — clean files are not escalated
                 result.detection_signals.push(DetectionSignal::new(
                     "context",
                     "encrypted copy of this file exists in same directory",
@@ -305,7 +314,6 @@ impl ContextAnalyzer {
         }
 
         // ── 6. YARA + ransom note correlation ─────────────────────────────────
-        // YARA matched a ransomware rule AND ransom notes are present → very high confidence
         if has_yara_ransomware_signal(result) && facts.ransom_note_count >= 1 {
             result.add_context_flag(ContextFlag::YaraRansomwareCorrelated);
             result.confidence_score = result.confidence_score.max(0.95);
@@ -321,9 +329,7 @@ impl ContextAnalyzer {
             ));
         }
 
-        // ── 7. YARA + filename hybrid scoring ────────────────────────────────
-        // YARA matched anything AND filename also has a malware pattern
-        // → corroboration between two independent signals
+        // ── 7. YARA + filename hybrid scoring ─────────────────────────────────
         if has_yara_signal(result) && has_filename_signal(result) {
             result.add_context_flag(ContextFlag::YaraFilenameCorrelated);
             result.confidence_score = result.confidence_score.max(0.90);
@@ -385,20 +391,26 @@ mod tests {
     }
 
     #[test]
-    fn test_ransom_note_nearby_flag() {
+    fn test_clean_files_not_escalated_by_ransom_notes() {
+        // Clean files near ransom notes should be annotated but NOT escalated
         let mut results = vec![
-            make_result("C:/test/README_decrypt.txt", ThreatLevel::Clean),
+            make_result("C:/test/how_to_decrypt.txt", ThreatLevel::Clean),
+            make_result("C:/test/ransom_note.txt", ThreatLevel::Clean),
+            make_result("C:/test/files_encrypted.txt", ThreatLevel::Clean),
             make_result("C:/test/document.txt", ThreatLevel::Clean),
         ];
-        // First file is a ransom note — manually set up facts
         let analyzer = ContextAnalyzer::new();
         analyzer.analyze(&mut results, Path::new("C:/test"));
-        // document.txt should have RansomNoteNearby if note detected
-        // (actual detection depends on is_ransom_note logic)
+
+        let doc = results.iter().find(|r| r.path.ends_with("document.txt")).unwrap();
+        assert_eq!(doc.level, ThreatLevel::Clean,
+            "Clean file should not be escalated by ransom notes");
+        assert!(doc.context_flags.contains(&ContextFlag::RansomNoteNearby),
+            "Clean file should be annotated with RansomNoteNearby");
     }
 
     #[test]
-    fn test_multiple_ransom_notes_escalates_suspicious() {
+    fn test_suspicious_escalated_by_multiple_ransom_notes() {
         let mut results = vec![
             make_result("C:/test/how_to_decrypt.txt", ThreatLevel::Clean),
             make_result("C:/test/ransom_note.txt", ThreatLevel::Clean),
@@ -408,8 +420,36 @@ mod tests {
         ];
         let analyzer = ContextAnalyzer::new();
         analyzer.analyze(&mut results, Path::new("C:/test"));
+
         let malware = results.iter().find(|r| r.path.ends_with("malware.exe")).unwrap();
+        assert_eq!(malware.level, ThreatLevel::Malicious,
+            "Suspicious file should be escalated by 3+ ransom notes");
         assert!(malware.context_flags.contains(&ContextFlag::MultipleRansomNotes));
+    }
+
+    #[test]
+    fn test_sibling_dirs_isolated() {
+        // Files in different directories must not affect each other
+        // SuspiciousOnly files analyzed separately from RansomDir files
+        let mut ransom_dir_results = vec![
+            make_result("C:/test/RansomDir/how_to_decrypt.txt", ThreatLevel::Clean),
+            make_result("C:/test/RansomDir/ransom_note.txt", ThreatLevel::Clean),
+            make_result("C:/test/RansomDir/files_encrypted.txt", ThreatLevel::Clean),
+        ];
+
+        let mut suspicious_dir_results = vec![
+            make_result_with_signal("C:/test/SuspiciousOnly/deploy.ps1",
+                ThreatLevel::Suspicious, "keyword", "downloadstring"),
+        ];
+
+        let analyzer = ContextAnalyzer::new();
+        analyzer.analyze(&mut ransom_dir_results, Path::new("C:/test/RansomDir"));
+        analyzer.analyze(&mut suspicious_dir_results, Path::new("C:/test/SuspiciousOnly"));
+
+        // deploy.ps1 should stay Suspicious — no ransom notes in its directory
+        let deploy = &suspicious_dir_results[0];
+        assert_eq!(deploy.level, ThreatLevel::Suspicious,
+            "File in SuspiciousOnly should not be escalated by RansomDir notes");
     }
 
     #[test]
@@ -422,7 +462,6 @@ mod tests {
                 "Keylogger_Generic rule matched",
             ),
         ];
-        // Add filename signal too
         results[0].detection_signals.push(DetectionSignal::new(
             "filename", "Malware pattern: keylogger", 5
         ));
@@ -452,8 +491,23 @@ mod tests {
     fn test_is_ransom_note() {
         assert!(is_ransom_note(Path::new("how_to_decrypt.txt")));
         assert!(is_ransom_note(Path::new("files_encrypted.html")));
+        assert!(is_ransom_note(Path::new("ransom_note.txt")));
         assert!(!is_ransom_note(Path::new("Neural network-HowTo.txt")));
         assert!(!is_ransom_note(Path::new("README.txt")));
         assert!(!is_ransom_note(Path::new("recovery_guide.txt")));
+        assert!(!is_ransom_note(Path::new("howto_setup.txt")));
+    }
+
+    #[test]
+    fn test_mass_modification_not_triggered_by_few_files() {
+        // 7 files created at the same time should NOT trigger mass modification
+        // (threshold is now 20 files)
+        let results: Vec<ScanResult> = (0..7)
+            .map(|i| make_result(&format!("C:/test/file{}.txt", i), ThreatLevel::Clean))
+            .collect();
+        let analyzer = ContextAnalyzer::new();
+        let facts = analyzer.collect_facts(&results, Path::new("C:/test"));
+        assert!(!facts.mass_modification_detected,
+            "7 files should not trigger mass modification (threshold is 20)");
     }
 }

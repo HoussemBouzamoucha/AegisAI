@@ -22,96 +22,116 @@ export type ContextFlag =
   | 'yara_filename_correlated'
   | 'high_ransomware_extension_ratio';
 
+// ─── Shared detection signal (used by both file and process scanner) ──────────
+
 export interface DetectionSignal {
-  /** Short identifier: "yara", "hash", "entropy", "keyword", "filename", "context" */
-  source: string;
-  /** Human-readable description of what triggered */
+  source:      string;
   description: string;
-  /** Score contribution from this signal */
-  score: number;
+  score:       number;
 }
 
-export interface ScanResult {
-  // ── Core verdict ────────────────────────────────────────────────────────
-  path: string;
-  level: ThreatLevel;
-  reason: string;
-  hash?: string;
-  signature?: string;
-  is_threat: boolean;
-  success: boolean;
+// ─── File scan types ──────────────────────────────────────────────────────────
 
-  // ── ML classification fields ─────────────────────────────────────────────
-  /** 0.0 (uncertain) → 1.0 (definitive). Hash match = 1.0, clean = 1.0 */
+export interface ScanResult {
+  path:             string;
+  level:            ThreatLevel;
+  reason:           string;
+  hash?:            string;
+  signature?:       string;
+  is_threat:        boolean;
+  success:          boolean;
   confidence_score: number;
-  /** Individual signals that contributed to the verdict */
   detection_signals: DetectionSignal[];
-  /** File type category derived from extension */
-  file_category: FileCategory;
-  /** Directory-level context flags set after full directory scan */
-  context_flags: ContextFlag[];
+  file_category:    FileCategory;
+  context_flags:    ContextFlag[];
 }
 
 export interface ScanStats {
-  total_files: number;
-  clean_files: number;
+  total_files:      number;
+  clean_files:      number;
   suspicious_files: number;
-  malicious_files: number;
-  error_files: number;
-  total_size_mb: number;
+  malicious_files:  number;
+  error_files:      number;
+  total_size_mb:    number;
 }
 
 export interface ScanOutput {
-  success: boolean;
-  files: ScanResult[];
+  success:    boolean;
+  files:      ScanResult[];
   statistics: ScanStats;
-  error?: string;
+  error?:     string;
 }
 
 export interface DirectoryScanResult {
-  success: boolean;
+  success:    boolean;
   statistics: ScanStats;
-  files: ScanResult[];
-  error?: string;
+  files:      ScanResult[];
+  error?:     string;
 }
 
+// ─── Process scan types ───────────────────────────────────────────────────────
+
 export interface ProcessInfo {
-  pid: number;
-  name: string;
-  path?: string;
-  memory_mb: string;
-  cpu_usage: number;
-  threat_level: ProcessThreat;
-  suspicious_behaviors: string[];
-  is_threat: boolean;
+  // Core metadata
+  pid:          number;
+  name:         string;
+  parent_pid:   number | null;
+  exe_path:     string | null;
+  command_line: string | null;
+  status:       string;
+
+  // Resources
+  cpu_usage:         number;
+  memory_mb:         string;   // "xx.xx" formatted string from engine
+  memory_bytes:      number;
+  virtual_memory_mb: string;
+  thread_count:      number;
+  start_time:        number | null;
+  user:              string | null;
+
+  // Stage 2-4 placeholders
+  handle_count: number | null;
+  module_count: number | null;
+
+  // Threat assessment + ML fields
+  threat_level:      ProcessThreat;
+  threat_score:      number;
+  is_threat:         boolean;
+  detection_signals: DetectionSignal[];
+  anomaly_flags:     string[];
 }
 
 export interface ProcessStats {
-  total_processes: number;
-  safe_processes: number;
+  total_processes:      number;
+  safe_processes:       number;
   suspicious_processes: number;
-  malicious_processes: number;
-  critical_processes: number;
-  total_memory_mb: string;
+  malicious_processes:  number;
+  critical_processes:   number;
+  total_memory_mb:      string;
+  total_threads:        number;
+  avg_cpu_usage:        string;
+  scan_duration_ms:     number;
 }
 
 export interface ProcessScanResult {
-  success: boolean;
+  success:    boolean;
   statistics: ProcessStats;
-  processes: ProcessInfo[];
-  error?: string;
+  processes:  ProcessInfo[];
+  error?:     string;
 }
 
+// ─── History ──────────────────────────────────────────────────────────────────
+
 export interface ScanHistoryEntry {
-  id: string;
+  id:        string;
   timestamp: Date;
-  path: string;
-  type: 'file' | 'directory';
-  stats: { total: number; clean: number; suspicious: number; malicious: number };
+  path:      string;
+  type:      'file' | 'directory';
+  stats:     { total: number; clean: number; suspicious: number; malicious: number };
   durationMs: number;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 export const CONTEXT_FLAG_LABEL: Record<ContextFlag, string> = {
   ransom_note_nearby:             'Ransom note in directory',

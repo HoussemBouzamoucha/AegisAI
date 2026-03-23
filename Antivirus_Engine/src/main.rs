@@ -4,7 +4,8 @@
 mod core;
 
 use core::file_system::scanner::FileSystemScanner;
-use core::process::scanner::ProcessScanner;
+use core::process::ProcessScanner;
+use core::process::output::serialize_process;
 use core::types::ThreatLevel;
 use std::path::Path;
 use std::env;
@@ -65,8 +66,8 @@ fn run_daemon() {
     println!("{}", ready);
     io::stdout().flush().ok();
 
-    // Scanner created ONCE — YARA compiles here, reused for every request
-    let scanner = FileSystemScanner::new();
+    // Scanners created ONCE — YARA compiles here, reused for every request
+    let scanner         = FileSystemScanner::new();
     let process_scanner = ProcessScanner::new();
 
     eprintln!("DAEMON: scanner initialized, waiting for requests...");
@@ -99,8 +100,8 @@ fn run_daemon() {
                 let path = request["path"].as_str().unwrap_or("");
                 daemon_scan_dir(&scanner, Path::new(path), &id)
             }
-            "scan-processes"  => daemon_scan_processes(&process_scanner, &id),
-            "kill-process"    => {
+            "scan-processes" => daemon_scan_processes(&process_scanner, &id),
+            "kill-process"   => {
                 let pid = request["pid"].as_u64().unwrap_or(0) as u32;
                 daemon_kill_process(&process_scanner, pid, &id)
             }
@@ -115,7 +116,7 @@ fn run_daemon() {
     eprintln!("DAEMON: stdin closed, exiting");
 }
 
-// ─── Serialize a ScanResult into a JSON value including ALL ML fields ─────────
+// ─── File scan serialization ──────────────────────────────────────────────────
 
 fn serialize_result(r: &core::types::ScanResult) -> serde_json::Value {
     let context_flags: Vec<&str> = r.context_flags.iter()
@@ -137,7 +138,6 @@ fn serialize_result(r: &core::types::ScanResult) -> serde_json::Value {
         "hash":              r.hash,
         "signature":         r.signature,
         "is_threat":         r.level.is_threat(),
-        // ML fields
         "confidence_score":  r.confidence_score,
         "detection_signals": detection_signals,
         "file_category":     r.file_category.as_str(),
@@ -166,12 +166,8 @@ fn daemon_scan_dir(scanner: &FileSystemScanner, path: &Path, id: &str) -> serde_
     if !path.exists() {
         return json!({ "id": id, "error": "Directory does not exist" });
     }
-
     let (results, stats) = scanner.scan_directory_with_stats(path, true);
-    let files: Vec<serde_json::Value> = results.iter()
-        .map(serialize_result)
-        .collect();
-
+    let files: Vec<serde_json::Value> = results.iter().map(serialize_result).collect();
     json!({
         "id":      id,
         "success": true,
@@ -191,25 +187,22 @@ fn daemon_scan_processes(scanner: &ProcessScanner, id: &str) -> serde_json::Valu
     match scanner.scan_all_processes() {
         Ok(processes) => {
             let stats = scanner.get_statistics(&processes);
-            let list: Vec<serde_json::Value> = processes.iter().map(|p| json!({
-                "pid":                  p.pid,
-                "name":                 p.name,
-                "path":                 p.path,
-                "memory_mb":            format!("{:.2}", p.memory_mb),
-                "cpu_usage":            p.cpu_usage,
-                "threat_level":         p.threat_level.as_str(),
-                "suspicious_behaviors": p.suspicious_behaviors,
-                "is_threat":            p.threat_level != core::process::scanner::ProcessThreatLevel::Safe,
-            })).collect();
+            let list: Vec<serde_json::Value> = processes.iter()
+                .map(serialize_process)
+                .collect();
             json!({
-                "id": id, "success": true,
+                "id":      id,
+                "success": true,
                 "statistics": {
-                    "total_processes":     stats.total_processes,
-                    "safe_processes":      stats.safe_processes,
-                    "suspicious_processes":stats.suspicious_processes,
-                    "malicious_processes": stats.malicious_processes,
-                    "critical_processes":  stats.critical_processes,
-                    "total_memory_mb":     format!("{:.2}", stats.total_memory_mb),
+                    "total_processes":      stats.total_processes,
+                    "safe_processes":       stats.safe_processes,
+                    "suspicious_processes": stats.suspicious_processes,
+                    "malicious_processes":  stats.malicious_processes,
+                    "critical_processes":   stats.critical_processes,
+                    "total_memory_mb":      format!("{:.2}", stats.total_memory_mb),
+                    "total_threads":        stats.total_threads,
+                    "avg_cpu_usage":        format!("{:.2}", stats.avg_cpu_usage),
+                    "scan_duration_ms":     stats.scan_duration_ms,
                 },
                 "processes": list,
             })
@@ -220,35 +213,33 @@ fn daemon_scan_processes(scanner: &ProcessScanner, id: &str) -> serde_json::Valu
 
 fn daemon_kill_process(scanner: &ProcessScanner, pid: u32, id: &str) -> serde_json::Value {
     match scanner.terminate_process(pid) {
-        Ok(()) => json!({ "id": id, "success": true, "message": format!("Process {} terminated", pid) }),
-        Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
+        Ok(())  => json!({ "id": id, "success": true, "message": format!("Process {} terminated", pid) }),
+        Err(e)  => json!({ "id": id, "success": false, "error": e.to_string() }),
     }
 }
 
-// ─── One-shot CLI (unchanged) ─────────────────────────────────────────────────
+// ─── One-shot CLI ─────────────────────────────────────────────────────────────
 
 fn scan_processes_json() {
     let scanner = ProcessScanner::new();
     match scanner.scan_all_processes() {
         Ok(processes) => {
             let stats = scanner.get_statistics(&processes);
-            let list: Vec<_> = processes.iter().map(|p| json!({
-                "pid": p.pid, "name": p.name, "path": p.path,
-                "memory_mb": format!("{:.2}", p.memory_mb),
-                "cpu_usage": p.cpu_usage,
-                "threat_level": p.threat_level.as_str(),
-                "suspicious_behaviors": p.suspicious_behaviors,
-                "is_threat": p.threat_level != core::process::scanner::ProcessThreatLevel::Safe,
-            })).collect();
+            let list: Vec<serde_json::Value> = processes.iter()
+                .map(serialize_process)
+                .collect();
             println!("{}", json!({
                 "success": true,
                 "statistics": {
-                    "total_processes": stats.total_processes,
-                    "safe_processes": stats.safe_processes,
+                    "total_processes":      stats.total_processes,
+                    "safe_processes":       stats.safe_processes,
                     "suspicious_processes": stats.suspicious_processes,
-                    "malicious_processes": stats.malicious_processes,
-                    "critical_processes": stats.critical_processes,
-                    "total_memory_mb": format!("{:.2}", stats.total_memory_mb),
+                    "malicious_processes":  stats.malicious_processes,
+                    "critical_processes":   stats.critical_processes,
+                    "total_memory_mb":      format!("{:.2}", stats.total_memory_mb),
+                    "total_threads":        stats.total_threads,
+                    "avg_cpu_usage":        format!("{:.2}", stats.avg_cpu_usage),
+                    "scan_duration_ms":     stats.scan_duration_ms,
                 },
                 "processes": list,
             }));
@@ -327,8 +318,8 @@ fn scan_path_human(path: &Path) {
 
 fn scan_path_json(path: &Path) {
     if !path.exists() { println!("{{\"error\": \"Path does not exist\"}}"); return; }
-    if path.is_file()      { scan_single_file_json(path); }
-    else if path.is_dir()  { scan_directory_json(path); }
+    if path.is_file()     { scan_single_file_json(path); }
+    else if path.is_dir() { scan_directory_json(path); }
 }
 
 fn print_result(r: &core::types::ScanResult) {
@@ -350,10 +341,10 @@ fn run_tests() {
     let mut passed = 0; let mut failed = 0;
 
     let tests: &[(&str, Box<dyn Fn(&FileSystemScanner) -> Result<bool, String>>)] = &[
-        ("EICAR detection",          Box::new(test_eicar)),
-        ("Clean file detection",     Box::new(test_clean_file)),
-        ("Ransomware note",          Box::new(test_ransomware_note)),
-        ("Zero-byte executable",     Box::new(test_zero_byte_executable)),
+        ("EICAR detection",      Box::new(test_eicar)),
+        ("Clean file detection", Box::new(test_clean_file)),
+        ("Ransomware note",      Box::new(test_ransomware_note)),
+        ("Zero-byte executable", Box::new(test_zero_byte_executable)),
     ];
 
     for (name, test_fn) in tests {
@@ -387,7 +378,8 @@ fn test_clean_file(scanner: &FileSystemScanner) -> Result<bool, String> {
 
 fn test_ransomware_note(scanner: &FileSystemScanner) -> Result<bool, String> {
     let path = std::env::temp_dir().join("README_DECRYPT.txt");
-    std::fs::write(&path, "All your files have been encrypted. Pay bitcoin to recover your files.").map_err(|e| e.to_string())?;
+    std::fs::write(&path, "All your files have been encrypted. Pay bitcoin to recover your files.")
+        .map_err(|e| e.to_string())?;
     let result = scanner.scan_file(&path).map_err(|e| e.to_string())?;
     std::fs::remove_file(&path).ok();
     Ok(result.level == ThreatLevel::Malicious || result.level == ThreatLevel::Suspicious)

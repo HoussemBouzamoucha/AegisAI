@@ -26,6 +26,7 @@ serde_json = { version = "1.0", optional = true }
 # YARA support (commented out - uncomment after installing LLVM)
 # yara = { version = "0.27", optional = true }
 yara-x = "1.13.0"
+sysinfo = "0.38.4"
 [dev-dependencies]
 tempfile = "3.10"        # For tests
 

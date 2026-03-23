@@ -3,7 +3,7 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import type {
   View, ScanResult, ScanOutput, DirectoryScanResult,
-  ProcessScanResult, ScanHistoryEntry,
+  ProcessInfo, ProcessScanResult, ScanHistoryEntry,
 } from '../types';
 
 interface AppState {
@@ -22,7 +22,7 @@ interface AppState {
   clearScan: () => void;
 
   processScanning: boolean;
-  processes: ProcessScanResult['processes'];
+  processes: ProcessInfo[];
   processStats: ProcessScanResult['statistics'] | null;
   processError: string | null;
   scanProcesses: () => Promise<void>;
@@ -32,9 +32,8 @@ interface AppState {
   addHistory: (entry: ScanHistoryEntry) => void;
 }
 
-/** Ensure every ScanResult has the new ML fields with safe defaults.
- *  This makes the store forward-compatible even if the engine binary
- *  is older and doesn't emit these fields yet. */
+// ─── Normalizers ──────────────────────────────────────────────────────────────
+
 function normalizeScanResult(f: any): ScanResult {
   return {
     path:              f.path      ?? '',
@@ -44,13 +43,39 @@ function normalizeScanResult(f: any): ScanResult {
     signature:         f.signature,
     is_threat:         f.is_threat ?? (f.level === 'Suspicious' || f.level === 'Malicious'),
     success:           f.success   ?? true,
-    // ML fields — default to safe values if engine doesn't send them yet
     confidence_score:  f.confidence_score  ?? (f.level === 'Clean' ? 1.0 : 0.6),
     detection_signals: f.detection_signals ?? [],
     file_category:     f.file_category     ?? 'unknown',
     context_flags:     f.context_flags     ?? [],
   };
 }
+
+function normalizeProcess(p: any): ProcessInfo {
+  return {
+    pid:               p.pid           ?? 0,
+    name:              p.name          ?? '',
+    parent_pid:        p.parent_pid    ?? null,
+    exe_path:          p.exe_path      ?? null,
+    command_line:      p.command_line  ?? null,
+    status:            p.status        ?? 'Unknown',
+    cpu_usage:         p.cpu_usage     ?? 0,
+    memory_mb:         p.memory_mb     ?? '0.00',
+    memory_bytes:      p.memory_bytes  ?? 0,
+    virtual_memory_mb: p.virtual_memory_mb ?? '0.00',
+    thread_count:      p.thread_count  ?? 0,
+    start_time:        p.start_time    ?? null,
+    user:              p.user          ?? null,
+    handle_count:      p.handle_count  ?? null,
+    module_count:      p.module_count  ?? null,
+    threat_level:      p.threat_level  ?? 'Safe',
+    threat_score:      p.threat_score  ?? 0,
+    is_threat:         p.is_threat     ?? false,
+    detection_signals: p.detection_signals ?? [],
+    anomaly_flags:     p.anomaly_flags ?? [],
+  };
+}
+
+// ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useStore = create<AppState>((set, get) => ({
   view: 'dashboard',
@@ -77,10 +102,8 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const result = await invoke<ScanOutput>('scan_file', { path });
       if (!result.success) throw new Error(result.error ?? 'Scan failed');
-
       const files = (result.files ?? []).map(normalizeScanResult);
       set({ scanResults: files, scanStats: result.statistics });
-
       const s = result.statistics;
       get().addHistory({
         id: crypto.randomUUID(),
@@ -88,10 +111,10 @@ export const useStore = create<AppState>((set, get) => ({
         path,
         type: 'file',
         stats: {
-          total: s.total_files,
-          clean: s.clean_files,
+          total:      s.total_files,
+          clean:      s.clean_files,
           suspicious: s.suspicious_files,
-          malicious: s.malicious_files,
+          malicious:  s.malicious_files,
         },
         durationMs: Date.now() - t0,
       });
@@ -108,10 +131,8 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const result = await invoke<DirectoryScanResult>('scan_directory', { path });
       if (!result.success) throw new Error(result.error ?? 'Scan failed');
-
       const files = (result.files ?? []).map(normalizeScanResult);
       set({ scanResults: files, scanStats: result.statistics });
-
       const s = result.statistics;
       get().addHistory({
         id: crypto.randomUUID(),
@@ -119,10 +140,10 @@ export const useStore = create<AppState>((set, get) => ({
         path,
         type: 'directory',
         stats: {
-          total: s.total_files,
-          clean: s.clean_files,
+          total:      s.total_files,
+          clean:      s.clean_files,
           suspicious: s.suspicious_files,
-          malicious: s.malicious_files,
+          malicious:  s.malicious_files,
         },
         durationMs: Date.now() - t0,
       });
@@ -145,7 +166,8 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const result = await invoke<ProcessScanResult>('scan_processes');
       if (!result.success) throw new Error(result.error ?? 'Process scan failed');
-      set({ processes: result.processes, processStats: result.statistics });
+      const processes = (result.processes ?? []).map(normalizeProcess);
+      set({ processes, processStats: result.statistics });
     } catch (e: any) {
       set({ processError: String(e) });
     } finally {
