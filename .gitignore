@@ -1,5 +1,6 @@
 /target/
-*.rlib
-*.rmeta
-*.dll
-*.exe
+**/*.rlib
+**/*.dll
+**/*.pdb
+**/*.exp
+**/*.lib
