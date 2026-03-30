@@ -1,5 +1,5 @@
 import { useStore } from '../store';
-import { Shield, AlertTriangle, CheckCircle, Cpu, FolderSearch, Clock } from 'lucide-react';
+import { Shield, AlertTriangle, CheckCircle, Cpu, FolderSearch, Clock, Wifi } from 'lucide-react';
 import { RadialBarChart, RadialBar, ResponsiveContainer, PolarAngleAxis } from 'recharts';
 
 function StatCard({ label, value, color, sub }: { label: string; value: string | number; color: string; sub?: string }) {
@@ -73,7 +73,7 @@ function QuickAction({ icon, label, onClick }: { icon: React.ReactNode; label: s
 }
 
 export default function Dashboard() {
-  const { setView, scanStats, processStats, scanning, processScanning, history } = useStore();
+  const { setView, scanStats, processStats, history } = useStore();
 
   const totalThreats = (scanStats?.malicious_files ?? 0) + (scanStats?.suspicious_files ?? 0);
   const secureScore = scanStats
@@ -186,6 +186,7 @@ export default function Dashboard() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             <QuickAction icon={<FolderSearch size={16} />} label="Scan Files or Directory" onClick={() => setView('scanner')} />
             <QuickAction icon={<Cpu size={16} />} label="Monitor Running Processes" onClick={() => setView('processes')} />
+            <QuickAction icon={<Wifi size={16} />} label="Inspect Network Traffic" onClick={() => setView('network')} />
             <QuickAction icon={<Clock size={16} />} label="View Scan History" onClick={() => setView('history')} />
           </div>
         </div>

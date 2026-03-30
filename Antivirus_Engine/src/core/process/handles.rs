@@ -17,6 +17,7 @@
 //     "Win32_Foundation",
 //     "Win32_System_Threading",
 //     "Win32_System_WindowsProgramming",
+//     "Wdk_Foundation",
 //     "Wdk_System_SystemInformation",
 //     "Wdk_System_SystemServices",
 //     "Win32_Security",
@@ -34,7 +35,14 @@ pub fn enumerate_handles(pid: u32) -> Vec<HandleInfo> {
         match windows_impl::enumerate_handles_for_pid(pid) {
             Ok(handles) => handles,
             Err(e) => {
-                eprintln!("WARN [handles] PID {}: {}", pid, e);
+                // Change #1: silence expected Windows access errors to reduce log noise.
+                // "Access is denied" and "parameter is incorrect" are normal for
+                // protected processes — only log genuinely unexpected failures.
+                let msg = e.to_string().to_lowercase();
+                if !msg.contains("access is denied") &&
+                   !msg.contains("parameter is incorrect") {
+                    eprintln!("WARN [handles] PID {}: {}", pid, e);
+                }
                 vec![]
             }
         }
@@ -69,17 +77,22 @@ mod windows_impl {
         GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
     };
     use windows::Win32::System::WindowsProgramming::PUBLIC_OBJECT_TYPE_INFORMATION;
+
     use windows::Wdk::System::SystemInformation::{
-        NtQueryObject, NtQuerySystemInformation, SystemHandleInformation,
-    };
-    use windows::Wdk::System::SystemServices::{
-        ObjectNameInformation as WdkObjectNameInformation,
-        ObjectTypeInformation as WdkObjectTypeInformation,
+        NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS,
     };
 
-    // Raw layout of a single entry returned by
-    // NtQuerySystemInformation(SystemHandleInformation).
-    // Not in the public SDK — defined manually from documented layout.
+    use windows::Wdk::Foundation::{
+        NtQueryObject, ObjectTypeInformation,
+    };
+
+    const SYSTEM_HANDLE_INFORMATION: SYSTEM_INFORMATION_CLASS =
+        SYSTEM_INFORMATION_CLASS(16i32);
+
+    use windows::Wdk::Foundation::OBJECT_INFORMATION_CLASS;
+    const OBJECT_NAME_INFORMATION_CLASS: OBJECT_INFORMATION_CLASS =
+        OBJECT_INFORMATION_CLASS(1i32);
+
     #[repr(C)]
     struct SystemHandleEntry {
         process_id:               u16,
@@ -91,8 +104,6 @@ mod windows_impl {
         granted_access:           u32,
     }
 
-    // The header returned by NtQuerySystemInformation. `handles` is a
-    // variable-length array — we index past the end deliberately.
     #[repr(C)]
     struct RawSystemHandleInformation {
         number_of_handles: u32,
@@ -101,7 +112,6 @@ mod windows_impl {
 
     pub fn enumerate_handles_for_pid(target_pid: u32) -> anyhow::Result<Vec<HandleInfo>> {
         // ── 1. Call NtQuerySystemInformation with a growing buffer ────────────
-        // The required size changes between calls, so retry until it fits.
         let mut buffer: Vec<u8> = Vec::with_capacity(1024 * 1024); // 1 MB start
         let mut return_length: u32 = 0;
 
@@ -111,7 +121,7 @@ mod windows_impl {
 
             let status = unsafe {
                 NtQuerySystemInformation(
-                    SystemHandleInformation,
+                    SYSTEM_HANDLE_INFORMATION,
                     buffer.as_mut_ptr() as *mut _,
                     buffer.len() as u32,
                     &mut return_length,
@@ -147,7 +157,6 @@ mod windows_impl {
 
         let current_proc = unsafe { GetCurrentProcess() };
 
-        // Cache type index → type name to avoid redundant NtQueryObject calls
         let mut type_cache: HashMap<u8, String> = HashMap::new();
         let mut results: Vec<HandleInfo>         = Vec::new();
 
@@ -161,11 +170,12 @@ mod windows_impl {
             let handle_value = entry.handle_value as u64;
 
             // ── 4. Duplicate the handle into our process ──────────────────────
+            let raw_handle = HANDLE(entry.handle_value as usize as *mut std::ffi::c_void);
             let mut dup = HANDLE::default();
             let duped = unsafe {
                 DuplicateHandle(
                     target_proc,
-                    HANDLE(entry.handle_value as isize),
+                    raw_handle,
                     current_proc,
                     &mut dup,
                     0,
@@ -175,7 +185,6 @@ mod windows_impl {
             }.is_ok();
 
             if !duped {
-                // Can't duplicate (access denied is common) — record minimal info
                 results.push(HandleInfo {
                     handle_value,
                     object_type: type_from_cache(
@@ -193,8 +202,7 @@ mod windows_impl {
 
             // ── 6. Resolve object name (best-effort) ─────────────────────────
             // File handles are skipped — querying their names on synchronous
-            // handles blocks indefinitely. Non-blocking file name query via
-            // a worker thread can be added in a future stage.
+            // handles blocks indefinitely.
             let object_name = if type_name != "File" {
                 query_object_name(dup)
             } else {
@@ -235,10 +243,10 @@ mod windows_impl {
         let status = unsafe {
             NtQueryObject(
                 handle,
-                WdkObjectTypeInformation,
-                buf.as_mut_ptr() as *mut _,
+                ObjectTypeInformation,
+                Some(buf.as_mut_ptr() as *mut _),
                 buf.len() as u32,
-                &mut ret_len,
+                Some(&mut ret_len),
             )
         };
         if status.is_err() { return None; }
@@ -262,23 +270,22 @@ mod windows_impl {
         let status = unsafe {
             NtQueryObject(
                 handle,
-                WdkObjectNameInformation,
-                buf.as_mut_ptr() as *mut _,
+                OBJECT_NAME_INFORMATION_CLASS,
+                Some(buf.as_mut_ptr() as *mut _),
                 buf.len() as u32,
-                &mut ret_len,
+                Some(&mut ret_len),
             )
         };
 
-        // Retry with exact size if too small
         let status = if status == STATUS_INFO_LENGTH_MISMATCH {
             buf = vec![0u8; ret_len as usize + 64];
             unsafe {
                 NtQueryObject(
                     handle,
-                    WdkObjectNameInformation,
-                    buf.as_mut_ptr() as *mut _,
+                    OBJECT_NAME_INFORMATION_CLASS,
+                    Some(buf.as_mut_ptr() as *mut _),
                     buf.len() as u32,
-                    &mut ret_len,
+                    Some(&mut ret_len),
                 )
             }
         } else {
@@ -287,8 +294,6 @@ mod windows_impl {
 
         if status.is_err() { return None; }
 
-        // OBJECT_NAME_INFORMATION = { UNICODE_STRING Name }
-        // We read a UNICODE_STRING directly from offset 0.
         #[repr(C)]
         struct UnicodeString {
             length:          u16,
@@ -300,7 +305,6 @@ mod windows_impl {
         let us = unsafe { &*(buf.as_ptr() as *const UnicodeString) };
         if us.length == 0 || us.buffer.is_null() { return None; }
 
-        // Bounds-check: the string buffer must sit within our Vec
         let buf_start = buf.as_ptr() as usize;
         let buf_end   = buf_start + buf.len();
         let str_start = us.buffer as usize;

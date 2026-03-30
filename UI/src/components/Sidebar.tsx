@@ -1,4 +1,4 @@
-import { LayoutDashboard, FolderSearch, Cpu, ClockIcon } from 'lucide-react';
+import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi } from 'lucide-react';
 import { useStore } from '../store';
 import type { View } from '../types';
 
@@ -7,11 +7,12 @@ const NAV: { id: View; label: string; icon: React.ReactNode; }[] = [
   { id: 'dashboard',  label: 'OVERVIEW',  icon: <LayoutDashboard size={18} /> },
   { id: 'scanner',   label: 'SCANNER',   icon: <FolderSearch size={18} /> },
   { id: 'processes', label: 'PROCESSES', icon: <Cpu size={18} /> },
+  { id: 'network',   label: 'NETWORK',   icon: <Wifi size={18} /> },
   { id: 'history',   label: 'HISTORY',   icon: <ClockIcon size={18} /> },
 ];
 
 export default function Sidebar() {
-  const { view, setView, scanStats, processStats, scanning, processScanning } = useStore();
+  const { view, setView, scanStats, processStats, scanning, processScanning, networkScanning } = useStore();
 
   return (
     <nav style={{
@@ -45,7 +46,7 @@ export default function Sidebar() {
 
       {NAV.map(item => {
         const active = view === item.id;
-        const isBusy = (item.id === 'scanner' && scanning) || (item.id === 'processes' && processScanning);
+        const isBusy = (item.id === 'scanner' && scanning) || (item.id === 'processes' && processScanning) || (item.id === 'network' && networkScanning);
 
         return (
           <button key={item.id} onClick={() => setView(item.id)} style={{

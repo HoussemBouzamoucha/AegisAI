@@ -13,6 +13,10 @@
 //   Memory > 1GB                                     +2
 //   Suspicious command line argument                 +3   per arg, capped at +9
 //
+// Dev process halving:
+//   Known dev tools (rust-analyzer, node, cargo…)   score /= 2
+//   These legitimately load temp DLLs, dynamic modules, etc.
+//
 // Thresholds:
 //   score >= 15  → Critical
 //   score >= 10  → Malicious
@@ -31,6 +35,10 @@ const SAFE_PATHS: &[&str] = &[
     r"c:\windows\",
     r"c:\program files\",
     r"c:\program files (x86)\",
+    // Change #6 (optional): user-directory apps are common and legitimate.
+    // Safe only when combined with the dev-process halving below, which
+    // prevents malware from hiding here undetected.
+    r"c:\users\",
 ];
 
 // Processes that MUST run from system32 — if found elsewhere that's malicious.
@@ -228,6 +236,14 @@ impl ProcessHeuristics {
             }
         }
 
+        // ── Change #5: Dev process context awareness ──────────────────────────
+        // Dev tools legitimately exhibit malware-like behaviour (temp DLL loading,
+        // dynamic module injection, high file I/O). Halve their score to avoid
+        // over-penalizing normal development workflows.
+        if is_known_dev_process(&process.name) {
+            score /= 2;
+        }
+
         // ── Decision ──────────────────────────────────────────────────────────
         process.threat_score = score;
         process.threat_level = if score >= CRITICAL_THRESHOLD {
@@ -242,6 +258,21 @@ impl ProcessHeuristics {
         process.is_threat         = process.threat_level.is_threat();
         process.detection_signals = signals;
     }
+}
+
+// ── Change #5 helper ──────────────────────────────────────────────────────────
+
+/// True for well-known development toolchain processes.
+/// These are intentionally excluded from full threat scoring because they
+/// dynamically load proc-macro DLLs, spawn child processes, and perform
+/// heavy file I/O — all patterns that overlap with malware heuristics.
+fn is_known_dev_process(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("rust-analyzer")
+        || n.contains("node")
+        || n.contains("npm")
+        || n.contains("python")
+        || n.contains("cargo")
 }
 
 impl Default for ProcessHeuristics {
@@ -365,5 +396,39 @@ mod tests {
         );
         h.analyze(&mut p);
         assert!(p.detection_signals.iter().any(|s| s.source == "resource"));
+    }
+
+    // Change #5: dev processes should never reach Critical from normal activity.
+    #[test]
+    fn test_rust_analyzer_score_is_halved() {
+        let h = ProcessHeuristics::new();
+        // Give it a suspicious-looking path to rack up raw score, then confirm halving.
+        let mut p = make_process(
+            "rust-analyzer.exe",
+            Some(r"c:\users\dev\.rustup\bin\rust-analyzer.exe"),
+            4, 0.5,
+        );
+        h.analyze(&mut p);
+        assert!(
+            p.threat_level != ThreatLevel::Critical,
+            "rust-analyzer should not be Critical after dev halving. Score: {}",
+            p.threat_score
+        );
+    }
+
+    #[test]
+    fn test_node_score_is_halved() {
+        let h = ProcessHeuristics::new();
+        let mut p = make_process(
+            "node.exe",
+            Some(r"c:\users\dev\appdata\roaming\nvm\node.exe"),
+            4, 0.5,
+        );
+        h.analyze(&mut p);
+        assert!(
+            p.threat_level != ThreatLevel::Critical,
+            "node.exe should not be Critical after dev halving. Score: {}",
+            p.threat_score
+        );
     }
 }

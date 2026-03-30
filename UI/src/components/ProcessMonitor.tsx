@@ -4,6 +4,7 @@ import { useStore } from '../store';
 import {
   RefreshCw, Cpu, Trash2, AlertTriangle, CheckCircle,
   Loader, Search, ChevronDown, ChevronRight, Shield, Zap,
+  Package, Hash,
 } from 'lucide-react';
 import type { ProcessInfo } from '../types';
 
@@ -16,22 +17,36 @@ const THREAT_COLOR: Record<string, string> = {
   Critical:  '#e040fb',
 };
 
+// All six sources the Rust engine emits
 const SIGNAL_SOURCE_COLOR: Record<string, string> = {
   path:     'var(--amber)',
   name:     'var(--red)',
   threads:  'var(--cyan)',
   resource: 'var(--amber)',
   cmdline:  'var(--red)',
+  handle:   '#e040fb',   // purple — cross-process / mutex signals
+  module:   'var(--cyan)', // cyan  — suspicious DLL signals
 };
+
+// ─── Small helpers ────────────────────────────────────────────────────────────
+
+function InfoRow({ label, value, color }: { label: string; value: React.ReactNode; color?: string }) {
+  return (
+    <div style={{ display: 'flex', gap: 4 }}>
+      <span style={{ color: 'var(--text-dim)', minWidth: 90 }}>{label}</span>
+      <span style={{ color: color ?? 'var(--text)', wordBreak: 'break-all', flex: 1 }}>{value}</span>
+    </div>
+  );
+}
 
 // ─── Expandable Process Row ───────────────────────────────────────────────────
 
 function ProcessRow({ proc, onKill }: { proc: ProcessInfo; onKill: (pid: number) => void }) {
   const [expanded, setExpanded] = useState(false);
-  const color = THREAT_COLOR[proc.threat_level] ?? 'var(--text-dim)';
+  const color    = THREAT_COLOR[proc.threat_level] ?? 'var(--text-dim)';
   const isThreat = proc.is_threat;
 
-  // ── Null-safe arrays ──────────────────────────────────────────────────────
+  // Null-safe arrays
   const detectionSignals = Array.isArray(proc.detection_signals) ? proc.detection_signals : [];
   const anomalyFlags     = Array.isArray(proc.anomaly_flags)     ? proc.anomaly_flags     : [];
 
@@ -67,7 +82,7 @@ function ProcessRow({ proc, onKill }: { proc: ProcessInfo; onKill: (pid: number)
           {proc.pid}
         </span>
 
-        {/* Name */}
+        {/* Name + path */}
         <div style={{ overflow: 'hidden' }}>
           <div style={{
             fontFamily: 'var(--font-mono)', fontSize: 11,
@@ -95,7 +110,9 @@ function ProcessRow({ proc, onKill }: { proc: ProcessInfo; onKill: (pid: number)
           fontFamily: 'var(--font-mono)', fontSize: 10,
           color: 'var(--text-dim)', textAlign: 'right',
         }}>
-          {proc.memory_mb} MB
+          {Number.isFinite(Number(proc.memory_mb))
+            ? Number(proc.memory_mb).toFixed(1)
+            : String(proc.memory_mb)} MB
         </span>
 
         {/* CPU */}
@@ -104,10 +121,10 @@ function ProcessRow({ proc, onKill }: { proc: ProcessInfo; onKill: (pid: number)
           color: proc.cpu_usage > 50 ? 'var(--amber)' : 'var(--text-dim)',
           textAlign: 'right',
         }}>
-          {proc.cpu_usage.toFixed(1)}%
+          {typeof proc.cpu_usage === 'number' ? proc.cpu_usage.toFixed(1) : proc.cpu_usage}%
         </span>
 
-        {/* Threat level */}
+        {/* Threat level badge */}
         <span style={{
           fontFamily: 'var(--font-hud)', fontSize: 10,
           color, letterSpacing: '0.06em', textAlign: 'center',
@@ -163,42 +180,66 @@ function ProcessRow({ proc, onKill }: { proc: ProcessInfo; onKill: (pid: number)
       {expanded && isThreat && (
         <div style={{
           padding: '0 16px 14px 76px',
-          display: 'flex', flexDirection: 'column', gap: 10,
+          display: 'flex', flexDirection: 'column', gap: 12,
         }}>
-          {/* Basic info */}
+
+          {/* ── Basic process info ─────────────────────────────────────────── */}
           <div style={{
             fontFamily: 'var(--font-mono)', fontSize: 10,
             display: 'flex', flexDirection: 'column', gap: 3,
           }}>
             {proc.parent_pid != null && (
-              <div>
-                <span style={{ color: 'var(--text-dim)' }}>PARENT PID: </span>
-                <span style={{ color: 'var(--cyan)' }}>{proc.parent_pid}</span>
-              </div>
-            )}
-            {proc.command_line && (
-              <div>
-                <span style={{ color: 'var(--text-dim)' }}>CMD: </span>
-                <span style={{ color: color, wordBreak: 'break-all' }}>{proc.command_line}</span>
-              </div>
+              <InfoRow label="PARENT PID:" value={proc.parent_pid} color="var(--cyan)" />
             )}
             {proc.user && (
-              <div>
-                <span style={{ color: 'var(--text-dim)' }}>USER: </span>
-                <span style={{ color: 'var(--text)' }}>{proc.user}</span>
-              </div>
+              <InfoRow label="USER:" value={proc.user} />
             )}
-            <div>
-              <span style={{ color: 'var(--text-dim)' }}>SCORE: </span>
-              <span style={{ color }}>{proc.threat_score}</span>
-              <span style={{ color: 'var(--text-dim)', marginLeft: 8 }}>THREADS: </span>
-              <span style={{ color: 'var(--text)' }}>{proc.thread_count}</span>
-              <span style={{ color: 'var(--text-dim)', marginLeft: 8 }}>STATUS: </span>
-              <span style={{ color: 'var(--text)' }}>{proc.status}</span>
-            </div>
+            <InfoRow
+              label="SCORE:"
+              value={
+                <span>
+                  <span style={{ color }}>{proc.threat_score}</span>
+                  <span style={{ color: 'var(--text-dim)', margin: '0 12px' }}>
+                    THREADS: {proc.thread_count}
+                  </span>
+                  <span style={{ color: 'var(--text-dim)' }}>STATUS: </span>
+                  <span style={{ color: 'var(--text)' }}>{proc.status}</span>
+                </span>
+              }
+            />
+            {proc.command_line && (
+              <InfoRow label="CMD:" value={proc.command_line} color={color} />
+            )}
           </div>
 
-          {/* Detection signals */}
+          {/* ── Handle / Module counts ─────────────────────────────────────── */}
+          {(proc.handle_count != null || proc.module_count != null) && (
+            <div style={{
+              display: 'flex', gap: 20,
+              fontFamily: 'var(--font-mono)', fontSize: 10,
+            }}>
+              {proc.handle_count != null && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Hash size={10} color="var(--text-dim)" />
+                  <span style={{ color: 'var(--text-dim)' }}>HANDLES:</span>
+                  <span style={{
+                    color: proc.handle_count > 500 ? 'var(--amber)' : 'var(--text)',
+                  }}>
+                    {proc.handle_count}
+                  </span>
+                </div>
+              )}
+              {proc.module_count != null && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Package size={10} color="var(--text-dim)" />
+                  <span style={{ color: 'var(--text-dim)' }}>MODULES:</span>
+                  <span style={{ color: 'var(--text)' }}>{proc.module_count}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Detection signals ──────────────────────────────────────────── */}
           {detectionSignals.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               <div style={{
@@ -220,7 +261,7 @@ function ProcessRow({ proc, onKill }: { proc: ProcessInfo; onKill: (pid: number)
                     <span style={{
                       fontFamily: 'var(--font-hud)', fontSize: 8,
                       color: SIGNAL_SOURCE_COLOR[s.source] ?? 'var(--text-dim)',
-                      letterSpacing: '0.08em', minWidth: 56, paddingTop: 1,
+                      letterSpacing: '0.08em', minWidth: 60, paddingTop: 1,
                     }}>
                       [{s.source.toUpperCase()}]
                     </span>
@@ -234,6 +275,7 @@ function ProcessRow({ proc, onKill }: { proc: ProcessInfo; onKill: (pid: number)
                       <span style={{
                         fontFamily: 'var(--font-hud)', fontSize: 8,
                         color: 'var(--text-dim)', paddingTop: 1,
+                        whiteSpace: 'nowrap',
                       }}>
                         +{s.score}
                       </span>
@@ -244,7 +286,7 @@ function ProcessRow({ proc, onKill }: { proc: ProcessInfo; onKill: (pid: number)
             </div>
           )}
 
-          {/* Anomaly flags */}
+          {/* ── Anomaly flags ──────────────────────────────────────────────── */}
           {anomalyFlags.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               <div style={{
@@ -276,6 +318,40 @@ function ProcessRow({ proc, onKill }: { proc: ProcessInfo; onKill: (pid: number)
   );
 }
 
+// ─── Stats card ───────────────────────────────────────────────────────────────
+
+function StatCard({ label, value, color, sub }: {
+  label: string; value: React.ReactNode; color: string; sub?: string;
+}) {
+  return (
+    <div style={{
+      background: 'var(--surface)', border: '1px solid var(--border)',
+      borderRadius: 8, padding: '14px 16px',
+      borderTop: `2px solid ${color}`,
+    }}>
+      <div style={{
+        fontFamily: 'var(--font-hud)', fontSize: 24, fontWeight: 700, color,
+      }}>
+        {value}
+      </div>
+      <div style={{
+        fontFamily: 'var(--font-mono)', fontSize: 9,
+        color: 'var(--text-dim)', marginTop: 4, letterSpacing: '0.08em',
+      }}>
+        {label}
+      </div>
+      {sub && (
+        <div style={{
+          fontFamily: 'var(--font-mono)', fontSize: 8,
+          color: 'var(--text-dim)', marginTop: 2, opacity: 0.7,
+        }}>
+          {sub}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export default function ProcessMonitor() {
@@ -284,8 +360,8 @@ export default function ProcessMonitor() {
     processError, scanProcesses, killProcess,
   } = useStore();
 
-  const [search, setSearch]   = useState('');
-  const [filter, setFilter]   = useState<'all' | 'threats'>('all');
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState<'all' | 'threats'>('all');
 
   const filtered = processes.filter(p => {
     if (filter === 'threats' && !p.is_threat) return false;
@@ -294,7 +370,8 @@ export default function ProcessMonitor() {
       if (
         !p.name.toLowerCase().includes(q) &&
         !String(p.pid).includes(q) &&
-        !(p.exe_path?.toLowerCase().includes(q))
+        !(p.exe_path?.toLowerCase().includes(q)) &&
+        !(p.user?.toLowerCase().includes(q))
       ) return false;
     }
     return true;
@@ -318,7 +395,7 @@ export default function ProcessMonitor() {
             fontFamily: 'var(--font-mono)', fontSize: 11,
             color: 'var(--text-dim)', marginTop: 4,
           }}>
-            Real-time process analysis — path · name · resource · command line heuristics
+            Real-time process analysis · path · name · resource · cmdline · handles · modules
           </div>
         </div>
         <button
@@ -342,33 +419,41 @@ export default function ProcessMonitor() {
         </button>
       </div>
 
-      {/* ── Stats ───────────────────────────────────────────────────────────── */}
+      {/* ── Stats row ───────────────────────────────────────────────────────── */}
       {processStats && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12 }}>
-          {[
-            { label: 'TOTAL',      value: processStats.total_processes,      color: 'var(--cyan)'  },
-            { label: 'SAFE',       value: processStats.safe_processes,       color: 'var(--green)' },
-            { label: 'SUSPICIOUS', value: processStats.suspicious_processes, color: 'var(--amber)' },
-            { label: 'MALICIOUS',  value: processStats.malicious_processes,  color: 'var(--red)'   },
-            { label: 'CRITICAL',   value: processStats.critical_processes,   color: '#e040fb'      },
-          ].map(s => (
-            <div key={s.label} style={{
-              background: 'var(--surface)', border: '1px solid var(--border)',
-              borderRadius: 8, padding: '14px 16px',
-              borderTop: `2px solid ${s.color}`,
-            }}>
-              <div style={{ fontFamily: 'var(--font-hud)', fontSize: 24, fontWeight: 700, color: s.color }}>
-                {s.value}
-              </div>
-              <div style={{
-                fontFamily: 'var(--font-mono)', fontSize: 9,
-                color: 'var(--text-dim)', marginTop: 4, letterSpacing: '0.08em',
-              }}>
-                {s.label}
-              </div>
-            </div>
-          ))}
-        </div>
+        <>
+          {/* Threat counts */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12 }}>
+            <StatCard label="TOTAL"      value={processStats.total_processes}      color="var(--cyan)" />
+            <StatCard label="SAFE"       value={processStats.safe_processes}       color="var(--green)" />
+            <StatCard label="SUSPICIOUS" value={processStats.suspicious_processes} color="var(--amber)" />
+            <StatCard label="MALICIOUS"  value={processStats.malicious_processes}  color="var(--red)" />
+            <StatCard label="CRITICAL"   value={processStats.critical_processes}   color="#e040fb" />
+          </div>
+          {/* System metrics */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+            <StatCard
+              label="MEMORY USED"
+              value={`${parseFloat(processStats.total_memory_mb).toFixed(0)} MB`}
+              color="var(--cyan)"
+            />
+            <StatCard
+              label="TOTAL THREADS"
+              value={processStats.total_threads}
+              color="var(--text-dim)"
+            />
+            <StatCard
+              label="AVG CPU"
+              value={`${parseFloat(processStats.avg_cpu_usage).toFixed(1)}%`}
+              color={parseFloat(processStats.avg_cpu_usage) > 50 ? 'var(--amber)' : 'var(--text-dim)'}
+            />
+            <StatCard
+              label="SCAN TIME"
+              value={`${processStats.scan_duration_ms} ms`}
+              color="var(--text-dim)"
+            />
+          </div>
+        </>
       )}
 
       {/* ── Process list ────────────────────────────────────────────────────── */}
@@ -408,11 +493,11 @@ export default function ProcessMonitor() {
             <input
               value={search}
               onChange={e => setSearch(e.target.value)}
-              placeholder="Search by name, PID or path..."
+              placeholder="Search by name, PID, path or user..."
               style={{
                 background: 'transparent', border: 'none', outline: 'none',
                 color: 'var(--text)', fontFamily: 'var(--font-mono)', fontSize: 11,
-                width: 220,
+                width: 240,
               }}
             />
           </div>

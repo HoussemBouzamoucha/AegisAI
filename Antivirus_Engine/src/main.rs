@@ -4,6 +4,7 @@
 mod core;
 
 use core::file_system::scanner::FileSystemScanner;
+use core::network::NetworkScanner;
 use core::process::ProcessScanner;
 use core::process::output::serialize_process;
 use core::types::ThreatLevel;
@@ -45,6 +46,15 @@ fn main() {
             scan_directory_json(Path::new(&args[2]));
         }
         "scan-processes" => { scan_processes_json(); }
+        "scan-network" => { scan_network_json(None); }
+        "scan-network-pid" => {
+            if args.len() < 3 { println!("{{\"error\": \"No PID provided\"}}"); return; }
+            if let Ok(pid) = args[2].parse::<u32>() {
+                scan_network_json(Some(pid));
+            } else {
+                println!("{{\"error\": \"Invalid PID\"}}");
+            }
+        }
         "kill-process" => {
             if args.len() < 3 { println!("{{\"error\": \"No PID provided\"}}"); return; }
             if let Ok(pid) = args[2].parse::<u32>() {
@@ -69,6 +79,7 @@ fn run_daemon() {
     // Scanners created ONCE — YARA compiles here, reused for every request
     let scanner         = FileSystemScanner::new();
     let process_scanner = ProcessScanner::new();
+    let network_scanner = NetworkScanner::new();
 
     eprintln!("DAEMON: scanner initialized, waiting for requests...");
 
@@ -101,6 +112,7 @@ fn run_daemon() {
                 daemon_scan_dir(&scanner, Path::new(path), &id)
             }
             "scan-processes" => daemon_scan_processes(&process_scanner, &id),
+            "scan-network" => daemon_scan_network(&network_scanner, request["pid"].as_u64().map(|v| v as u32), &id),
             "kill-process"   => {
                 let pid = request["pid"].as_u64().unwrap_or(0) as u32;
                 daemon_kill_process(&process_scanner, pid, &id)
@@ -245,6 +257,112 @@ fn scan_processes_json() {
             }));
         }
         Err(e) => println!("{{\"success\": false, \"error\": \"{}\"}}", e),
+    }
+}
+
+fn scan_network_json(pid: Option<u32>) {
+    let scanner = NetworkScanner::new();
+
+    let (connections, stats) = match pid {
+        Some(pid) => {
+            let connections = match scanner.scan_by_pid(pid) {
+                Ok(connections) => connections,
+                Err(e) => {
+                    println!("{{\"success\": false, \"error\": \"{}\"}}", e);
+                    return;
+                }
+            };
+            let stats = scanner.get_statistics(&connections);
+            (connections, stats)
+        }
+        None => match scanner.scan() {
+            Ok((connections, stats)) => (connections, stats),
+            Err(e) => {
+                println!("{{\"success\": false, \"error\": \"{}\"}}", e);
+                return;
+            }
+        },
+    };
+
+    let list: Vec<serde_json::Value> = connections.iter()
+        .map(serialize_network_connection)
+        .collect();
+
+    println!("{}", json!({
+        "success": true,
+        "statistics": {
+            "total_connections":      stats.total_connections,
+            "suspicious_connections": stats.suspicious_connections,
+            "malicious_connections":  stats.malicious_connections,
+            "local_listeners":        stats.local_listeners,
+            "established_connections": stats.established_connections,
+            "scan_duration_ms":       stats.scan_duration_ms,
+        },
+        "connections": list,
+    }));
+}
+
+fn serialize_network_connection(c: &crate::core::network::types::NetworkConnection) -> serde_json::Value {
+    let signals: Vec<serde_json::Value> = c.detection_signals.iter()
+        .map(|s| json!({
+            "source":      s.source,
+            "description": s.description,
+            "score":       s.score,
+        }))
+        .collect();
+
+    json!({
+        "protocol":      c.protocol,
+        "local_address": c.local_address,
+        "remote_address": c.remote_address,
+        "state":         c.state,
+        "pid":           c.pid,
+        "process_name":  c.process_name,
+        "threat_level":  c.threat_level.as_str(),
+        "threat_score":  c.threat_score,
+        "is_threat":     c.is_threat,
+        "detection_signals": signals,
+    })
+}
+
+fn daemon_scan_network(scanner: &NetworkScanner, pid: Option<u32>, id: &str) -> serde_json::Value {
+    let result = match pid {
+        Some(pid) => scanner.scan_by_pid(pid).map(|connections| {
+            let stats = scanner.get_statistics(&connections);
+            json!({
+                "id": id,
+                "success": true,
+                "statistics": {
+                    "total_connections":      stats.total_connections,
+                    "suspicious_connections": stats.suspicious_connections,
+                    "malicious_connections":  stats.malicious_connections,
+                    "local_listeners":        stats.local_listeners,
+                    "established_connections": stats.established_connections,
+                    "scan_duration_ms":       stats.scan_duration_ms,
+                },
+                "connections": connections.iter().map(serialize_network_connection).collect::<Vec<_>>(),
+            })
+        }),
+        None => scanner.scan().map(|(connections, stats)| {
+            json!({
+                "id": id,
+                "success": true,
+                "statistics": {
+                    "total_connections":      stats.total_connections,
+                    "suspicious_connections": stats.suspicious_connections,
+                    "malicious_connections":  stats.malicious_connections,
+                    "local_listeners":        stats.local_listeners,
+                    "established_connections": stats.established_connections,
+                    "scan_duration_ms":       stats.scan_duration_ms,
+                },
+                "connections": connections.iter().map(serialize_network_connection).collect::<Vec<_>>(),
+            })
+        }),
+    };
+
+    match result {
+        Ok(value) => value,
+        Err(e)    => json!({ "id": id, "success": false, "error": e.to_string() }),
     }
 }
 
@@ -402,6 +520,8 @@ fn print_usage() {
     println!("  antivirus scan-file <file>      Scan single file (JSON)");
     println!("  antivirus scan-dir <dir>        Scan directory (JSON)");
     println!("  antivirus scan-processes        Scan running processes (JSON)");
+    println!("  antivirus scan-network          Scan system network connections (JSON)");
+    println!("  antivirus scan-network-pid <PID> Scan network connections for a process (JSON)");
     println!("  antivirus kill-process <PID>    Terminate a process");
     println!("  antivirus test                  Run self-tests");
 }

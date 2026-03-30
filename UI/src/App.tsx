@@ -5,6 +5,7 @@ import Sidebar from './components/Sidebar';
 import Dashboard from './components/Dashboard';
 import Scanner from './components/Scanner';
 import ProcessMonitor from './components/ProcessMonitor';
+import NetworkMonitor from './components/NetworkMonitor';
 import History from './components/History';
 
 export default function App() {
@@ -28,6 +29,7 @@ export default function App() {
           {view === 'dashboard'  && <Dashboard />}
           {view === 'scanner'   && <Scanner />}
           {view === 'processes' && <ProcessMonitor />}
+          {view === 'network'   && <NetworkMonitor />}
           {view === 'history'   && <History />}
         </main>
       </div>

@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   View, ScanResult, ScanOutput, DirectoryScanResult,
   ProcessInfo, ProcessScanResult, ScanHistoryEntry,
+  NetworkConnection, NetworkStats, NetworkScanResult,
 } from '../types';
 
 interface AppState {
@@ -27,6 +28,12 @@ interface AppState {
   processError: string | null;
   scanProcesses: () => Promise<void>;
   killProcess: (pid: number) => Promise<void>;
+
+  networkScanning: boolean;
+  networkConnections: NetworkConnection[];
+  networkStats: NetworkStats | null;
+  networkError: string | null;
+  scanNetwork: (pid?: number) => Promise<void>;
 
   history: ScanHistoryEntry[];
   addHistory: (entry: ScanHistoryEntry) => void;
@@ -75,6 +82,21 @@ function normalizeProcess(p: any): ProcessInfo {
   };
 }
 
+function normalizeNetwork(connection: any): NetworkConnection {
+  return {
+    protocol:          connection.protocol      ?? 'tcp',
+    local_address:     connection.local_address  ?? '',
+    remote_address:    connection.remote_address ?? '',
+    state:             connection.state          ?? '',
+    pid:               connection.pid ?? null,
+    process_name:      connection.process_name ?? null,
+    threat_level:      connection.threat_level  ?? 'Clean',
+    threat_score:      connection.threat_score  ?? 0,
+    is_threat:         connection.is_threat     ?? false,
+    detection_signals: connection.detection_signals ?? [],
+  };
+}
+
 // ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useStore = create<AppState>((set, get) => ({
@@ -84,8 +106,8 @@ export const useStore = create<AppState>((set, get) => ({
   engineReady: false,
   checkEngine: async () => {
     try {
-      const status = await invoke<{ ready: boolean }>('engine_status');
-      set({ engineReady: status.ready });
+      const status = await invoke<{ available: boolean; daemon_alive: boolean }>('get_engine_status');
+      set({ engineReady: status.available && status.daemon_alive });
     } catch {
       set({ engineReady: false });
     }
@@ -160,6 +182,26 @@ export const useStore = create<AppState>((set, get) => ({
   processes: [],
   processStats: null,
   processError: null,
+
+  networkScanning: false,
+  networkConnections: [],
+  networkStats: null,
+  networkError: null,
+  scanNetwork: async (pid) => {
+    set({ networkScanning: true, networkError: null });
+    try {
+      const args: Record<string, unknown> = {};
+      if (pid !== undefined) { args.pid = pid; }
+      const result = await invoke<NetworkScanResult>('scan_network', args);
+      if (!result.success) throw new Error(result.error ?? 'Network scan failed');
+      const connections = (result.connections ?? []).map(normalizeNetwork);
+      set({ networkConnections: connections, networkStats: result.statistics });
+    } catch (e: any) {
+      set({ networkError: String(e) });
+    } finally {
+      set({ networkScanning: false });
+    }
+  },
 
   scanProcesses: async () => {
     set({ processScanning: true, processError: null });

@@ -1,6 +1,3 @@
-# Cargo.toml - Antivirus Engine (Without YARA)
-# This version compiles without requiring LLVM/Clang
-
 [package]
 name = "antivirus_engine"
 version = "1.0.0"
@@ -10,31 +7,36 @@ description = "Multi-layer malware detection engine with dynamic behavioral anal
 license = "MIT"
 
 [dependencies]
-# Core dependencies - always required
-anyhow = "1.0"           # Error handling
-hex = "0.4"              # Hex encoding for hashes
-walkdir = "2.5"          # Directory traversal
+anyhow    = "1.0"
+hex       = "0.4"
+walkdir   = "2.5"
+sha2      = "0.10.9"
+md5       = "0.8.0"
+sysinfo   = "0.38.4"
 
-# Hashing algorithms
-sha2 = "0.10"            # SHA-256, SHA-512
-md5 = "0.8.0"              # MD5 (legacy support)
-
-# Optional features
-serde = { version = "1.0", features = ["derive"], optional = true }
+serde      = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
+yara-x     = "1.13.0"
 
-# YARA support (commented out - uncomment after installing LLVM)
-# yara = { version = "0.27", optional = true }
-yara-x = "1.13.0"
-sysinfo = "0.38.4"
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_Security",
+    "Win32_System_ProcessStatus",
+    "Wdk_Foundation",
+    "Wdk_System_SystemInformation",
+    "Wdk_System_SystemServices",
+] }
+
 [dev-dependencies]
-tempfile = "3.10"        # For tests
+tempfile = "3.10"
 
 [features]
-default = ["json"]  # Enable JSON by default for Python integration
-json = ["dep:serde", "dep:serde_json"]
-# yara = ["dep:yara"]      # Uncomment after LLVM installation
-# full = ["json", "yara"]  # Uncomment for all features
+default = ["json"]
+json    = ["dep:serde", "dep:serde_json"]
+full    = ["json"]
 
 [profile.dev]
 opt-level = 0
@@ -48,6 +50,3 @@ strip = true
 [[bin]]
 name = "antivirus"
 path = "src/main.rs"
-required-features = []
-
-sysinfo = "0.30"

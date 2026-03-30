@@ -62,9 +62,10 @@ pub struct HandleInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleInfo {
     pub name:         String,
-    pub path:         Option<String>,
+    pub path:         Option<String>, // None if the path could not be retrieved
     pub base_address: u64,
     pub size:         u64,
+    pub is_suspicious: bool,          // Fix #2: added missing field
 }
 
 // ─── Stage 4 stub: Service info ───────────────────────────────────────────────

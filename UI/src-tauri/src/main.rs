@@ -81,6 +81,26 @@ pub struct ProcessScanOutput {
     pub error:      Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NetworkStats {
+    pub total_connections:      u64,
+    pub suspicious_connections: u64,
+    pub malicious_connections:  u64,
+    pub local_listeners:        u64,
+    pub established_connections: u64,
+    pub scan_duration_ms:       u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NetworkScanOutput {
+    pub success:     bool,
+    pub statistics:  NetworkStats,
+    pub connections: Vec<serde_json::Value>,
+    pub error:       Option<String>,
+}
+
 // ─── Daemon state ─────────────────────────────────────────────────────────────
 
 struct Daemon {
@@ -333,6 +353,38 @@ async fn scan_processes(
 }
 
 #[tauri::command]
+async fn scan_network(
+    pid: Option<u32>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<NetworkScanOutput, String> {
+    let mut request = serde_json::Map::new();
+    request.insert("id".to_string(), serde_json::json!(next_id()));
+    request.insert("cmd".to_string(), serde_json::json!("scan-network"));
+    if let Some(pid) = pid {
+        request.insert("pid".to_string(), serde_json::json!(pid));
+    }
+
+    let json = daemon_request(&state, serde_json::Value::Object(request))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+
+    let connections = json["connections"].as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let s = &json["statistics"];
+    let stats = NetworkStats {
+        total_connections:      s["total_connections"].as_u64().unwrap_or(0),
+        suspicious_connections: s["suspicious_connections"].as_u64().unwrap_or(0),
+        malicious_connections:  s["malicious_connections"].as_u64().unwrap_or(0),
+        local_listeners:        s["local_listeners"].as_u64().unwrap_or(0),
+        established_connections: s["established_connections"].as_u64().unwrap_or(0),
+        scan_duration_ms:       s["scan_duration_ms"].as_u64().unwrap_or(0),
+    };
+
+    Ok(NetworkScanOutput { success: true, statistics: stats, connections, error: None })
+}
+
+#[tauri::command]
 async fn kill_process(
     pid: u32,
     state: tauri::State<'_, Arc<AppState>>,
@@ -409,6 +461,7 @@ fn main() {
             scan_file,
             scan_directory,
             scan_processes,
+            scan_network,
             kill_process,
             open_file_dialog,
             open_dir_dialog,

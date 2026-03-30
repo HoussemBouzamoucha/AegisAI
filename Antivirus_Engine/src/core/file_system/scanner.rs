@@ -46,13 +46,6 @@ const YARA_WEAK_RULES: &[&str] = &[
     // Network indicator rules — belong in network scanner (not built yet)
     // Kept as weak (+1) to avoid false positives on scripts with URLs/IPs
     // TODO: move to network_scanner::yara_policy when network module is built
-    "domain",
-    "ip",
-    "ip_address",
-    "url",
-    "network",
-    "http",
-    "email",
     // Tool name rules — too generic, fire on any script calling the tool
     "powershell",
     "cmd",

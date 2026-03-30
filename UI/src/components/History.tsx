@@ -1,5 +1,5 @@
 import { useStore } from '../store';
-import { Clock, FolderOpen, FileText, CheckCircle, AlertTriangle, Trash2 } from 'lucide-react';
+import { Clock, FolderOpen, FileText, CheckCircle, AlertTriangle } from 'lucide-react';
 
 export default function History() {
   const { history } = useStore();
