@@ -6,7 +6,7 @@
 
 export type ThreatLevel = 'Clean' | 'Suspicious' | 'Malicious';
 export type ProcessThreat = 'Safe' | 'Suspicious' | 'Malicious' | 'Critical';
-export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'history';
+export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // File Classification
@@ -166,6 +166,42 @@ export interface NetworkScanResult {
   success: boolean;
   statistics: NetworkStats;
   connections: NetworkConnection[];
+  error?: string;
+}
+
+export interface MemoryRegion {
+  pid: number;
+  process_name: string;
+  process_path: string | null;
+  command_line: string | null;
+  region_start: number;
+  region_size: number;
+  protection: string;
+  is_executable: boolean;
+  is_writable: boolean;
+  is_readable: boolean;
+  is_committed: boolean;
+  is_private: boolean;
+  content_sample?: string | null;
+  threat_level: ThreatLevel;
+  threat_score: number;
+  is_threat: boolean;
+  detection_signals: DetectionSignal[];
+}
+
+export interface MemoryStats {
+  total_regions: number;
+  scanned_processes: number;
+  suspicious_regions: number;
+  malicious_regions: number;
+  total_bytes_scanned: number;
+  scan_duration_ms: number;
+}
+
+export interface MemoryScanResult {
+  success: boolean;
+  statistics: MemoryStats;
+  regions: MemoryRegion[];
   error?: string;
 }
 

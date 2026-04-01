@@ -1,4 +1,4 @@
-import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi } from 'lucide-react';
+import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi, Activity } from 'lucide-react';
 import { useStore } from '../store';
 import type { View } from '../types';
 
@@ -8,11 +8,12 @@ const NAV: { id: View; label: string; icon: React.ReactNode; }[] = [
   { id: 'scanner',   label: 'SCANNER',   icon: <FolderSearch size={18} /> },
   { id: 'processes', label: 'PROCESSES', icon: <Cpu size={18} /> },
   { id: 'network',   label: 'NETWORK',   icon: <Wifi size={18} /> },
+  { id: 'memory',    label: 'MEMORY',    icon: <Activity size={18} /> },
   { id: 'history',   label: 'HISTORY',   icon: <ClockIcon size={18} /> },
 ];
 
 export default function Sidebar() {
-  const { view, setView, scanStats, processStats, scanning, processScanning, networkScanning } = useStore();
+  const { view, setView, scanStats, processStats, scanning, processScanning, networkScanning, memoryScanning } = useStore();
 
   return (
     <nav style={{
@@ -46,7 +47,7 @@ export default function Sidebar() {
 
       {NAV.map(item => {
         const active = view === item.id;
-        const isBusy = (item.id === 'scanner' && scanning) || (item.id === 'processes' && processScanning) || (item.id === 'network' && networkScanning);
+        const isBusy = (item.id === 'scanner' && scanning) || (item.id === 'processes' && processScanning) || (item.id === 'network' && networkScanning) || (item.id === 'memory' && memoryScanning);
 
         return (
           <button key={item.id} onClick={() => setView(item.id)} style={{

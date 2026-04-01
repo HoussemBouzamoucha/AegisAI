@@ -4,6 +4,7 @@
 mod core;
 
 use core::file_system::scanner::FileSystemScanner;
+use core::memory::scanner::MemoryScanner;
 use core::network::NetworkScanner;
 use core::process::ProcessScanner;
 use core::process::output::serialize_process;
@@ -55,6 +56,17 @@ fn main() {
                 println!("{{\"error\": \"Invalid PID\"}}");
             }
         }
+        "scan-memory" => {
+            if args.len() >= 3 {
+                if let Ok(pid) = args[2].parse::<u32>() {
+                    scan_memory_json(Some(pid));
+                } else {
+                    println!("{{\"success\": false, \"error\": \"Invalid PID\"}}");
+                }
+            } else {
+                scan_memory_json(None);
+            }
+        }
         "kill-process" => {
             if args.len() < 3 { println!("{{\"error\": \"No PID provided\"}}"); return; }
             if let Ok(pid) = args[2].parse::<u32>() {
@@ -76,10 +88,14 @@ fn run_daemon() {
     println!("{}", ready);
     io::stdout().flush().ok();
 
-    // Scanners created ONCE — YARA compiles here, reused for every request
     let scanner         = FileSystemScanner::new();
     let process_scanner = ProcessScanner::new();
     let network_scanner = NetworkScanner::new();
+    // FIX: MemoryScanner is now created once here instead of being
+    // re-created on every scan-memory request. Each new() previously
+    // triggered a fresh System allocation internally when scan_processes
+    // was called, compounding the RAM spike with every daemon request.
+    let memory_scanner  = MemoryScanner::new();
 
     eprintln!("DAEMON: scanner initialized, waiting for requests...");
 
@@ -103,16 +119,26 @@ fn run_daemon() {
         let cmd = request["cmd"].as_str().unwrap_or("");
 
         let response = match cmd {
-            "scan-file" => {
+            "scan-file"      => {
                 let path = request["path"].as_str().unwrap_or("");
                 daemon_scan_file(&scanner, Path::new(path), &id)
             }
-            "scan-dir" => {
+            "scan-dir"       => {
                 let path = request["path"].as_str().unwrap_or("");
                 daemon_scan_dir(&scanner, Path::new(path), &id)
             }
             "scan-processes" => daemon_scan_processes(&process_scanner, &id),
-            "scan-network" => daemon_scan_network(&network_scanner, request["pid"].as_u64().map(|v| v as u32), &id),
+            "scan-network"   => daemon_scan_network(
+                &network_scanner,
+                request["pid"].as_u64().map(|v| v as u32),
+                &id,
+            ),
+            // FIX: pass &memory_scanner instead of allocating a new one per call.
+            "scan-memory"    => daemon_scan_memory(
+                &memory_scanner,
+                request["pid"].as_u64().map(|v| v as u32),
+                &id,
+            ),
             "kill-process"   => {
                 let pid = request["pid"].as_u64().unwrap_or(0) as u32;
                 daemon_kill_process(&process_scanner, pid, &id)
@@ -154,6 +180,38 @@ fn serialize_result(r: &core::types::ScanResult) -> serde_json::Value {
         "detection_signals": detection_signals,
         "file_category":     r.file_category.as_str(),
         "context_flags":     context_flags,
+    })
+}
+
+// ─── Shared memory region serializer ─────────────────────────────────────────
+
+fn serialize_memory_region(r: &crate::core::memory::scanner::MemoryRegion) -> serde_json::Value {
+    let signals: Vec<serde_json::Value> = r.detection_signals.iter()
+        .map(|s| json!({
+            "source":      s.source,
+            "description": s.description,
+            "score":       s.score,
+        }))
+        .collect();
+
+    json!({
+        "pid":               r.pid,
+        "process_name":      r.process_name,
+        "process_path":      r.process_path,
+        "command_line":      r.command_line,
+        "region_start":      r.region_start,
+        "region_size":       r.region_size,
+        "protection":        r.protection,
+        "is_executable":     r.is_executable,
+        "is_writable":       r.is_writable,
+        "is_readable":       r.is_readable,
+        "is_committed":      r.is_committed,
+        "is_private":        r.is_private,
+        "content_sample":    r.content_sample,
+        "threat_level":      r.threat_level,
+        "threat_score":      r.threat_score,
+        "is_threat":         r.is_threat,
+        "detection_signals": signals,
     })
 }
 
@@ -230,6 +288,26 @@ fn daemon_kill_process(scanner: &ProcessScanner, pid: u32, id: &str) -> serde_js
     }
 }
 
+// FIX: now accepts &MemoryScanner instead of allocating a new one each call.
+fn daemon_scan_memory(scanner: &MemoryScanner, pid: Option<u32>, id: &str) -> serde_json::Value {
+    match scanner.scan_processes(pid) {
+        Ok((regions, stats)) => json!({
+            "id":      id,
+            "success": true,
+            "statistics": {
+                "total_regions":       stats.total_regions,
+                "scanned_processes":   stats.scanned_processes,
+                "suspicious_regions":  stats.suspicious_regions,
+                "malicious_regions":   stats.malicious_regions,
+                "total_bytes_scanned": stats.total_bytes_scanned,
+                "scan_duration_ms":    stats.scan_duration_ms,
+            },
+            "regions": regions.iter().map(serialize_memory_region).collect::<Vec<_>>(),
+        }),
+        Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
+    }
+}
+
 // ─── One-shot CLI ─────────────────────────────────────────────────────────────
 
 fn scan_processes_json() {
@@ -266,7 +344,7 @@ fn scan_network_json(pid: Option<u32>) {
     let (connections, stats) = match pid {
         Some(pid) => {
             let connections = match scanner.scan_by_pid(pid) {
-                Ok(connections) => connections,
+                Ok(c)  => c,
                 Err(e) => {
                     println!("{{\"success\": false, \"error\": \"{}\"}}", e);
                     return;
@@ -291,12 +369,12 @@ fn scan_network_json(pid: Option<u32>) {
     println!("{}", json!({
         "success": true,
         "statistics": {
-            "total_connections":      stats.total_connections,
-            "suspicious_connections": stats.suspicious_connections,
-            "malicious_connections":  stats.malicious_connections,
-            "local_listeners":        stats.local_listeners,
+            "total_connections":       stats.total_connections,
+            "suspicious_connections":  stats.suspicious_connections,
+            "malicious_connections":   stats.malicious_connections,
+            "local_listeners":         stats.local_listeners,
             "established_connections": stats.established_connections,
-            "scan_duration_ms":       stats.scan_duration_ms,
+            "scan_duration_ms":        stats.scan_duration_ms,
         },
         "connections": list,
     }));
@@ -312,15 +390,15 @@ fn serialize_network_connection(c: &crate::core::network::types::NetworkConnecti
         .collect();
 
     json!({
-        "protocol":      c.protocol,
-        "local_address": c.local_address,
-        "remote_address": c.remote_address,
-        "state":         c.state,
-        "pid":           c.pid,
-        "process_name":  c.process_name,
-        "threat_level":  c.threat_level.as_str(),
-        "threat_score":  c.threat_score,
-        "is_threat":     c.is_threat,
+        "protocol":          c.protocol,
+        "local_address":     c.local_address,
+        "remote_address":    c.remote_address,
+        "state":             c.state,
+        "pid":               c.pid,
+        "process_name":      c.process_name,
+        "threat_level":      c.threat_level.as_str(),
+        "threat_score":      c.threat_score,
+        "is_threat":         c.is_threat,
         "detection_signals": signals,
     })
 }
@@ -330,30 +408,30 @@ fn daemon_scan_network(scanner: &NetworkScanner, pid: Option<u32>, id: &str) -> 
         Some(pid) => scanner.scan_by_pid(pid).map(|connections| {
             let stats = scanner.get_statistics(&connections);
             json!({
-                "id": id,
+                "id":      id,
                 "success": true,
                 "statistics": {
-                    "total_connections":      stats.total_connections,
-                    "suspicious_connections": stats.suspicious_connections,
-                    "malicious_connections":  stats.malicious_connections,
-                    "local_listeners":        stats.local_listeners,
+                    "total_connections":       stats.total_connections,
+                    "suspicious_connections":  stats.suspicious_connections,
+                    "malicious_connections":   stats.malicious_connections,
+                    "local_listeners":         stats.local_listeners,
                     "established_connections": stats.established_connections,
-                    "scan_duration_ms":       stats.scan_duration_ms,
+                    "scan_duration_ms":        stats.scan_duration_ms,
                 },
                 "connections": connections.iter().map(serialize_network_connection).collect::<Vec<_>>(),
             })
         }),
         None => scanner.scan().map(|(connections, stats)| {
             json!({
-                "id": id,
+                "id":      id,
                 "success": true,
                 "statistics": {
-                    "total_connections":      stats.total_connections,
-                    "suspicious_connections": stats.suspicious_connections,
-                    "malicious_connections":  stats.malicious_connections,
-                    "local_listeners":        stats.local_listeners,
+                    "total_connections":       stats.total_connections,
+                    "suspicious_connections":  stats.suspicious_connections,
+                    "malicious_connections":   stats.malicious_connections,
+                    "local_listeners":         stats.local_listeners,
                     "established_connections": stats.established_connections,
-                    "scan_duration_ms":       stats.scan_duration_ms,
+                    "scan_duration_ms":        stats.scan_duration_ms,
                 },
                 "connections": connections.iter().map(serialize_network_connection).collect::<Vec<_>>(),
             })
@@ -365,6 +443,34 @@ fn daemon_scan_network(scanner: &NetworkScanner, pid: Option<u32>, id: &str) -> 
         Err(e)    => json!({ "id": id, "success": false, "error": e.to_string() }),
     }
 }
+
+// ─── One-shot memory scan (CLI) ───────────────────────────────────────────────
+
+fn scan_memory_json(pid: Option<u32>) {
+    let scanner = MemoryScanner::new();
+    match scanner.scan_processes(pid) {
+        Ok((regions, stats)) => {
+            let regions_json: Vec<serde_json::Value> =
+                regions.iter().map(serialize_memory_region).collect();
+
+            println!("{}", json!({
+                "success": true,
+                "statistics": {
+                    "total_regions":       stats.total_regions,
+                    "scanned_processes":   stats.scanned_processes,
+                    "suspicious_regions":  stats.suspicious_regions,
+                    "malicious_regions":   stats.malicious_regions,
+                    "total_bytes_scanned": stats.total_bytes_scanned,
+                    "scan_duration_ms":    stats.scan_duration_ms,
+                },
+                "regions": regions_json,
+            }));
+        }
+        Err(e) => println!("{{\"success\": false, \"error\": \"{}\"}}", e),
+    }
+}
+
+// ─── Remaining CLI helpers ────────────────────────────────────────────────────
 
 fn kill_process_json(pid: u32) {
     let scanner = ProcessScanner::new();
@@ -514,14 +620,15 @@ fn test_zero_byte_executable(scanner: &FileSystemScanner) -> Result<bool, String
 fn print_usage() {
     println!("🛡️  Antivirus Engine v1.0.0\n");
     println!("Usage:");
-    println!("  antivirus daemon                Run as persistent daemon (used by Tauri)");
-    println!("  antivirus scan <path>           Scan a file or directory");
-    println!("  antivirus scan <path> --json    Scan with JSON output");
-    println!("  antivirus scan-file <file>      Scan single file (JSON)");
-    println!("  antivirus scan-dir <dir>        Scan directory (JSON)");
-    println!("  antivirus scan-processes        Scan running processes (JSON)");
-    println!("  antivirus scan-network          Scan system network connections (JSON)");
-    println!("  antivirus scan-network-pid <PID> Scan network connections for a process (JSON)");
-    println!("  antivirus kill-process <PID>    Terminate a process");
-    println!("  antivirus test                  Run self-tests");
+    println!("  antivirus daemon                  Run as persistent daemon (used by Tauri)");
+    println!("  antivirus scan <path>             Scan a file or directory");
+    println!("  antivirus scan <path> --json      Scan with JSON output");
+    println!("  antivirus scan-file <file>        Scan single file (JSON)");
+    println!("  antivirus scan-dir <dir>          Scan directory (JSON)");
+    println!("  antivirus scan-processes          Scan running processes (JSON)");
+    println!("  antivirus scan-network            Scan system network connections (JSON)");
+    println!("  antivirus scan-network-pid <PID>  Scan network connections for a process (JSON)");
+    println!("  antivirus scan-memory             Scan process memory regions (JSON)");
+    println!("  antivirus kill-process <PID>      Terminate a process");
+    println!("  antivirus test                    Run self-tests");
 }

@@ -1,5 +1,5 @@
 import { useStore } from '../store';
-import { Shield, AlertTriangle, CheckCircle, Cpu, FolderSearch, Clock, Wifi } from 'lucide-react';
+import { Shield, AlertTriangle, CheckCircle, Cpu, FolderSearch, Clock, Wifi, Activity } from 'lucide-react';
 import { RadialBarChart, RadialBar, ResponsiveContainer, PolarAngleAxis } from 'recharts';
 
 function StatCard({ label, value, color, sub }: { label: string; value: string | number; color: string; sub?: string }) {
@@ -187,6 +187,7 @@ export default function Dashboard() {
             <QuickAction icon={<FolderSearch size={16} />} label="Scan Files or Directory" onClick={() => setView('scanner')} />
             <QuickAction icon={<Cpu size={16} />} label="Monitor Running Processes" onClick={() => setView('processes')} />
             <QuickAction icon={<Wifi size={16} />} label="Inspect Network Traffic" onClick={() => setView('network')} />
+            <QuickAction icon={<Activity size={16} />} label="Inspect Memory Regions" onClick={() => setView('memory')} />
             <QuickAction icon={<Clock size={16} />} label="View Scan History" onClick={() => setView('history')} />
           </div>
         </div>

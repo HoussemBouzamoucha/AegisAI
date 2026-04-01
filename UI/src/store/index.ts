@@ -5,6 +5,7 @@ import type {
   View, ScanResult, ScanOutput, DirectoryScanResult,
   ProcessInfo, ProcessScanResult, ScanHistoryEntry,
   NetworkConnection, NetworkStats, NetworkScanResult,
+  MemoryRegion, MemoryStats, MemoryScanResult as MemoryScanResultType,
 } from '../types';
 
 interface AppState {
@@ -34,6 +35,12 @@ interface AppState {
   networkStats: NetworkStats | null;
   networkError: string | null;
   scanNetwork: (pid?: number) => Promise<void>;
+
+  memoryScanning: boolean;
+  memoryRegions: MemoryRegion[];
+  memoryStats: MemoryStats | null;
+  memoryError: string | null;
+  scanMemory: (pid?: number) => Promise<void>;
 
   history: ScanHistoryEntry[];
   addHistory: (entry: ScanHistoryEntry) => void;
@@ -96,7 +103,27 @@ function normalizeNetwork(connection: any): NetworkConnection {
     detection_signals: connection.detection_signals ?? [],
   };
 }
-
+function normalizeMemoryRegion(region: any): MemoryRegion {
+  return {
+    pid:               region.pid ?? 0,
+    process_name:      region.process_name ?? '',
+    process_path:      region.process_path ?? null,
+    command_line:      region.command_line ?? null,
+    region_start:      region.region_start ?? 0,
+    region_size:       region.region_size ?? 0,
+    protection:        region.protection ?? '',
+    is_executable:      region.is_executable ?? false,
+    is_writable:        region.is_writable ?? false,
+    is_readable:        region.is_readable ?? false,
+    is_committed:       region.is_committed ?? false,
+    is_private:         region.is_private ?? false,
+    content_sample:     region.content_sample ?? null,
+    threat_level:       region.threat_level ?? 'Clean',
+    threat_score:       region.threat_score ?? 0,
+    is_threat:          region.is_threat ?? false,
+    detection_signals:  region.detection_signals ?? [],
+  };
+}
 // ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useStore = create<AppState>((set, get) => ({
@@ -200,6 +227,26 @@ export const useStore = create<AppState>((set, get) => ({
       set({ networkError: String(e) });
     } finally {
       set({ networkScanning: false });
+    }
+  },
+
+  memoryScanning: false,
+  memoryRegions: [],
+  memoryStats: null,
+  memoryError: null,
+  scanMemory: async (pid) => {
+    set({ memoryScanning: true, memoryError: null });
+    try {
+      const args: Record<string, unknown> = {};
+      if (pid !== undefined) { args.pid = pid; }
+      const result = await invoke<MemoryScanResultType>('scan_memory', args);
+      if (!result.success) throw new Error(result.error ?? 'Memory scan failed');
+      const regions = (result.regions ?? []).map(normalizeMemoryRegion);
+      set({ memoryRegions: regions, memoryStats: result.statistics });
+    } catch (e: any) {
+      set({ memoryError: String(e) });
+    } finally {
+      set({ memoryScanning: false });
     }
   },
 

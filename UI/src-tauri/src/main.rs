@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -84,12 +84,12 @@ pub struct ProcessScanOutput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct NetworkStats {
-    pub total_connections:      u64,
-    pub suspicious_connections: u64,
-    pub malicious_connections:  u64,
-    pub local_listeners:        u64,
+    pub total_connections:       u64,
+    pub suspicious_connections:  u64,
+    pub malicious_connections:   u64,
+    pub local_listeners:         u64,
     pub established_connections: u64,
-    pub scan_duration_ms:       u64,
+    pub scan_duration_ms:        u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,6 +101,48 @@ pub struct NetworkScanOutput {
     pub error:       Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryRegion {
+    pub pid:               u32,
+    pub process_name:      String,
+    pub process_path:      Option<String>,
+    pub command_line:      Option<String>,
+    pub region_start:      u64,
+    pub region_size:       u64,
+    pub protection:        String,
+    pub is_executable:     bool,
+    pub is_writable:       bool,
+    pub is_readable:       bool,
+    pub is_committed:      bool,
+    pub is_private:        bool,
+    pub content_sample:    Option<String>,
+    pub threat_level:      String,
+    pub threat_score:      i32,
+    pub is_threat:         bool,
+    pub detection_signals: Vec<DetectionSignal>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryStats {
+    pub total_regions:       u64,
+    pub scanned_processes:   u64,
+    pub suspicious_regions:  u64,
+    pub malicious_regions:   u64,
+    pub total_bytes_scanned: u64,
+    pub scan_duration_ms:    u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryScanOutput {
+    pub success:    bool,
+    pub statistics: MemoryStats,
+    pub regions:    Vec<MemoryRegion>,
+    pub error:      Option<String>,
+}
+
 // ─── Daemon state ─────────────────────────────────────────────────────────────
 
 struct Daemon {
@@ -108,9 +150,12 @@ struct Daemon {
 }
 
 struct AppState {
-    daemon:      Mutex<Option<Daemon>>,
-    child:       Mutex<Child>,
-    response_rx: Mutex<std::sync::mpsc::Receiver<String>>,
+    daemon:           Mutex<Option<Daemon>>,
+    child:            Mutex<Child>,
+    response_rx:      Mutex<std::sync::mpsc::Receiver<String>>,
+    // Prevents concurrent memory scans from stacking up and compounding
+    // the RAM spike. Only one memory scan may be in-flight at a time.
+    memory_scan_lock: AtomicBool,
 }
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -146,7 +191,6 @@ fn spawn_daemon() -> Result<AppState, String> {
     let stdin  = child.stdin.take().ok_or("Could not get daemon stdin")?;
     let stdout = child.stdout.take().ok_or("Could not get daemon stdout")?;
 
-    // Timeout on ready phase — prevents Tauri freeze if daemon hangs
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<BufReader<std::process::ChildStdout>, String>>();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -176,18 +220,22 @@ fn spawn_daemon() -> Result<AppState, String> {
     });
 
     Ok(AppState {
-        daemon:      Mutex::new(Some(Daemon { stdin })),
-        child:       Mutex::new(child),
-        response_rx: Mutex::new(rx),
+        daemon:           Mutex::new(Some(Daemon { stdin })),
+        child:            Mutex::new(child),
+        response_rx:      Mutex::new(rx),
+        memory_scan_lock: AtomicBool::new(false),
     })
 }
 
 // ─── Send request / read matching response ────────────────────────────────────
 
-fn daemon_request(state: &AppState, request: serde_json::Value) -> Result<serde_json::Value, String> {
+fn daemon_request(
+    state: &AppState,
+    request: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
     let id = request["id"].as_str().unwrap_or("0").to_string();
 
-    // Crash detection
     {
         let mut child = state.child.lock().unwrap();
         match child.try_wait() {
@@ -197,7 +245,6 @@ fn daemon_request(state: &AppState, request: serde_json::Value) -> Result<serde_
         }
     }
 
-    // Send request
     {
         let mut lock = state.daemon.lock().unwrap();
         let daemon = lock.as_mut().ok_or("Daemon not initialized")?;
@@ -209,9 +256,8 @@ fn daemon_request(state: &AppState, request: serde_json::Value) -> Result<serde_
             .map_err(|e| format!("Failed to flush daemon stdin: {}", e))?;
     }
 
-    // Read matching response
     let rx = state.response_rx.lock().unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let deadline = std::time::Instant::now() + timeout;
 
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -226,8 +272,8 @@ fn daemon_request(state: &AppState, request: serde_json::Value) -> Result<serde_
 
         match json["id"].as_str() {
             Some(resp_id) if resp_id == id => return Ok(json),
-            Some(other)   => { eprintln!("WARN: skipping response id={}", other); continue; }
-            None          => return Ok(json),
+            Some(other) => { eprintln!("WARN: skipping response id={}", other); continue; }
+            None        => return Ok(json),
         }
     }
 }
@@ -263,8 +309,8 @@ fn parse_scan_result(f: &serde_json::Value, fallback_path: &str) -> ScanResult {
         confidence_score: f["confidence_score"].as_f64()
             .unwrap_or(if is_threat { 0.6 } else { 1.0 }) as f32,
         detection_signals,
-        file_category:    f["file_category"].as_str().unwrap_or("unknown").to_string(),
         context_flags,
+        file_category:    f["file_category"].as_str().unwrap_or("unknown").to_string(),
     }
 }
 
@@ -278,7 +324,7 @@ async fn scan_file(
     let request = serde_json::json!({
         "id": next_id(), "cmd": "scan-file", "path": path,
     });
-    let json = daemon_request(&state, request)?;
+    let json = daemon_request(&state, request, Duration::from_secs(60))?;
     if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
 
     let file  = parse_scan_result(&json, &path);
@@ -302,7 +348,7 @@ async fn scan_directory(
     let request = serde_json::json!({
         "id": next_id(), "cmd": "scan-dir", "path": path,
     });
-    let json = daemon_request(&state, request)?;
+    let json = daemon_request(&state, request, Duration::from_secs(120))?;
     if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
 
     let files_arr = json["files"].as_array()
@@ -330,7 +376,7 @@ async fn scan_processes(
     let request = serde_json::json!({
         "id": next_id(), "cmd": "scan-processes",
     });
-    let json = daemon_request(&state, request)?;
+    let json = daemon_request(&state, request, Duration::from_secs(60))?;
     if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
 
     let processes = json["processes"].as_array()
@@ -358,13 +404,13 @@ async fn scan_network(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<NetworkScanOutput, String> {
     let mut request = serde_json::Map::new();
-    request.insert("id".to_string(), serde_json::json!(next_id()));
+    request.insert("id".to_string(),  serde_json::json!(next_id()));
     request.insert("cmd".to_string(), serde_json::json!("scan-network"));
     if let Some(pid) = pid {
         request.insert("pid".to_string(), serde_json::json!(pid));
     }
 
-    let json = daemon_request(&state, serde_json::Value::Object(request))?;
+    let json = daemon_request(&state, serde_json::Value::Object(request), Duration::from_secs(30))?;
     if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
 
     let connections = json["connections"].as_array()
@@ -373,15 +419,51 @@ async fn scan_network(
 
     let s = &json["statistics"];
     let stats = NetworkStats {
-        total_connections:      s["total_connections"].as_u64().unwrap_or(0),
-        suspicious_connections: s["suspicious_connections"].as_u64().unwrap_or(0),
-        malicious_connections:  s["malicious_connections"].as_u64().unwrap_or(0),
-        local_listeners:        s["local_listeners"].as_u64().unwrap_or(0),
+        total_connections:       s["total_connections"].as_u64().unwrap_or(0),
+        suspicious_connections:  s["suspicious_connections"].as_u64().unwrap_or(0),
+        malicious_connections:   s["malicious_connections"].as_u64().unwrap_or(0),
+        local_listeners:         s["local_listeners"].as_u64().unwrap_or(0),
         established_connections: s["established_connections"].as_u64().unwrap_or(0),
-        scan_duration_ms:       s["scan_duration_ms"].as_u64().unwrap_or(0),
+        scan_duration_ms:        s["scan_duration_ms"].as_u64().unwrap_or(0),
     };
 
     Ok(NetworkScanOutput { success: true, statistics: stats, connections, error: None })
+}
+
+#[tauri::command]
+async fn scan_memory(
+    pid: Option<u32>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    // Reject concurrent memory scan requests immediately rather than
+    // letting them queue up and compound the RSS spike.
+    if state.memory_scan_lock.compare_exchange(
+        false, true, Ordering::SeqCst, Ordering::SeqCst
+    ).is_err() {
+        return Err("A memory scan is already in progress. Please wait.".to_string());
+    }
+
+    let mut request = serde_json::Map::new();
+    request.insert("id".to_string(),  serde_json::json!(next_id()));
+    request.insert("cmd".to_string(), serde_json::json!("scan-memory"));
+    if let Some(pid) = pid {
+        request.insert("pid".to_string(), serde_json::json!(pid));
+    }
+
+    let result = daemon_request(
+        &state,
+        serde_json::Value::Object(request),
+        Duration::from_secs(120),
+    );
+
+    // Always release the lock, even if the scan failed.
+    state.memory_scan_lock.store(false, Ordering::SeqCst);
+
+    let json = result?;
+    if let Some(err) = json["error"].as_str() {
+        return Err(err.to_string());
+    }
+    Ok(json)
 }
 
 #[tauri::command]
@@ -392,7 +474,7 @@ async fn kill_process(
     let request = serde_json::json!({
         "id": next_id(), "cmd": "kill-process", "pid": pid,
     });
-    let json = daemon_request(&state, request)?;
+    let json = daemon_request(&state, request, Duration::from_secs(10))?;
     if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
     Ok(json)
 }
@@ -462,6 +544,7 @@ fn main() {
             scan_directory,
             scan_processes,
             scan_network,
+            scan_memory,
             kill_process,
             open_file_dialog,
             open_dir_dialog,
