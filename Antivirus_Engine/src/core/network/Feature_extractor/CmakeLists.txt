@@ -1,0 +1,51 @@
+cmake_minimum_required(VERSION 3.16)
+project(NetworkFeatureExtractor CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ── Optimisation flags ────────────────────────────────────────────────────────
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# ── Find libpcap ──────────────────────────────────────────────────────────────
+find_library(PCAP_LIB pcap REQUIRED)
+find_path(PCAP_INCLUDE pcap.h)
+
+if(NOT PCAP_LIB)
+    message(FATAL_ERROR
+        "libpcap not found.\n"
+        "  Ubuntu/Debian: sudo apt install libpcap-dev\n"
+        "  RHEL/CentOS:   sudo yum install libpcap-devel\n"
+        "  macOS:         brew install libpcap\n"
+    )
+endif()
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+set(SOURCES
+    src/flow_extractor.cpp
+    src/flow_table.cpp
+    src/feature_writer.cpp
+    src/connection_tracker.cpp
+)
+
+add_executable(flow_extractor ${SOURCES})
+
+target_include_directories(flow_extractor PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PCAP_INCLUDE}
+)
+
+target_link_libraries(flow_extractor PRIVATE
+    ${PCAP_LIB}
+    pthread
+)
+
+# ── Install ───────────────────────────────────────────────────────────────────
+install(TARGETS flow_extractor DESTINATION bin)
+
+message(STATUS "Build type  : ${CMAKE_BUILD_TYPE}")
+message(STATUS "libpcap     : ${PCAP_LIB}")
+message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
