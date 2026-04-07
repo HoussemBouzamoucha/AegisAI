@@ -127,7 +127,7 @@ impl YaraEngine {
 
         let matches = results
             .matching_rules()
-            .map(|rule| {
+            .map(|rule| {   
                 let tags: Vec<String> = rule.tags().map(|t| t.identifier().to_string()).collect();
                 let meta_description = rule
                     .metadata()
