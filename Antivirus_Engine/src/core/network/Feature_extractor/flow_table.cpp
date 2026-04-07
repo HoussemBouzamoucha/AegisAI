@@ -4,7 +4,7 @@
  * FlowTable: manages active flow records, dispatches packets, handles expiry.
  */
 
-#include "../include/flow_table.h"
+#include "flow_table.h"
 #include <iostream>
 #include <cstring>
 

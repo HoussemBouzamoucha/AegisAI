@@ -54,7 +54,7 @@ static void signal_handler(int) {
 }
 
 // ─── Packet callback ──────────────────────────────────────────────────────────
-void packet_handler(u_char* user, const struct pcap_pkthdr* hdr, const u_char* pkt) {
+void packet_handler(u_char* /*user*/, const struct pcap_pkthdr* hdr, const u_char* pkt) {
     if (!g_running) return;
 
     PacketInfo p{};

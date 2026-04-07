@@ -17,10 +17,12 @@
  * Implementation uses a fixed-size sliding window of the last N exported flows.
  */
 
-#include "flow.h"
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <string>
+
+#include "flow.h"
 
 // Snapshot of exported flow for window-based counting
 struct FlowSnapshot {

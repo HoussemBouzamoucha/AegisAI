@@ -4,7 +4,7 @@
  * Sliding-window connection tracking counters as defined in UNSW-NB15.
  */
 
-#include "../include/connection_tracker.h"
+#include "connection_tracker.h"
 #include <algorithm>
 
 ConnectionTracker::ConnectionTracker(size_t window_size)
