@@ -17,7 +17,7 @@
  *   ct_src_dport_ltm, ct_dst_sport_ltm, ct_dst_src_ltm
  */
 
-#include "../include/feature_writer.h"
+#include "feature_writer.h"
 #include <sstream>
 #include <iomanip>
 #include <iostream>

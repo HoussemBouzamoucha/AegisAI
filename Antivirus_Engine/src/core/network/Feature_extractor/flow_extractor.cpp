@@ -38,10 +38,10 @@
 #include <cstring>
 #include <getopt.h>
 
-#include "../include/flow.h"
-#include "../include/flow_table.h"
-#include "../include/feature_writer.h"
-#include "../include/connection_tracker.h"
+#include "flow.h"
+#include "flow_table.h"
+#include "feature_writer.h"
+#include "connection_tracker.h"
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 static std::atomic<bool>  g_running{true};
@@ -165,7 +165,7 @@ static void usage(const char* prog) {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
-    std::string iface, pcap_file, output = "features.csv", bpf_filter = "ip or ip6";
+    std::string iface, pcap_file, output = "latest.csv", bpf_filter = "ip or ip6";
     int flow_timeout = 120, duration = 0;
     bool verbose = false;
 

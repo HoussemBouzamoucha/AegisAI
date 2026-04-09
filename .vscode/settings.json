@@ -2,5 +2,6 @@
     "python.analysis.extraPaths": [
         "./Antivirus_Engine/src",
         "./Antivirus_Engine/src"
-    ]
+    ],
+    "C_Cpp.errorSquiggles": "disabled"
 }

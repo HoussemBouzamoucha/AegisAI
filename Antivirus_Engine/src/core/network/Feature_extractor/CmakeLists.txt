@@ -25,16 +25,16 @@ endif()
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 set(SOURCES
-    src/flow_extractor.cpp
-    src/flow_table.cpp
-    src/feature_writer.cpp
-    src/connection_tracker.cpp
+    flow_extractor.cpp
+    flow_table.cpp
+    feature_writer.cpp
+    connection_tracker.cpp
 )
 
 add_executable(flow_extractor ${SOURCES})
 
 target_include_directories(flow_extractor PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}
     ${PCAP_INCLUDE}
 )
 

@@ -7,16 +7,16 @@
 
 CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2
-INCLUDES := -Iinclude
+INCLUDES := -I.
 LIBS     := -lpcap -lpthread
 
 # Debug variant
 DBGFLAGS := -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined
 
-SRCS := src/flow_extractor.cpp \
-        src/flow_table.cpp     \
-        src/feature_writer.cpp \
-        src/connection_tracker.cpp
+SRCS := flow_extractor.cpp \
+        flow_table.cpp     \
+        feature_writer.cpp \
+        connection_tracker.cpp
 
 TARGET := flow_extractor
 
