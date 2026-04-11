@@ -1,24 +1,49 @@
 [package]
-name = "antivirus_engine"
-version = "1.0.0"
-edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+name        = "antivirus_engine"
+version     = "1.0.0"
+edition     = "2021"
+authors     = ["Your Name <your.email@example.com>"]
 description = "Multi-layer malware detection engine with dynamic behavioral analysis"
-license = "MIT"
+license     = "MIT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependencies
+# ─────────────────────────────────────────────────────────────────────────────
 
 [dependencies]
+# Core utilities
 anyhow    = "1.0"
 hex       = "0.4"
 walkdir   = "2.5"
-sha2      = "0.10.9"
-md5       = "0.8.0"
-sysinfo   = "0.38.4"
 
+# Hashing
+sha2 = "0.10.9"
+md5  = "0.8.0"
+
+# System info / process enumeration
+sysinfo = "0.38.4"
+
+# YARA scanning
+yara-x = "1.13.0"
+
+# Packet capture + parsing (feature extractor)
+pcap       = "2.4"
+etherparse = "0.19"
+
+# Concurrent flow table + fast locking
+dashmap     = "6"
+parking_lot = "0.12"
+
+# Serialisation (optional, enabled via "json" feature)
 serde      = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
-yara-x     = "1.13.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Platform-specific dependencies
+# ─────────────────────────────────────────────────────────────────────────────
 
 [target.'cfg(windows)'.dependencies]
+# High-level Windows API bindings (process / memory / security inspection)
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
@@ -32,22 +57,46 @@ windows = { version = "0.58", features = [
     "Wdk_System_SystemServices",
 ] }
 
+# Low-level Windows networking API (TCP table, IP/TCP statistics)
+# Used by feature_extractor for swin/dwin/sttl/tcprtt
+windows-sys = { version = "0.61", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Foundation",
+] }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dev dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+
 [dev-dependencies]
 tempfile = "3.10"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Features
+# ─────────────────────────────────────────────────────────────────────────────
 
 [features]
 default = ["json"]
 json    = ["dep:serde", "dep:serde_json"]
 full    = ["json"]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Build profiles
+# ─────────────────────────────────────────────────────────────────────────────
+
 [profile.dev]
 opt-level = 0
 
 [profile.release]
-opt-level = 3
-lto = true
+opt-level     = 3
+lto           = true
 codegen-units = 1
-strip = true
+strip         = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binaries
+# ─────────────────────────────────────────────────────────────────────────────
 
 [[bin]]
 name = "antivirus"
