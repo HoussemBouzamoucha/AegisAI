@@ -499,6 +499,54 @@ async fn check_engine() -> bool {
 }
 
 #[tauri::command]
+async fn run_ml_ids(csv_path: Option<String>) -> Result<serde_json::Value, String> {
+    let script = PathBuf::from(
+        r"C:\Users\houss\Desktop\AegisAI\Antivirus_Engine\src\core\network\Feature_extractor\ML_IDS\preprocessing_pipeline.py"
+    );
+
+    if !script.exists() {
+        return Err(format!("ML script not found at: {}", script.display()));
+    }
+
+    let csv = csv_path.unwrap_or_else(|| {
+        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Public".to_string());
+        format!("{}\\OnePace.csv", home)
+    });
+
+    // Try common Python executable names
+    for py in &["python", "python3", "py"] {
+        match std::process::Command::new(py)
+            .args([
+                script.to_str().unwrap_or(""),
+                "--infer",
+                "--csv", &csv,
+            ])
+            .output()
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let trimmed = stdout.trim();
+                    return serde_json::from_str(trimmed)
+                        .map_err(|e| format!("Invalid JSON from ML script: {} — raw: {}", e, &trimmed[..trimmed.len().min(300)]));
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    // If the script printed a JSON error to stdout, return that
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                        return Ok(v);
+                    }
+                    return Err(format!("ML script error: {}", stderr.trim()));
+                }
+            }
+            Err(_) => continue, // try next interpreter name
+        }
+    }
+
+    Err("Python interpreter not found. Ensure Python 3 is installed and available in PATH.".to_string())
+}
+
+#[tauri::command]
 async fn get_engine_status(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
@@ -550,6 +598,7 @@ fn main() {
             open_dir_dialog,
             check_engine,
             get_engine_status,
+            run_ml_ids,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

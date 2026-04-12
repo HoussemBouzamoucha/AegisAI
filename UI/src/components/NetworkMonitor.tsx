@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useStore } from '../store';
-import { RefreshCw, Search, ChevronDown, ChevronRight, Link } from 'lucide-react';
+import { RefreshCw, Search, ChevronDown, ChevronRight, Link, BrainCircuit, ShieldAlert, ShieldCheck, X } from 'lucide-react';
+import type { MlFlowResult } from '../types';
 
 function StatCard({ label, value, color, sub }: { label: string; value: string | number; color: string; sub?: string }) {
   return (
@@ -22,6 +23,143 @@ function StatCard({ label, value, color, sub }: { label: string; value: string |
   );
 }
 
+function MlResultsPanel({ flows, summary, onClose }: {
+  flows: MlFlowResult[];
+  summary: { total_flows: number; clean_flows: number; malicious_flows: number; malicious_rate: number };
+  onClose: () => void;
+}) {
+  const maliciousFlows = flows.filter(f => f.prediction === 'Malicious');
+  const [showAll, setShowAll] = useState(false);
+  const displayed = showAll ? flows : maliciousFlows.slice(0, 50);
+
+  return (
+    <div style={{
+      background: 'var(--surface)',
+      border: '1px solid rgba(139, 92, 246, 0.3)',
+      borderRadius: 8,
+      overflow: 'hidden',
+    }}>
+      {/* Header */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '12px 16px',
+        background: 'rgba(139, 92, 246, 0.06)',
+        borderBottom: '1px solid rgba(139, 92, 246, 0.2)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <BrainCircuit size={14} color="#a78bfa" />
+          <span style={{ fontFamily: 'var(--font-hud)', fontSize: 11, color: '#a78bfa', letterSpacing: '0.1em' }}>
+            ML IDS RESULTS
+          </span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <div style={{ display: 'flex', gap: 20 }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+              Flows: <span style={{ color: 'var(--text)' }}>{summary.total_flows}</span>
+            </span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+              Clean: <span style={{ color: 'var(--green)' }}>{summary.clean_flows}</span>
+            </span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+              Malicious: <span style={{ color: 'var(--red)' }}>{summary.malicious_flows}</span>
+            </span>
+            {summary.total_flows > 0 && (
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                Rate: <span style={{ color: summary.malicious_rate > 0.1 ? 'var(--red)' : 'var(--amber)' }}>
+                  {(summary.malicious_rate * 100).toFixed(1)}%
+                </span>
+              </span>
+            )}
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-dim)', display: 'flex' }}>
+            <X size={14} />
+          </button>
+        </div>
+      </div>
+
+      {/* Toggle */}
+      <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 8 }}>
+        <button
+          onClick={() => setShowAll(false)}
+          style={{
+            padding: '4px 10px', borderRadius: 4, fontSize: 10, fontFamily: 'var(--font-hud)',
+            border: `1px solid ${!showAll ? 'var(--border-md)' : 'transparent'}`,
+            background: !showAll ? 'rgba(255,51,85,0.08)' : 'transparent',
+            color: !showAll ? 'var(--red)' : 'var(--text-dim)', cursor: 'pointer',
+          }}
+        >
+          MALICIOUS ({maliciousFlows.length})
+        </button>
+        <button
+          onClick={() => setShowAll(true)}
+          style={{
+            padding: '4px 10px', borderRadius: 4, fontSize: 10, fontFamily: 'var(--font-hud)',
+            border: `1px solid ${showAll ? 'var(--border-md)' : 'transparent'}`,
+            background: showAll ? 'var(--green-glow)' : 'transparent',
+            color: showAll ? 'var(--green)' : 'var(--text-dim)', cursor: 'pointer',
+          }}
+        >
+          ALL FLOWS ({flows.length})
+        </button>
+      </div>
+
+      {/* Table */}
+      {displayed.length === 0 ? (
+        <div style={{ padding: '20px', display: 'flex', alignItems: 'center', gap: 10, color: 'var(--green)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+          <ShieldCheck size={16} />
+          No malicious flows detected in captured data.
+        </div>
+      ) : (
+        <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+          {/* Column headers */}
+          <div style={{
+            display: 'grid', gridTemplateColumns: '1.2fr 1.2fr 80px 80px 70px 100px 90px',
+            gap: 8, padding: '6px 16px',
+            fontFamily: 'var(--font-hud)', fontSize: 9, color: 'var(--text-dim)', letterSpacing: '0.1em',
+            background: 'var(--base)', borderBottom: '1px solid var(--border)',
+          }}>
+            {['SRC IP', 'DST IP', 'SPORT', 'DSPORT', 'PROTO', 'VERDICT', 'CONFIDENCE'].map(h => (
+              <span key={h}>{h}</span>
+            ))}
+          </div>
+          {displayed.map((flow, i) => {
+            const isMal = flow.prediction === 'Malicious';
+            const pct   = (flow.probability * 100).toFixed(1);
+            return (
+              <div key={i} style={{
+                display: 'grid', gridTemplateColumns: '1.2fr 1.2fr 80px 80px 70px 100px 90px',
+                gap: 8, padding: '8px 16px',
+                borderBottom: '1px solid var(--border)',
+                background: isMal ? 'rgba(255,51,85,0.04)' : 'transparent',
+                alignItems: 'center',
+              }}>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: isMal ? 'var(--red)' : 'var(--text)' }}>
+                  {flow.srcip}
+                </span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: isMal ? 'var(--red)' : 'var(--text)' }}>
+                  {flow.dstip}
+                </span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{flow.sport}</span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{flow.dsport}</span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                  {flow.proto.toUpperCase()}
+                </span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'var(--font-mono)', fontSize: 10, color: isMal ? 'var(--red)' : 'var(--green)' }}>
+                  {isMal ? <ShieldAlert size={11} /> : <ShieldCheck size={11} />}
+                  {flow.prediction.toUpperCase()}
+                </span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: isMal ? 'var(--red)' : 'var(--text-dim)' }}>
+                  {pct}%
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function NetworkMonitor() {
   const {
     networkConnections,
@@ -29,6 +167,10 @@ export default function NetworkMonitor() {
     networkScanning,
     networkError,
     scanNetwork,
+    mlIdsRunning,
+    mlIdsResult,
+    mlIdsError,
+    runMlIds,
   } = useStore();
 
   const [search, setSearch] = useState('');
@@ -76,26 +218,48 @@ export default function NetworkMonitor() {
             Live connection telemetry · process mapping · suspicious hosts · listener detection
           </div>
         </div>
-        <button
-          onClick={() => scanNetwork()}
-          disabled={networkScanning}
-          style={{
-            display: 'flex', alignItems: 'center', gap: 8,
-            padding: '10px 20px',
-            background: 'var(--green-glow)',
-            border: '1px solid var(--border-md)',
-            borderRadius: 6,
-            color: 'var(--green)',
-            fontFamily: 'var(--font-hud)',
-            fontSize: 11,
-            letterSpacing: '0.1em',
-            cursor: networkScanning ? 'not-allowed' : 'pointer',
-            opacity: networkScanning ? 0.6 : 1,
-          }}
-        >
-          <RefreshCw size={14} style={{ animation: networkScanning ? 'spin 1s linear infinite' : 'none' }} />
-          {networkScanning ? 'REFRESHING...' : 'REFRESH'}
-        </button>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button
+            onClick={() => runMlIds()}
+            disabled={mlIdsRunning}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '10px 20px',
+              background: 'rgba(139, 92, 246, 0.08)',
+              border: '1px solid rgba(139, 92, 246, 0.35)',
+              borderRadius: 6,
+              color: '#a78bfa',
+              fontFamily: 'var(--font-hud)',
+              fontSize: 11,
+              letterSpacing: '0.1em',
+              cursor: mlIdsRunning ? 'not-allowed' : 'pointer',
+              opacity: mlIdsRunning ? 0.6 : 1,
+            }}
+          >
+            <BrainCircuit size={14} style={{ animation: mlIdsRunning ? 'spin 1s linear infinite' : 'none' }} />
+            {mlIdsRunning ? 'ANALYZING...' : 'APPLY ML MODEL'}
+          </button>
+          <button
+            onClick={() => scanNetwork()}
+            disabled={networkScanning}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '10px 20px',
+              background: 'var(--green-glow)',
+              border: '1px solid var(--border-md)',
+              borderRadius: 6,
+              color: 'var(--green)',
+              fontFamily: 'var(--font-hud)',
+              fontSize: 11,
+              letterSpacing: '0.1em',
+              cursor: networkScanning ? 'not-allowed' : 'pointer',
+              opacity: networkScanning ? 0.6 : 1,
+            }}
+          >
+            <RefreshCw size={14} style={{ animation: networkScanning ? 'spin 1s linear infinite' : 'none' }} />
+            {networkScanning ? 'REFRESHING...' : 'REFRESH'}
+          </button>
+        </div>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12 }}>
@@ -105,6 +269,25 @@ export default function NetworkMonitor() {
         <StatCard label="LISTENERS" value={networkStats?.local_listeners ?? '—'} color="var(--green)" sub="Open services" />
         <StatCard label="ESTABLISHED" value={networkStats?.established_connections ?? '—'} color="var(--text-dim)" sub="Active flows" />
       </div>
+
+      {/* ML IDS error */}
+      {mlIdsError && (
+        <div style={{ padding: '12px 16px', background: 'rgba(255,51,85,0.08)', border: '1px solid rgba(255,51,85,0.3)', borderRadius: 8, color: 'var(--red)', fontFamily: 'var(--font-mono)', fontSize: 11, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>ML IDS: {mlIdsError}</span>
+          <button onClick={() => useStore.setState({ mlIdsError: null })} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--red)' }}>
+            <X size={12} />
+          </button>
+        </div>
+      )}
+
+      {/* ML IDS results panel */}
+      {mlIdsResult && mlIdsResult.success && (
+        <MlResultsPanel
+          flows={mlIdsResult.flows}
+          summary={mlIdsResult.summary}
+          onClose={() => useStore.setState({ mlIdsResult: null })}
+        />
+      )}
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8 }}>
         <div style={{ display: 'flex', gap: 4 }}>

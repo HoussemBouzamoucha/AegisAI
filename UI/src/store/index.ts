@@ -6,6 +6,7 @@ import type {
   ProcessInfo, ProcessScanResult, ScanHistoryEntry,
   NetworkConnection, NetworkStats, NetworkScanResult,
   MemoryRegion, MemoryStats, MemoryScanResult as MemoryScanResultType,
+  MlIdsResult,
 } from '../types';
 
 interface AppState {
@@ -35,6 +36,11 @@ interface AppState {
   networkStats: NetworkStats | null;
   networkError: string | null;
   scanNetwork: (pid?: number) => Promise<void>;
+
+  mlIdsRunning: boolean;
+  mlIdsResult: MlIdsResult | null;
+  mlIdsError: string | null;
+  runMlIds: (csvPath?: string) => Promise<void>;
 
   memoryScanning: boolean;
   memoryRegions: MemoryRegion[];
@@ -214,6 +220,25 @@ export const useStore = create<AppState>((set, get) => ({
   networkConnections: [],
   networkStats: null,
   networkError: null,
+
+  mlIdsRunning: false,
+  mlIdsResult: null,
+  mlIdsError: null,
+  runMlIds: async (csvPath) => {
+    set({ mlIdsRunning: true, mlIdsError: null, mlIdsResult: null });
+    try {
+      const args: Record<string, unknown> = {};
+      if (csvPath !== undefined) { args.csvPath = csvPath; }
+      const result = await invoke<MlIdsResult>('run_ml_ids', args);
+      if (!result.success) throw new Error(result.error ?? 'ML IDS failed');
+      set({ mlIdsResult: result });
+    } catch (e: any) {
+      set({ mlIdsError: String(e) });
+    } finally {
+      set({ mlIdsRunning: false });
+    }
+  },
+
   scanNetwork: async (pid) => {
     set({ networkScanning: true, networkError: null });
     try {

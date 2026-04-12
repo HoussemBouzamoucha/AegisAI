@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use std::ffi::c_void;
 use std::mem::{size_of, MaybeUninit};
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 
@@ -180,6 +181,7 @@ impl MemoryScanner {
         let mut total_committed: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut address = 0usize;
+        let mut iter_count: usize = 0;
 
         loop {
             let mut mem_info = MaybeUninit::<MEMORY_BASIC_INFORMATION>::zeroed();
@@ -268,6 +270,12 @@ impl MemoryScanner {
                 break;
             }
             address = next_address;
+
+            // Yield every 1 000 regions so other threads get CPU time.
+            iter_count += 1;
+            if iter_count % 1_000 == 0 {
+                thread::yield_now();
+            }
         }
 
         Ok((threat_regions, total_committed, total_bytes))

@@ -43,7 +43,28 @@ use std::{
         Arc,
     },
     thread,
+    time::Duration,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tuneable constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum packets stored per flow for statistical features.
+/// All counters (bytes, pkt count) are still tracked for every packet.
+const MAX_PKTS: usize = 200;
+
+/// Maximum number of capture threads (one per physical interface).
+const MAX_CAPTURE_IFACES: usize = 4;
+
+/// Seconds of inactivity after which a terminated/idle flow is evicted.
+const FLOW_IDLE_SECS: f64 = 30.0;
+
+/// Pcap read timeout in milliseconds. Larger value = kernel does the waiting.
+const PCAP_TIMEOUT_MS: i32 = 500;
+
+/// Sleep duration when pcap returns TimeoutExpired to prevent busy-wait spin.
+const PCAP_IDLE_SLEEP_MS: u64 = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CSV header — 47 columns, UNSW-NB15 ordering
@@ -113,6 +134,7 @@ struct PktSummary {
 
 #[derive(Debug)]
 struct FlowAcc {
+    /// Capped sample buffer (MAX_PKTS) used for timing statistics only.
     pkts:    Vec<PktSummary>,
     state:   String,
     service: &'static str,
@@ -130,12 +152,19 @@ struct FlowAcc {
     http_response_body_max:  u32,
     ftp_cmd_count:           u32,
     ftp_logged_in:           bool,
+    // Running counters — accurate for ALL packets (not capped by MAX_PKTS)
+    src_pkt_count:  u32,
+    dst_pkt_count:  u32,
+    src_byte_count: u64,
+    dst_byte_count: u64,
+    last_src_win:   u16,
+    last_dst_win:   u16,
 }
 
 impl FlowAcc {
     fn new(service: &'static str) -> Self {
         Self {
-            pkts: Vec::with_capacity(32),
+            pkts: Vec::with_capacity(32.min(MAX_PKTS)),
             state: "CON".to_string(),
             service,
             syn_ts: None, syn_ack_ts: None, ack_ts: None,
@@ -143,6 +172,9 @@ impl FlowAcc {
             last_src_seq: 0, last_dst_seq: 0,
             http_req_count: 0, http_response_body_max: 0,
             ftp_cmd_count: 0, ftp_logged_in: false,
+            src_pkt_count: 0, dst_pkt_count: 0,
+            src_byte_count: 0, dst_byte_count: 0,
+            last_src_win: 0, last_dst_win: 0,
         }
     }
 
@@ -183,7 +215,21 @@ impl FlowAcc {
         if p.is_ftp_cmd    { self.ftp_cmd_count += 1; }
         if p.ftp_logged_in { self.ftp_logged_in = true; }
 
-        self.pkts.push(p);
+        // Update running counters for ALL packets (not subject to cap).
+        if p.from_src {
+            self.src_pkt_count  += 1;
+            self.src_byte_count += p.len as u64;
+            if p.tcp_win != 0 { self.last_src_win = p.tcp_win; }
+        } else {
+            self.dst_pkt_count  += 1;
+            self.dst_byte_count += p.len as u64;
+            if p.tcp_win != 0 { self.last_dst_win = p.tcp_win; }
+        }
+
+        // Cap the timing sample buffer to bound memory usage per flow.
+        if self.pkts.len() < MAX_PKTS {
+            self.pkts.push(p);
+        }
     }
 
     // ── helper iterators ──────────────────────────────────────────────────────
@@ -201,11 +247,11 @@ impl FlowAcc {
     fn ltime(&self) -> f64 { self.pkts.last().map(|p| p.ts).unwrap_or(0.0) }
     fn dur(&self)   -> f64 { (self.ltime() - self.stime()).max(0.0) }
 
-    fn spkts(&self) -> u32 { self.src_pkts().count() as u32 }
-    fn dpkts(&self) -> u32 { self.dst_pkts().count() as u32 }
+    fn spkts(&self) -> u32 { self.src_pkt_count }
+    fn dpkts(&self) -> u32 { self.dst_pkt_count }
 
-    fn sbytes(&self) -> u64 { self.src_pkts().map(|p| p.len as u64).sum() }
-    fn dbytes(&self) -> u64 { self.dst_pkts().map(|p| p.len as u64).sum() }
+    fn sbytes(&self) -> u64 { self.src_byte_count }
+    fn dbytes(&self) -> u64 { self.dst_byte_count }
 
     fn sttl(&self) -> u8 { self.src_pkts().next().map(|p| p.ttl).unwrap_or(128) }
     fn dttl(&self) -> u8 { self.dst_pkts().next().map(|p| p.ttl).unwrap_or(64) }
@@ -222,12 +268,8 @@ impl FlowAcc {
         if d <= 0.0 { 0.0 } else { (self.dbytes() as f64 * 8.0) / d }
     }
 
-    fn swin(&self) -> u32 {
-        self.src_pkts().last().map(|p| p.tcp_win as u32).unwrap_or(0)
-    }
-    fn dwin(&self) -> u32 {
-        self.dst_pkts().last().map(|p| p.tcp_win as u32).unwrap_or(0)
-    }
+    fn swin(&self) -> u32 { self.last_src_win as u32 }
+    fn dwin(&self) -> u32 { self.last_dst_win as u32 }
 
     fn stcpb(&self) -> u32 {
         self.src_pkts().find(|p| p.tcp_syn)
@@ -263,21 +305,15 @@ impl FlowAcc {
         (mean, mad)
     }
 
-    fn sintpkt(&self) -> f64 {
+    /// Returns (mean_iat, jitter) for src packets in one allocation.
+    fn src_iat_stats(&self) -> (f64, f64) {
         let ts: Vec<f64> = self.src_pkts().map(|p| p.ts).collect();
-        Self::iat_stats(&ts).0
+        Self::iat_stats(&ts)
     }
-    fn dintpkt(&self) -> f64 {
+    /// Returns (mean_iat, jitter) for dst packets in one allocation.
+    fn dst_iat_stats(&self) -> (f64, f64) {
         let ts: Vec<f64> = self.dst_pkts().map(|p| p.ts).collect();
-        Self::iat_stats(&ts).0
-    }
-    fn sjit(&self) -> f64 {
-        let ts: Vec<f64> = self.src_pkts().map(|p| p.ts).collect();
-        Self::iat_stats(&ts).1
-    }
-    fn djit(&self) -> f64 {
-        let ts: Vec<f64> = self.dst_pkts().map(|p| p.ts).collect();
-        Self::iat_stats(&ts).1
+        Self::iat_stats(&ts)
     }
 
 
@@ -636,58 +672,82 @@ impl FeatureRow {
 // Background capture thread
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Returns true for loopback or virtual interfaces we should skip.
+fn is_virtual_interface(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("loopback")
+        || n.contains("vethernet")
+        || n.contains("hyper-v")
+        || n.contains("wsl")
+        || n.contains("virtual")
+        || n.contains("miniport")
+        || n == "lo"
+        || n.starts_with("virbr")
+        || n.starts_with("docker")
+}
+
+/// Spawn one capture thread per physical interface (capped at MAX_CAPTURE_IFACES).
+/// Returns the thread handles so the caller can join them on shutdown.
 fn spawn_capture_threads(
     flow_table: Arc<DashMap<FlowKey, FlowAcc>>,
     stop: Arc<AtomicBool>,
-) {
-    thread::spawn(move || {
-        let devices = Device::list().unwrap_or_default();
-        if devices.is_empty() {
-            eprintln!(
-                "[feature_extractor] No pcap devices found. \
-                 On Windows, install Npcap with 'WinPcap API compatible mode'."
-            );
-            return;
-        }
+) -> Vec<thread::JoinHandle<()>> {
+    let all_devices = Device::list().unwrap_or_default();
+    if all_devices.is_empty() {
+        eprintln!(
+            "[feature_extractor] No pcap devices found. \
+             On Windows, install Npcap with 'WinPcap API compatible mode'."
+        );
+        return Vec::new();
+    }
 
-        let mut handles = Vec::new();
-        for device in devices {
-            let table   = Arc::clone(&flow_table);
-            let stopper = Arc::clone(&stop);
-            let name    = device.name.clone();
+    // Filter out loopback / virtual interfaces, then cap the count.
+    let devices: Vec<Device> = all_devices
+        .into_iter()
+        .filter(|d| !is_virtual_interface(&d.name))
+        .take(MAX_CAPTURE_IFACES)
+        .collect();
 
-            let h = thread::spawn(move || {
-                let cap = Capture::from_device(device)
-                    .and_then(|c| c.promisc(true).snaplen(65535).timeout(100).open());
+    let mut handles = Vec::new();
+    for device in devices {
+        let table   = Arc::clone(&flow_table);
+        let stopper = Arc::clone(&stop);
+        let name    = device.name.clone();
 
-                let mut cap = match cap {
-                    Ok(c)  => c,
-                    Err(e) => { eprintln!("[feature_extractor] {name}: {e}"); return; }
-                };
+        let h = thread::spawn(move || {
+            let cap = Capture::from_device(device)
+                .and_then(|c| c.promisc(true).snaplen(65535).timeout(PCAP_TIMEOUT_MS).open());
 
-                while !stopper.load(Ordering::Relaxed) {
-                    match cap.next_packet() {
-                        Ok(pkt) => {
-                            let ts = pkt.header.ts.tv_sec  as f64
-                                   + pkt.header.ts.tv_usec as f64 * 1e-6;
-                            let wlen = pkt.header.len;
+            let mut cap = match cap {
+                Ok(c)  => c,
+                Err(e) => { eprintln!("[feature_extractor] {name}: {e}"); return; }
+            };
 
-                            if let Some((key, summary)) = parse_packet(pkt.data, ts, wlen) {
-                                let svc = best_service(key.dport, key.sport);
-                                table.entry(key)
-                                    .or_insert_with(|| FlowAcc::new(svc))
-                                    .push(summary);
-                            }
+            while !stopper.load(Ordering::Relaxed) {
+                match cap.next_packet() {
+                    Ok(pkt) => {
+                        let ts = pkt.header.ts.tv_sec  as f64
+                               + pkt.header.ts.tv_usec as f64 * 1e-6;
+                        let wlen = pkt.header.len;
+
+                        if let Some((key, summary)) = parse_packet(pkt.data, ts, wlen) {
+                            let svc = best_service(key.dport, key.sport);
+                            table.entry(key)
+                                .or_insert_with(|| FlowAcc::new(svc))
+                                .push(summary);
                         }
-                        Err(pcap::Error::TimeoutExpired) => {}
-                        Err(e) => { eprintln!("[feature_extractor] {name}: {e}"); break; }
                     }
+                    // Yield CPU instead of spinning when the interface is quiet.
+                    Err(pcap::Error::TimeoutExpired) => {
+                        thread::sleep(Duration::from_millis(PCAP_IDLE_SLEEP_MS));
+                    }
+                    Err(e) => { eprintln!("[feature_extractor] {name}: {e}"); break; }
                 }
-            });
-            handles.push(h);
-        }
-        for h in handles { let _ = h.join(); }
-    });
+            }
+        });
+        handles.push(h);
+    }
+    handles
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -699,6 +759,8 @@ pub struct FeatureExtractor {
     flow_table:     Arc<DashMap<FlowKey, FlowAcc>>,
     context_tables: Mutex<ContextTables>,
     stop_flag:      Arc<AtomicBool>,
+    /// Capture thread handles — joined on Drop to ensure clean shutdown.
+    thread_handles: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 impl FeatureExtractor {
@@ -709,21 +771,26 @@ impl FeatureExtractor {
         let path = output_path.unwrap_or_else(default_csv_path);
 
         if !path.exists() {
-            let mut f = File::create(&path)
+            // Use BufWriter for the initial header write (Issue 9).
+            let f = File::create(&path)
                 .with_context(|| format!("Cannot create {}", path.display()))?;
-            writeln!(f, "{}", CSV_HEADER)?;
+            let mut w = BufWriter::new(f);
+            writeln!(w, "{}", CSV_HEADER)?;
+            w.flush()?;
         }
 
         let flow_table = Arc::new(DashMap::<FlowKey, FlowAcc>::new());
         let stop_flag  = Arc::new(AtomicBool::new(false));
 
-        spawn_capture_threads(Arc::clone(&flow_table), Arc::clone(&stop_flag));
+        // Spawn capture threads and retain handles for clean shutdown (Issue 10).
+        let handles = spawn_capture_threads(Arc::clone(&flow_table), Arc::clone(&stop_flag));
 
         Ok(Arc::new(Self {
             output_path: path,
             flow_table,
             context_tables: Mutex::new(ContextTables::new(100)),
             stop_flag,
+            thread_handles: Mutex::new(handles),
         }))
     }
 
@@ -734,15 +801,12 @@ impl FeatureExtractor {
     /// packet was more than `FLOW_IDLE_SECS` seconds ago are evicted from the
     /// flow table after their row is written — preventing unbounded growth.
     pub fn extract_and_append(&self, connections: &[NetworkConnection]) -> Result<usize> {
-        /// Seconds of inactivity after which a terminated flow is evicted.
-        const FLOW_IDLE_SECS: f64 = 120.0;
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
 
-        // Build state lookup from the live connection table
+        // Build state lookup from the live connection table.
         let conn_state: HashMap<(String, u16, String, u16, String), String> = connections
             .iter()
             .map(|c| {
@@ -753,109 +817,128 @@ impl FeatureExtractor {
             })
             .collect();
 
-        let mut rows       = Vec::new();
-        let mut evict_keys = Vec::new();
-        let mut ctx        = self.context_tables.lock();
-
+        // Snapshot the keys first (can't hold a DashMap iterator while removing).
         let keys: Vec<FlowKey> = self.flow_table.iter().map(|e| e.key().clone()).collect();
 
-        for key in keys {
-            let Some(acc_ref) = self.flow_table.get(&key) else { continue };
-            let acc = acc_ref.value();
-            if acc.pkts.is_empty() { continue; }
+        // Build CSV lines under the context lock, then drop the lock before I/O.
+        let mut csv_lines  = Vec::with_capacity(keys.len());
+        let mut evict_keys = Vec::new();
+        {
+            let mut ctx = self.context_tables.lock();
 
-            let proto_str = proto_name(key.proto).to_string();
-            let svc       = acc.service; // &'static str
+            for key in &keys {
+                let Some(acc_ref) = self.flow_table.get(key) else { continue };
+                let acc = acc_ref.value();
+                if acc.pkts.is_empty() && acc.src_pkt_count == 0 { continue; }
 
-            let live_state = conn_state.get(&(
-                key.src.clone(), key.sport,
-                key.dst.clone(), key.dport,
-                proto_str.clone(),
-            ));
+                let proto_str = proto_name(key.proto).to_string();
+                let svc       = acc.service;
 
-            let state = live_state
-                .cloned()
-                .unwrap_or_else(|| acc.state.clone());
+                let live_state = conn_state.get(&(
+                    key.src.clone(), key.sport,
+                    key.dst.clone(), key.dport,
+                    proto_str.clone(),
+                ));
 
-            // Mark for eviction: flow not in live table AND idle > threshold
-            let is_terminated = live_state.is_none()
-                && (acc.state.contains("FIN")
-                    || acc.state.contains("RST")
-                    || acc.state.contains("CLO"));
-            let is_idle = (now - acc.ltime()) > FLOW_IDLE_SECS;
-            if is_terminated || (live_state.is_none() && is_idle) {
-                evict_keys.push(key.clone());
+                let state = live_state
+                    .cloned()
+                    .unwrap_or_else(|| acc.state.clone());
+
+                // Eviction: terminated or idle beyond threshold.
+                let is_terminated = live_state.is_none()
+                    && (acc.state.contains("FIN")
+                        || acc.state.contains("RST")
+                        || acc.state.contains("CLO"));
+                let is_idle = (now - acc.ltime()) > FLOW_IDLE_SECS;
+                if is_terminated || (live_state.is_none() && is_idle) {
+                    evict_keys.push(key.clone());
+                }
+
+                let is_sm = u8::from(key.src == key.dst || key.sport == key.dport);
+                ctx.push(&key.src, &key.dst, key.sport, key.dport, svc);
+
+                // Compute IAT stats once per direction (halves allocations vs 4 separate calls).
+                let (sintpkt, sjit)   = acc.src_iat_stats();
+                let (dintpkt, djit)   = acc.dst_iat_stats();
+
+                let row = FeatureRow {
+                    srcip:  key.src.clone(),
+                    sport:  key.sport,
+                    dstip:  key.dst.clone(),
+                    dsport: key.dport,
+                    proto:  proto_str,
+                    state:  state.clone(),
+                    dur:    acc.dur(),
+                    sbytes: acc.sbytes(), dbytes: acc.dbytes(),
+                    sttl:   acc.sttl(),   dttl:   acc.dttl(),
+                    sloss:  acc.sloss(),  dloss:  acc.dloss(),
+                    service: svc.to_string(),
+                    Sload:  acc.sload(),  Dload:  acc.dload(),
+                    Spkts:  acc.spkts(),  Dpkts:  acc.dpkts(),
+                    swin:   acc.swin(),   dwin:   acc.dwin(),
+                    stcpb:  acc.stcpb(),  dtcpb:  acc.dtcpb(),
+                    smeansz: acc.smeansz(), dmeansz: acc.dmeansz(),
+                    trans_depth:    acc.trans_depth(),
+                    res_bdy_len:    acc.res_bdy_len(),
+                    Sjit:   sjit,  Djit:  djit,
+                    Stime:  acc.stime(),  Ltime: acc.ltime(),
+                    Sintpkt: sintpkt,  Dintpkt: dintpkt,
+                    tcprtt: acc.tcprtt(), synack: acc.synack(), ackdat: acc.ackdat(),
+                    is_sm_ips_ports: is_sm,
+                    ct_state_ttl:    ct_state_ttl(&state, acc.sttl(), acc.dttl()),
+                    ct_flw_http_mthd: acc.ct_flw_http_mthd(),
+                    is_ftp_login:    acc.is_ftp_login(),
+                    ct_ftp_cmd:      acc.ct_ftp_cmd(),
+                    ct_srv_src:      ctx.ct_srv_src(&key.src, svc),
+                    ct_srv_dst:      ctx.ct_srv_dst(&key.dst, svc),
+                    ct_dst_ltm:      ctx.ct_dst_ltm(&key.dst),
+                    ct_src_ltm:      ctx.ct_src_ltm(&key.src),
+                    ct_src_dport_ltm:  ctx.ct_src_dport_ltm(&key.src, key.dport),
+                    ct_dst_sport_ltm:  ctx.ct_dst_sport_ltm(&key.dst, key.sport),
+                    ct_dst_src_ltm:    ctx.ct_dst_src_ltm(&key.dst, &key.src),
+                };
+                // Serialize to string now so FeatureRow is not held past this scope.
+                csv_lines.push(row.to_csv_line());
             }
+        } // context_tables lock released here
 
-            let is_sm = u8::from(key.src == key.dst || key.sport == key.dport);
-            ctx.push(&key.src, &key.dst, key.sport, key.dport, svc);
+        let n = csv_lines.len();
 
-            rows.push(FeatureRow {
-                srcip:  key.src.clone(),
-                sport:  key.sport,
-                dstip:  key.dst.clone(),
-                dsport: key.dport,
-                proto:  proto_str,
-                state:  state.clone(),
-                dur:    acc.dur(),
-                sbytes: acc.sbytes(), dbytes: acc.dbytes(),
-                sttl:   acc.sttl(),   dttl:   acc.dttl(),
-                sloss:  acc.sloss(),  dloss:  acc.dloss(),
-                service: svc.to_string(),
-                Sload:  acc.sload(),  Dload:  acc.dload(),
-                Spkts:  acc.spkts(),  Dpkts:  acc.dpkts(),
-                swin:   acc.swin(),   dwin:   acc.dwin(),
-                stcpb:  acc.stcpb(),  dtcpb:  acc.dtcpb(),
-                smeansz: acc.smeansz(), dmeansz: acc.dmeansz(),
-                trans_depth:    acc.trans_depth(),
-                res_bdy_len:    acc.res_bdy_len(),
-                Sjit:   acc.sjit(),   Djit:  acc.djit(),
-                Stime:  acc.stime(),  Ltime: acc.ltime(),
-                Sintpkt: acc.sintpkt(), Dintpkt: acc.dintpkt(),
-                tcprtt: acc.tcprtt(), synack: acc.synack(), ackdat: acc.ackdat(),
-                is_sm_ips_ports: is_sm,
-                ct_state_ttl:    ct_state_ttl(&state, acc.sttl(), acc.dttl()),
-                ct_flw_http_mthd: acc.ct_flw_http_mthd(),
-                is_ftp_login:    acc.is_ftp_login(),
-                ct_ftp_cmd:      acc.ct_ftp_cmd(),
-                ct_srv_src:      ctx.ct_srv_src(&key.src, svc),
-                ct_srv_dst:      ctx.ct_srv_dst(&key.dst, svc),
-                ct_dst_ltm:      ctx.ct_dst_ltm(&key.dst),
-                ct_src_ltm:      ctx.ct_src_ltm(&key.src),
-                ct_src_dport_ltm:  ctx.ct_src_dport_ltm(&key.src, key.dport),
-                ct_dst_sport_ltm:  ctx.ct_dst_sport_ltm(&key.dst, key.sport),
-                ct_dst_src_ltm:    ctx.ct_dst_src_ltm(&key.dst, &key.src),
-            });
-        }
-
-        let n = rows.len();
-        drop(ctx);
-
-        // Evict completed/idle flows to keep the table from growing unboundedly
+        // Evict terminated/idle flows.
         for key in evict_keys {
             self.flow_table.remove(&key);
         }
 
-        self.append_rows(&rows)?;
+        // Write CSV lines (already buffered via BufWriter in append_lines).
+        self.append_lines(&csv_lines)?;
         Ok(n)
     }
 
     pub fn csv_path(&self) -> &std::path::Path { &self.output_path }
 
-    fn append_rows(&self, rows: &[FeatureRow]) -> Result<()> {
+    fn append_lines(&self, lines: &[String]) -> Result<()> {
+        if lines.is_empty() { return Ok(()); }
         let file = OpenOptions::new()
             .append(true).create(true)
             .open(&self.output_path)
             .with_context(|| format!("Cannot open {}", self.output_path.display()))?;
         let mut w = BufWriter::new(file);
-        for row in rows { writeln!(w, "{}", row.to_csv_line())?; }
+        for line in lines { writeln!(w, "{}", line)?; }
         w.flush()?;
         Ok(())
     }
 }
 
 impl Drop for FeatureExtractor {
-    fn drop(&mut self) { self.stop_flag.store(true, Ordering::Relaxed); }
+    fn drop(&mut self) {
+        // Signal all capture threads to exit.
+        self.stop_flag.store(true, Ordering::Relaxed);
+        // Join them so we don't leak OS threads after the extractor is dropped.
+        let mut handles = self.thread_handles.lock();
+        for h in handles.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

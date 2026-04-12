@@ -2,6 +2,7 @@
 // ProcessInfo type + sysinfo-based enumeration.
 
 use serde::{Deserialize, Serialize};
+use std::sync::{Mutex, OnceLock};
 use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
 
 // ─── Detection signal ─────────────────────────────────────────────────────────
@@ -185,6 +186,11 @@ impl ScanStatistics {
 
 // ─── Process enumeration ──────────────────────────────────────────────────────
 
+/// Global warm System instance.  Initialised once (with its mandatory 200 ms
+/// sleep) and then reused on every subsequent scan call — eliminating the
+/// per-scan blocking sleep that previously froze the daemon thread.
+static WARM_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+
 pub fn enumerate_processes() -> Vec<ProcessInfo> {
     // sysinfo 0.30+: use ::nothing() / ::everything(), NOT ::new().
     let process_refresh = ProcessRefreshKind::everything()
@@ -196,12 +202,25 @@ pub fn enumerate_processes() -> Vec<ProcessInfo> {
         .with_processes(process_refresh);
 
     // ── Two-sample CPU measurement ────────────────────────────────────────────
-    // sysinfo computes cpu_usage() as a delta between two snapshots.
-    // A single snapshot always returns 0.0 — you MUST take two samples
-    // separated by at least MINIMUM_CPU_UPDATE_INTERVAL (~200ms).
-    let mut sys = System::new_with_specifics(refresh_kind);
+    // On first call: create System, sleep once, refresh — unavoidable.
+    // On subsequent calls: just refresh. User-triggered scans are always
+    // multiple seconds apart, so the 200 ms delta requirement is satisfied
+    // without an additional sleep.
+    let warm = WARM_SYSTEM.get_or_init(|| {
+        let mut sys = System::new_with_specifics(refresh_kind);
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::everything()
+                .with_exe(UpdateKind::Always)
+                .with_cmd(UpdateKind::Always)
+                .with_user(UpdateKind::Always),
+        );
+        Mutex::new(sys)
+    });
 
-    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    let mut sys = warm.lock().expect("process system mutex poisoned");
 
     sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,

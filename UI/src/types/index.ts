@@ -224,6 +224,34 @@ export interface ScanHistoryEntry {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ML IDS Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface MlFlowResult {
+  srcip: string;
+  dstip: string;
+  sport: number;
+  dsport: number;
+  proto: string;
+  prediction: 'Clean' | 'Malicious';
+  probability: number;
+}
+
+export interface MlIdsSummary {
+  total_flows: number;
+  clean_flows: number;
+  malicious_flows: number;
+  malicious_rate: number;
+}
+
+export interface MlIdsResult {
+  success: boolean;
+  summary: MlIdsSummary;
+  flows: MlFlowResult[];
+  error?: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
