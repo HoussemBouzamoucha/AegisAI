@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useStore } from '../store';
-import { RefreshCw, Search, ChevronDown, ChevronRight, Link, BrainCircuit, ShieldAlert, ShieldCheck, X } from 'lucide-react';
-import type { MlFlowResult } from '../types';
+import { RefreshCw, Search, ChevronDown, ChevronRight, Link, BrainCircuit, ShieldAlert, ShieldCheck, AlertTriangle, X, Info } from 'lucide-react';
+import type { MlFlowResult, MlIdsSummary } from '../types';
 
 function StatCard({ label, value, color, sub }: { label: string; value: string | number; color: string; sub?: string }) {
   return (
@@ -23,14 +23,45 @@ function StatCard({ label, value, color, sub }: { label: string; value: string |
   );
 }
 
+function VerdictIcon({ prediction }: { prediction: MlFlowResult['prediction'] }) {
+  if (prediction === 'Malicious')  return <ShieldAlert   size={11} color="var(--red)"   />;
+  if (prediction === 'Suspicious') return <AlertTriangle size={11} color="var(--amber)" />;
+  return <ShieldCheck size={11} color="var(--green)" />;
+}
+
+function verdictColor(prediction: MlFlowResult['prediction']) {
+  if (prediction === 'Malicious')  return 'var(--red)';
+  if (prediction === 'Suspicious') return 'var(--amber)';
+  return 'var(--green)';
+}
+
+function verdictBg(prediction: MlFlowResult['prediction']) {
+  if (prediction === 'Malicious')  return 'rgba(255,51,85,0.05)';
+  if (prediction === 'Suspicious') return 'rgba(245,158,11,0.05)';
+  return 'transparent';
+}
+
+type FlowFilter = 'malicious' | 'suspicious' | 'all';
+
 function MlResultsPanel({ flows, summary, onClose }: {
   flows: MlFlowResult[];
-  summary: { total_flows: number; clean_flows: number; malicious_flows: number; malicious_rate: number };
+  summary: MlIdsSummary;
   onClose: () => void;
 }) {
-  const maliciousFlows = flows.filter(f => f.prediction === 'Malicious');
-  const [showAll, setShowAll] = useState(false);
-  const displayed = showAll ? flows : maliciousFlows.slice(0, 50);
+  const maliciousFlows  = flows.filter(f => f.prediction === 'Malicious');
+  const suspiciousFlows = flows.filter(f => f.prediction === 'Suspicious');
+
+  const [tab, setTab]               = useState<FlowFilter>('malicious');
+  const [expandedFlows, setExpanded] = useState<Set<number>>(new Set());
+
+  const displayed = tab === 'malicious' ? maliciousFlows
+                  : tab === 'suspicious' ? suspiciousFlows
+                  : flows;
+
+  const toggleFlow = (i: number) =>
+    setExpanded(prev => { const n = new Set(prev); n.has(i) ? n.delete(i) : n.add(i); return n; });
+
+  const COLS = '1.1fr 1.1fr 65px 65px 55px 115px 72px 20px';
 
   return (
     <div style={{
@@ -39,7 +70,7 @@ function MlResultsPanel({ flows, summary, onClose }: {
       borderRadius: 8,
       overflow: 'hidden',
     }}>
-      {/* Header */}
+      {/* ── Header ─────────────────────────────────────────────────────── */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         padding: '12px 16px',
@@ -52,105 +83,140 @@ function MlResultsPanel({ flows, summary, onClose }: {
             ML IDS RESULTS
           </span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-          <div style={{ display: 'flex', gap: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+            Flows: <span style={{ color: 'var(--text)' }}>{summary.total_flows}</span>
+          </span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+            Clean: <span style={{ color: 'var(--green)' }}>{summary.clean_flows}</span>
+          </span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+            Suspicious: <span style={{ color: 'var(--amber)' }}>{summary.suspicious_flows}</span>
+          </span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+            Malicious: <span style={{ color: 'var(--red)' }}>{summary.malicious_flows}</span>
+          </span>
+          {summary.total_flows > 0 && (
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
-              Flows: <span style={{ color: 'var(--text)' }}>{summary.total_flows}</span>
-            </span>
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
-              Clean: <span style={{ color: 'var(--green)' }}>{summary.clean_flows}</span>
-            </span>
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
-              Malicious: <span style={{ color: 'var(--red)' }}>{summary.malicious_flows}</span>
-            </span>
-            {summary.total_flows > 0 && (
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
-                Rate: <span style={{ color: summary.malicious_rate > 0.1 ? 'var(--red)' : 'var(--amber)' }}>
-                  {(summary.malicious_rate * 100).toFixed(1)}%
-                </span>
+              Rate: <span style={{ color: summary.malicious_rate > 0.1 ? 'var(--red)' : 'var(--amber)' }}>
+                {(summary.malicious_rate * 100).toFixed(1)}%
               </span>
-            )}
-          </div>
+            </span>
+          )}
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-dim)', display: 'flex' }}>
             <X size={14} />
           </button>
         </div>
       </div>
 
-      {/* Toggle */}
-      <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 8 }}>
-        <button
-          onClick={() => setShowAll(false)}
-          style={{
+      {/* ── Filter tabs ─────────────────────────────────────────────────── */}
+      <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 6 }}>
+        {([
+          { key: 'malicious',  label: `MALICIOUS (${maliciousFlows.length})`,  activeColor: 'var(--red)',   activeBg: 'rgba(255,51,85,0.08)'   },
+          { key: 'suspicious', label: `SUSPICIOUS (${suspiciousFlows.length})`, activeColor: 'var(--amber)', activeBg: 'rgba(245,158,11,0.08)'  },
+          { key: 'all',        label: `ALL FLOWS (${flows.length})`,            activeColor: 'var(--green)', activeBg: 'var(--green-glow)'      },
+        ] as const).map(({ key, label, activeColor, activeBg }) => (
+          <button key={key} onClick={() => setTab(key)} style={{
             padding: '4px 10px', borderRadius: 4, fontSize: 10, fontFamily: 'var(--font-hud)',
-            border: `1px solid ${!showAll ? 'var(--border-md)' : 'transparent'}`,
-            background: !showAll ? 'rgba(255,51,85,0.08)' : 'transparent',
-            color: !showAll ? 'var(--red)' : 'var(--text-dim)', cursor: 'pointer',
-          }}
-        >
-          MALICIOUS ({maliciousFlows.length})
-        </button>
-        <button
-          onClick={() => setShowAll(true)}
-          style={{
-            padding: '4px 10px', borderRadius: 4, fontSize: 10, fontFamily: 'var(--font-hud)',
-            border: `1px solid ${showAll ? 'var(--border-md)' : 'transparent'}`,
-            background: showAll ? 'var(--green-glow)' : 'transparent',
-            color: showAll ? 'var(--green)' : 'var(--text-dim)', cursor: 'pointer',
-          }}
-        >
-          ALL FLOWS ({flows.length})
-        </button>
+            border:     `1px solid ${tab === key ? 'var(--border-md)' : 'transparent'}`,
+            background: tab === key ? activeBg : 'transparent',
+            color:      tab === key ? activeColor : 'var(--text-dim)',
+            cursor: 'pointer',
+          }}>
+            {label}
+          </button>
+        ))}
+        <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', alignSelf: 'center' }}>
+          Click a row to inspect reasons
+        </span>
       </div>
 
-      {/* Table */}
+      {/* ── Table ───────────────────────────────────────────────────────── */}
       {displayed.length === 0 ? (
         <div style={{ padding: '20px', display: 'flex', alignItems: 'center', gap: 10, color: 'var(--green)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
           <ShieldCheck size={16} />
-          No malicious flows detected in captured data.
+          {tab === 'malicious' ? 'No malicious flows detected.' : tab === 'suspicious' ? 'No suspicious flows detected.' : 'No flows to display.'}
         </div>
       ) : (
-        <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+        <div style={{ maxHeight: 320, overflowY: 'auto' }}>
           {/* Column headers */}
           <div style={{
-            display: 'grid', gridTemplateColumns: '1.2fr 1.2fr 80px 80px 70px 100px 90px',
+            display: 'grid', gridTemplateColumns: COLS,
             gap: 8, padding: '6px 16px',
             fontFamily: 'var(--font-hud)', fontSize: 9, color: 'var(--text-dim)', letterSpacing: '0.1em',
             background: 'var(--base)', borderBottom: '1px solid var(--border)',
+            position: 'sticky', top: 0,
           }}>
-            {['SRC IP', 'DST IP', 'SPORT', 'DSPORT', 'PROTO', 'VERDICT', 'CONFIDENCE'].map(h => (
+            {['SRC IP', 'DST IP', 'SPORT', 'DPORT', 'PROTO', 'VERDICT', 'CONF', ''].map(h => (
               <span key={h}>{h}</span>
             ))}
           </div>
+
           {displayed.map((flow, i) => {
-            const isMal = flow.prediction === 'Malicious';
-            const pct   = (flow.probability * 100).toFixed(1);
+            const color    = verdictColor(flow.prediction);
+            const expanded = expandedFlows.has(i);
+            const pct      = (flow.probability * 100).toFixed(1);
+            const flagged  = flow.prediction !== 'Clean';
+
             return (
-              <div key={i} style={{
-                display: 'grid', gridTemplateColumns: '1.2fr 1.2fr 80px 80px 70px 100px 90px',
-                gap: 8, padding: '8px 16px',
-                borderBottom: '1px solid var(--border)',
-                background: isMal ? 'rgba(255,51,85,0.04)' : 'transparent',
-                alignItems: 'center',
-              }}>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: isMal ? 'var(--red)' : 'var(--text)' }}>
-                  {flow.srcip}
-                </span>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: isMal ? 'var(--red)' : 'var(--text)' }}>
-                  {flow.dstip}
-                </span>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{flow.sport}</span>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{flow.dsport}</span>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
-                  {flow.proto.toUpperCase()}
-                </span>
-                <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'var(--font-mono)', fontSize: 10, color: isMal ? 'var(--red)' : 'var(--green)' }}>
-                  {isMal ? <ShieldAlert size={11} /> : <ShieldCheck size={11} />}
-                  {flow.prediction.toUpperCase()}
-                </span>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: isMal ? 'var(--red)' : 'var(--text-dim)' }}>
-                  {pct}%
-                </span>
+              <div key={i} style={{ borderBottom: '1px solid var(--border)' }}>
+                {/* Flow row */}
+                <div
+                  onClick={() => flagged && toggleFlow(i)}
+                  style={{
+                    display: 'grid', gridTemplateColumns: COLS,
+                    gap: 8, padding: '8px 16px',
+                    background: expanded ? `${verdictBg(flow.prediction).replace('0.05', '0.09')}` : verdictBg(flow.prediction),
+                    alignItems: 'center',
+                    cursor: flagged ? 'pointer' : 'default',
+                  }}
+                >
+                  {/* SRC IP + IPv6 badge */}
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color, display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{flow.srcip}</span>
+                    {flow.is_ipv6 && (
+                      <span style={{ flexShrink: 0, fontSize: 8, padding: '1px 4px', borderRadius: 3, background: 'rgba(139,92,246,0.15)', color: '#a78bfa', fontFamily: 'var(--font-hud)', letterSpacing: '0.05em' }}>
+                        IPv6
+                      </span>
+                    )}
+                  </span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {flow.dstip}
+                  </span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{flow.sport}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{flow.dsport}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                    {flow.proto.toUpperCase()}
+                  </span>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'var(--font-mono)', fontSize: 10, color }}>
+                    <VerdictIcon prediction={flow.prediction} />
+                    {flow.prediction.toUpperCase()}
+                  </span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color }}>{pct}%</span>
+                  <span style={{ color: 'var(--text-dim)', display: 'flex', justifyContent: 'flex-end' }}>
+                    {flagged && (expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />)}
+                  </span>
+                </div>
+
+                {/* Reasons panel */}
+                {expanded && flagged && flow.reasons.length > 0 && (
+                  <div style={{
+                    padding: '10px 16px 12px 32px',
+                    background: 'var(--base)',
+                    borderTop: `1px solid ${color}22`,
+                    display: 'flex', flexDirection: 'column', gap: 6,
+                  }}>
+                    <span style={{ fontFamily: 'var(--font-hud)', fontSize: 9, color: 'var(--text-dim)', letterSpacing: '0.1em', marginBottom: 2 }}>
+                      DETECTION REASONS
+                    </span>
+                    {flow.reasons.map((reason, ri) => (
+                      <div key={ri} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <Info size={10} color={color} style={{ flexShrink: 0 }} />
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text)' }}>{reason}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             );
           })}

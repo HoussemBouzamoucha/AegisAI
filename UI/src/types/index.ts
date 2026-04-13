@@ -233,13 +233,16 @@ export interface MlFlowResult {
   sport: number;
   dsport: number;
   proto: string;
-  prediction: 'Clean' | 'Malicious';
+  is_ipv6: boolean;
+  prediction: 'Clean' | 'Suspicious' | 'Malicious';
   probability: number;
+  reasons: string[];
 }
 
 export interface MlIdsSummary {
   total_flows: number;
   clean_flows: number;
+  suspicious_flows: number;
   malicious_flows: number;
   malicious_rate: number;
 }

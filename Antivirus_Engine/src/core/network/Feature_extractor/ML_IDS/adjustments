@@ -1,0 +1,21 @@
+import joblib
+import numpy as np
+
+# Load saved artifacts
+subnet_encoders = joblib.load("subnet_encoders.joblib")
+src_counts = joblib.load("src_freq_map.joblib")
+dst_counts = joblib.load("dst_freq_map.joblib")
+
+# Subnet encoding
+for col in ['src_subnet', 'dst_subnet']:
+    le = subnet_encoders[col]
+    X[col] = X[col].map(
+        lambda x: le.transform([x])[0] if x in le.classes_ else -1
+    )
+
+# Frequency features
+X['src_freq'] = X['srcip'].map(src_counts).fillna(0)
+X['dst_freq'] = X['dstip'].map(dst_counts).fillna(0)
+
+X['src_freq'] = np.log1p(X['src_freq'])
+X['dst_freq'] = np.log1p(X['dst_freq'])

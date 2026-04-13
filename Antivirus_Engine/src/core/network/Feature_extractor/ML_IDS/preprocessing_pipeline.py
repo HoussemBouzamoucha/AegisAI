@@ -29,12 +29,14 @@ import joblib
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENGINE_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, '..', '..', '..', '..', '..'))
-MODEL_DIR  = os.path.join(ENGINE_DIR, 'models')
+MODEL_DIR  = os.path.join(ENGINE_DIR, 'models', 'network')
 
-MODEL_PATH        = os.path.join(MODEL_DIR, 'ids_xgboost_model.pkl')
+MODEL_PATH_CAL    = os.path.join(MODEL_DIR, 'ids_network_calibrated.pkl')
+MODEL_PATH_RAW    = os.path.join(MODEL_DIR, 'ids_network_model.pkl')
 ENCODER_PATH      = os.path.join(MODEL_DIR, 'ordinal_encoder.joblib')
-SKEWED_COLS_PATH  = os.path.join(MODEL_DIR, 'skewed_cols.joblib')
-FEATURE_COLS_PATH = os.path.join(MODEL_DIR, 'feature_cols.joblib')
+SRC_FREQ_PATH     = os.path.join(MODEL_DIR, 'src_freq_map.joblib')
+DST_FREQ_PATH     = os.path.join(MODEL_DIR, 'dst_freq_map.joblib')
+SUBNET_ENC_PATH   = os.path.join(MODEL_DIR, 'subnet_encoders.joblib')
 
 def _default_csv() -> str:
     home = os.environ.get('USERPROFILE', os.environ.get('HOME', '.'))
@@ -74,6 +76,10 @@ EXPECTED_FEATURE_COLS = [
     'src_subnet', 'dst_subnet', 'src_freq', 'dst_freq',
 ]
 
+# Detection thresholds
+THRESHOLD_MALICIOUS  = 0.65
+THRESHOLD_SUSPICIOUS = 0.40
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -110,13 +116,42 @@ def _get_subnet(ip: str) -> str:
         return ':'.join(groups[:4]) if len(groups) >= 4 else ip
     return ip
 
+
+def _build_reasons(flow_row: pd.Series, prediction: str, probability: float) -> list:
+    """Generate human-readable detection reasons for a flagged flow."""
+    reasons = []
+    pct = probability * 100
+
+    if prediction == 'Malicious':
+        reasons.append(f'ML model confidence: {pct:.1f}%')
+    elif prediction == 'Suspicious':
+        reasons.append(f'ML model flagged as suspicious ({pct:.1f}% confidence)')
+
+    proto = str(flow_row.get('proto', '')).upper()
+    state = str(flow_row.get('state', '')).upper()
+
+    # Unusual protocol/state combinations
+    if proto not in ('TCP', 'UDP', 'ICMP', ''):
+        reasons.append(f'Unusual protocol: {proto}')
+    if state in ('FIN', 'RST', 'INT'):
+        reasons.append(f'Abnormal connection state: {state}')
+
+    # Port-based signals
+    dsport = int(flow_row.get('dsport', 0) or 0)
+    sport  = int(flow_row.get('sport',  0) or 0)
+    KNOWN_C2_PORTS = {4444, 1337, 31337, 8888, 9999, 6666, 12345, 54321}
+    if dsport in KNOWN_C2_PORTS or sport in KNOWN_C2_PORTS:
+        reasons.append(f'Known C2/malware port used ({dsport or sport})')
+
+    return reasons
+
 # =============================================================================
 # Inference pipeline
 # =============================================================================
 
 def run_inference(csv_path: str) -> None:
     """
-    Read OnePace.csv, preprocess, run the saved XGBoost model, and print a
+    Read OnePace.csv, preprocess, run the saved model, and print a
     JSON object to stdout. stdout is always valid JSON.
     """
 
@@ -136,7 +171,11 @@ def run_inference(csv_path: str) -> None:
     if df.empty:
         print(json.dumps({
             'success': True,
-            'summary': {'total_flows': 0, 'clean_flows': 0, 'malicious_flows': 0, 'malicious_rate': 0.0},
+            'summary': {
+                'total_flows': 0, 'clean_flows': 0,
+                'suspicious_flows': 0, 'malicious_flows': 0,
+                'malicious_rate': 0.0,
+            },
             'flows': [],
         }))
         return
@@ -146,8 +185,9 @@ def run_inference(csv_path: str) -> None:
         _fail(f'CSV is missing columns: {missing}')
 
     # ── 2. Load model ─────────────────────────────────────────────────────────
-    if not os.path.exists(MODEL_PATH):
-        _fail(f'Model not found at: {MODEL_PATH}')
+    model_path = MODEL_PATH_CAL if os.path.exists(MODEL_PATH_CAL) else MODEL_PATH_RAW
+    if not os.path.exists(model_path):
+        _fail(f'Model not found. Looked for:\n  {MODEL_PATH_CAL}\n  {MODEL_PATH_RAW}')
 
     try:
         import xgboost  # noqa: F401
@@ -155,7 +195,7 @@ def run_inference(csv_path: str) -> None:
         _fail('xgboost is not installed. Run: pip install xgboost')
 
     try:
-        model = joblib.load(MODEL_PATH)
+        model = joblib.load(model_path)
     except Exception as e:
         _fail(f'Failed to load model: {e}')
 
@@ -168,10 +208,12 @@ def run_inference(csv_path: str) -> None:
     id_cols['sport']  = pd.to_numeric(id_cols['sport'],  errors='coerce').fillna(0).astype(int)
     id_cols['dsport'] = pd.to_numeric(id_cols['dsport'], errors='coerce').fillna(0).astype(int)
 
+    # Stash the raw row data for reason generation (before encoding)
+    raw_for_reasons = df[['proto', 'state', 'sport', 'dsport']].copy()
+
     X = df.copy()
 
     # ── 4. Fill structural NaNs ───────────────────────────────────────────────
-    # ct_flw_http_mthd and is_ftp_login are NaN when no HTTP/FTP — fill with 0
     X['ct_flw_http_mthd'] = pd.to_numeric(X['ct_flw_http_mthd'], errors='coerce').fillna(0).astype('float32')
     X['is_ftp_login']     = pd.to_numeric(X['is_ftp_login'],     errors='coerce').fillna(0).astype('float32')
 
@@ -184,14 +226,9 @@ def run_inference(csv_path: str) -> None:
     X['dsport'] = X['dsport'].fillna(0).astype('Int32')
 
     # ── 6. Log-transform skewed columns ───────────────────────────────────────
-    # Load the skewed column list saved at training time; fall back to detecting
-    # from the batch (may differ slightly from training).
-    if os.path.exists(SKEWED_COLS_PATH):
-        skewed_cols = joblib.load(SKEWED_COLS_PATH)
-    else:
-        numeric_only = X.select_dtypes(include=[np.number])
-        skewness     = numeric_only.skew(numeric_only=True)
-        skewed_cols  = skewness[skewness > 1].index.tolist()
+    numeric_only = X.select_dtypes(include=[np.number])
+    skewness     = numeric_only.skew(numeric_only=True)
+    skewed_cols  = skewness[skewness > 1].index.tolist()
 
     for col in skewed_cols:
         if col in X.columns:
@@ -219,7 +256,6 @@ def run_inference(csv_path: str) -> None:
     X[CAT_COLS] = X[CAT_COLS].astype('int32')
 
     # ── 9. Port fixes ─────────────────────────────────────────────────────────
-    # Port 0 is a safe placeholder for missing port values
     X['dsport'] = X['dsport'].fillna(0).astype('int32')
     X['sport']  = X['sport'].fillna(0).astype('int32')
 
@@ -240,20 +276,34 @@ def run_inference(csv_path: str) -> None:
     X['src_subnet'] = X['srcip'].astype(str).apply(_get_subnet)
     X['dst_subnet'] = X['dstip'].astype(str).apply(_get_subnet)
 
-    for col in ['src_subnet', 'dst_subnet']:
-        le = LabelEncoder()
-        X[col] = le.fit_transform(X[col].astype(str))
+    # ── 11. Subnet & frequency encoding (use pre-saved artifacts if available)
+    if os.path.exists(SUBNET_ENC_PATH):
+        subnet_encoders = joblib.load(SUBNET_ENC_PATH)
+        for col in ['src_subnet', 'dst_subnet']:
+            le = subnet_encoders[col]
+            X[col] = X[col].map(
+                lambda x, _le=le: int(_le.transform([x])[0]) if x in _le.classes_ else -1
+            )
+    else:
+        for col in ['src_subnet', 'dst_subnet']:
+            le = LabelEncoder()
+            X[col] = le.fit_transform(X[col].astype(str))
 
-    # IP frequency within batch (log-scaled)
-    src_counts = X['srcip'].value_counts()
-    dst_counts = X['dstip'].value_counts()
-    X['src_freq'] = np.log1p(X['srcip'].map(src_counts).fillna(0))
-    X['dst_freq'] = np.log1p(X['dstip'].map(dst_counts).fillna(0))
+    if os.path.exists(SRC_FREQ_PATH) and os.path.exists(DST_FREQ_PATH):
+        src_counts = joblib.load(SRC_FREQ_PATH)
+        dst_counts = joblib.load(DST_FREQ_PATH)
+        X['src_freq'] = np.log1p(X['srcip'].map(src_counts).fillna(0))
+        X['dst_freq'] = np.log1p(X['dstip'].map(dst_counts).fillna(0))
+    else:
+        src_counts = X['srcip'].value_counts()
+        dst_counts = X['dstip'].value_counts()
+        X['src_freq'] = np.log1p(X['srcip'].map(src_counts).fillna(0))
+        X['dst_freq'] = np.log1p(X['dstip'].map(dst_counts).fillna(0))
 
     X = X.drop(columns=['srcip', 'dstip'])
 
-    # ── 11. Align to model feature order ──────────────────────────────────────
-    feature_cols = joblib.load(FEATURE_COLS_PATH) if os.path.exists(FEATURE_COLS_PATH) else EXPECTED_FEATURE_COLS
+    # ── 12. Align to model feature order ──────────────────────────────────────
+    feature_cols = EXPECTED_FEATURE_COLS
 
     for col in feature_cols:
         if col not in X.columns:
@@ -266,42 +316,60 @@ def run_inference(csv_path: str) -> None:
 
     X_arr = X.values.astype('float32')
 
-    # ── 12. Predict ───────────────────────────────────────────────────────────
-    THRESHOLD = 0.75
-
+    # ── 13. Predict ───────────────────────────────────────────────────────────
     try:
         if hasattr(model, 'predict_proba'):
             mal_proba   = model.predict_proba(X_arr)[:, 1].tolist()
-            predictions = [1 if p >= THRESHOLD else 0 for p in mal_proba]
+            predictions = [
+                'Malicious' if p >= THRESHOLD_MALICIOUS
+                else ('Suspicious' if p >= THRESHOLD_SUSPICIOUS else 'Clean')
+                for p in mal_proba
+            ]
         else:
-            predictions = model.predict(X_arr).tolist()
-            mal_proba   = [float(p) for p in predictions]
+            raw_preds   = model.predict(X_arr).tolist()
+            mal_proba   = [float(p) for p in raw_preds]
+            predictions = [
+                'Malicious' if p >= THRESHOLD_MALICIOUS
+                else ('Suspicious' if p >= THRESHOLD_SUSPICIOUS else 'Clean')
+                for p in mal_proba
+            ]
     except Exception as e:
         _fail(f'Model prediction failed: {e}')
 
-    # ── 13. Build JSON output ─────────────────────────────────────────────────
+    # ── 14. Build JSON output ─────────────────────────────────────────────────
     flows = []
     for i, (pred, prob) in enumerate(zip(predictions, mal_proba)):
+        srcip = str(id_cols.iloc[i]['srcip'])
+        dstip = str(id_cols.iloc[i]['dstip'])
+        is_ipv6 = (':' in srcip and not srcip.lower().startswith('::ffff:')) or \
+                  (':' in dstip and not dstip.lower().startswith('::ffff:'))
+
+        reasons = _build_reasons(raw_for_reasons.iloc[i], pred, prob) if pred != 'Clean' else []
+
         flows.append({
-            'srcip':       str(id_cols.iloc[i]['srcip']),
-            'dstip':       str(id_cols.iloc[i]['dstip']),
+            'srcip':       srcip,
+            'dstip':       dstip,
             'sport':       int(id_cols.iloc[i]['sport']),
             'dsport':      int(id_cols.iloc[i]['dsport']),
             'proto':       str(id_cols.iloc[i]['proto']),
-            'prediction':  'Malicious' if int(pred) == 1 else 'Clean',
+            'is_ipv6':     is_ipv6,
+            'prediction':  pred,
             'probability': round(float(prob), 4),
+            'reasons':     reasons,
         })
 
-    total     = len(flows)
-    malicious = sum(1 for f in flows if f['prediction'] == 'Malicious')
+    total      = len(flows)
+    malicious  = sum(1 for f in flows if f['prediction'] == 'Malicious')
+    suspicious = sum(1 for f in flows if f['prediction'] == 'Suspicious')
 
     print(json.dumps({
         'success': True,
         'summary': {
             'total_flows':     total,
-            'clean_flows':     total - malicious,
+            'clean_flows':     total - malicious - suspicious,
+            'suspicious_flows': suspicious,
             'malicious_flows': malicious,
-            'malicious_rate':  round(malicious / total, 4) if total > 0 else 0.0,
+            'malicious_rate':  round((malicious + suspicious) / total, 4) if total > 0 else 0.0,
         },
         'flows': flows,
     }))
