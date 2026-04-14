@@ -47,6 +47,20 @@ use std::{
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CSV header — 47 columns matching FEATURE_NAMES_47 in preprocessing_pipeline.py
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CSV_HEADER: &str =
+    "srcip,sport,dstip,dsport,proto,state,dur,sbytes,dbytes,\
+sttl,dttl,sloss,dloss,service,Sload,Dload,Spkts,Dpkts,\
+swin,dwin,stcpb,dtcpb,smeansz,dmeansz,trans_depth,res_bdy_len,\
+Sjit,Djit,Stime,Ltime,Sintpkt,Dintpkt,\
+tcprtt,synack,ackdat,is_sm_ips_ports,ct_state_ttl,\
+ct_flw_http_mthd,is_ftp_login,ct_ftp_cmd,\
+ct_srv_src,ct_srv_dst,ct_dst_ltm,ct_src_ltm,\
+ct_src_dport_ltm,ct_dst_sport_ltm,ct_dst_src_ltm";
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tuneable constants
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -65,20 +79,6 @@ const PCAP_TIMEOUT_MS: i32 = 500;
 
 /// Sleep duration when pcap returns TimeoutExpired to prevent busy-wait spin.
 const PCAP_IDLE_SLEEP_MS: u64 = 10;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CSV header — 47 columns, UNSW-NB15 ordering
-// ─────────────────────────────────────────────────────────────────────────────
-
-const CSV_HEADER: &str =
-    "srcip,sport,dstip,dsport,proto,state,dur,sbytes,dbytes,\
-sttl,dttl,sloss,dloss,service,Sload,Dload,Spkts,Dpkts,\
-swin,dwin,stcpb,dtcpb,smeansz,dmeansz,trans_depth,res_bdy_len,\
-Sjit,Djit,Stime,Ltime,Sintpkt,Dintpkt,\
-tcprtt,synack,ackdat,is_sm_ips_ports,ct_state_ttl,\
-ct_flw_http_mthd,is_ftp_login,ct_ftp_cmd,\
-ct_srv_src,ct_srv_dst,ct_dst_ltm,ct_src_ltm,\
-ct_src_dport_ltm,ct_dst_sport_ltm,ct_dst_src_ltm";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Flow key — canonical bidirectional 5-tuple
@@ -673,17 +673,26 @@ impl FeatureRow {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Returns true for loopback or virtual interfaces we should skip.
-fn is_virtual_interface(name: &str) -> bool {
-    let n = name.to_lowercase();
-    n.contains("loopback")
-        || n.contains("vethernet")
-        || n.contains("hyper-v")
-        || n.contains("wsl")
-        || n.contains("virtual")
-        || n.contains("miniport")
-        || n == "lo"
-        || n.starts_with("virbr")
-        || n.starts_with("docker")
+/// Checks both the pcap device name and its human-readable description,
+/// because on Windows all names look like \Device\NPF_{GUID} — the
+/// description is the only thing that distinguishes real vs virtual adapters.
+fn is_virtual_interface(name: &str, desc: Option<&str>) -> bool {
+    let check = |s: &str| {
+        let s = s.to_lowercase();
+        s.contains("loopback")
+            || s.contains("vethernet")
+            || s.contains("hyper-v")
+            || s.contains("wsl")
+            || s.contains("miniport")      // WAN Miniport (IP/IPv6/Network Monitor)
+            || s.contains("wi-fi direct")  // Microsoft Wi-Fi Direct Virtual Adapter
+            || s.contains("bluetooth")     // Bluetooth PAN
+            || s.contains("remote ndis")   // Internet Sharing / USB tethering
+            || s.contains("virtual")
+            || s == "lo"
+            || s.starts_with("virbr")
+            || s.starts_with("docker")
+    };
+    check(name) || desc.map(check).unwrap_or(false)
 }
 
 /// Spawn one capture thread per physical interface (capped at MAX_CAPTURE_IFACES).
@@ -692,22 +701,42 @@ fn spawn_capture_threads(
     flow_table: Arc<DashMap<FlowKey, FlowAcc>>,
     stop: Arc<AtomicBool>,
 ) -> Vec<thread::JoinHandle<()>> {
-    let all_devices = Device::list().unwrap_or_default();
+    let all_devices = match Device::list() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[feature_extractor] pcap device enumeration failed: {e}");
+            eprintln!("[feature_extractor] On Windows, install Npcap with 'WinPcap API compatible mode' and run as Administrator.");
+            return Vec::new();
+        }
+    };
+
     if all_devices.is_empty() {
-        eprintln!(
-            "[feature_extractor] No pcap devices found. \
-             On Windows, install Npcap with 'WinPcap API compatible mode'."
-        );
+        eprintln!("[feature_extractor] No pcap devices found.");
+        eprintln!("[feature_extractor] On Windows, install Npcap with 'WinPcap API compatible mode' and run as Administrator.");
         return Vec::new();
+    }
+
+    eprintln!("[feature_extractor] {} pcap device(s) found:", all_devices.len());
+    for d in &all_devices {
+        eprintln!("  {} — {} (virtual={})",
+            d.name,
+            d.desc.as_deref().unwrap_or("no description"),
+            is_virtual_interface(&d.name, d.desc.as_deref()));
     }
 
     // Filter out loopback / virtual interfaces, then cap the count.
     let devices: Vec<Device> = all_devices
         .into_iter()
-        .filter(|d| !is_virtual_interface(&d.name))
+        .filter(|d| !is_virtual_interface(&d.name, d.desc.as_deref()))
         .take(MAX_CAPTURE_IFACES)
         .collect();
 
+    if devices.is_empty() {
+        eprintln!("[feature_extractor] All devices were filtered as virtual/loopback. Packet-level features will be zero.");
+        return Vec::new();
+    }
+
+    eprintln!("[feature_extractor] Opening {} capture interface(s):", devices.len());
     let mut handles = Vec::new();
     for device in devices {
         let table   = Arc::clone(&flow_table);
@@ -719,8 +748,15 @@ fn spawn_capture_threads(
                 .and_then(|c| c.promisc(true).snaplen(65535).timeout(PCAP_TIMEOUT_MS).open());
 
             let mut cap = match cap {
-                Ok(c)  => c,
-                Err(e) => { eprintln!("[feature_extractor] {name}: {e}"); return; }
+                Ok(c)  => {
+                    eprintln!("[feature_extractor] capturing on {name}");
+                    c
+                }
+                Err(e) => {
+                    eprintln!("[feature_extractor] failed to open {name}: {e}");
+                    eprintln!("[feature_extractor] Hint: run the application as Administrator.");
+                    return;
+                }
             };
 
             while !stopper.load(Ordering::Relaxed) {
@@ -765,10 +801,9 @@ pub struct FeatureExtractor {
 
 impl FeatureExtractor {
     /// Create extractor and start background packet capture on all interfaces.
-    ///
-    /// `output_path` defaults to `%USERPROFILE%\OnePace.csv` on Windows.
-    pub fn new(output_path: Option<PathBuf>) -> Result<Arc<Self>> {
-        let path = output_path.unwrap_or_else(default_csv_path);
+    /// Output is always written to `%USERPROFILE%\OnePace.csv` on Windows.
+    pub fn new() -> Result<Arc<Self>> {
+        let path = default_csv_path();
 
         if !path.exists() {
             // Use BufWriter for the initial header write (Issue 9).
@@ -797,6 +832,11 @@ impl FeatureExtractor {
     /// Build feature rows from accumulated packet data, correlated with the
     /// current connection table, and append them to `OnePace.csv`.
     ///
+    /// Pass 1 — pcap-captured flows: rich features from live packet capture.
+    /// Pass 2 — OS-table fallback: any active connection with no pcap flow gets
+    ///           a row with zeros for packet-level fields so the ML pipeline
+    ///           always has data even when Npcap has not yet seen that flow.
+    ///
     /// Flows that are no longer present in the connection table AND whose last
     /// packet was more than `FLOW_IDLE_SECS` seconds ago are evicted from the
     /// flow table after their row is written — preventing unbounded growth.
@@ -821,11 +861,15 @@ impl FeatureExtractor {
         let keys: Vec<FlowKey> = self.flow_table.iter().map(|e| e.key().clone()).collect();
 
         // Build CSV lines under the context lock, then drop the lock before I/O.
-        let mut csv_lines  = Vec::with_capacity(keys.len());
+        let mut csv_lines  = Vec::with_capacity(connections.len().max(keys.len()));
         let mut evict_keys = Vec::new();
         {
             let mut ctx = self.context_tables.lock();
+            // Track which canonical flow keys were handled by pcap data.
+            let mut covered: std::collections::HashSet<FlowKey> =
+                std::collections::HashSet::new();
 
+            // ── Pass 1: pcap-captured flows ──────────────────────────────────
             for key in &keys {
                 let Some(acc_ref) = self.flow_table.get(key) else { continue };
                 let acc = acc_ref.value();
@@ -897,12 +941,138 @@ impl FeatureExtractor {
                     ct_dst_sport_ltm:  ctx.ct_dst_sport_ltm(&key.dst, key.sport),
                     ct_dst_src_ltm:    ctx.ct_dst_src_ltm(&key.dst, &key.src),
                 };
-                // Serialize to string now so FeatureRow is not held past this scope.
+                covered.insert(key.clone());
+                csv_lines.push(row.to_csv_line());
+            }
+
+            // ── Pass 2: OS-table fallback (no pcap data for this connection) ─
+            // Guarantees the CSV always has rows so the ML pipeline can run even
+            // when Npcap has not captured packets for a flow yet.
+            for conn in connections {
+                let (src, sp) = split_endpoint(&conn.local_address);
+                let (dst, dp) = split_endpoint(&conn.remote_address);
+                let sport = sp.unwrap_or(0);
+                let dport = dp.unwrap_or(0);
+
+                // Skip pure listeners (no remote peer) and unroutable entries.
+                if dst.is_empty() || dst == "*" || dst == "0.0.0.0" || dst == "::" || dport == 0 {
+                    continue;
+                }
+
+                let proto_num: u8 = match conn.protocol.to_lowercase().as_str() {
+                    "tcp"  => 6,
+                    "udp"  => 17,
+                    "icmp" => 1,
+                    _      => 0,
+                };
+                let key = FlowKey::new(src, dst, sport, dport, proto_num);
+                if covered.contains(&key) { continue; }
+
+                let svc       = best_service(key.dport, key.sport);
+                let proto_str = proto_name(key.proto).to_string();
+                let state     = conn.state.clone();
+                let is_sm     = u8::from(key.src == key.dst || key.sport == key.dport);
+
+                ctx.push(&key.src, &key.dst, key.sport, key.dport, svc);
+
+                let row = FeatureRow {
+                    srcip:  key.src.clone(),
+                    sport:  key.sport,
+                    dstip:  key.dst.clone(),
+                    dsport: key.dport,
+                    proto:  proto_str,
+                    state:  state.clone(),
+                    // Packet-level fields are zero — only OS-table data is available.
+                    dur:    0.0,
+                    sbytes: 0,   dbytes: 0,
+                    sttl:   128, dttl:   64,   // typical Windows / Linux defaults
+                    sloss:  0,   dloss:  0,
+                    service: svc.to_string(),
+                    Sload:  0.0, Dload:  0.0,
+                    Spkts:  0,   Dpkts:  0,
+                    swin:   0,   dwin:   0,
+                    stcpb:  0,   dtcpb:  0,
+                    smeansz: 0.0, dmeansz: 0.0,
+                    trans_depth: 0, res_bdy_len: 0,
+                    Sjit:   0.0, Djit:   0.0,
+                    Stime:  now, Ltime:  now,
+                    Sintpkt: 0.0, Dintpkt: 0.0,
+                    tcprtt: 0.0, synack: 0.0, ackdat: 0.0,
+                    is_sm_ips_ports: is_sm,
+                    ct_state_ttl:    ct_state_ttl(&state, 128, 64),
+                    ct_flw_http_mthd: 0,
+                    is_ftp_login: 0, ct_ftp_cmd: 0,
+                    ct_srv_src:      ctx.ct_srv_src(&key.src, svc),
+                    ct_srv_dst:      ctx.ct_srv_dst(&key.dst, svc),
+                    ct_dst_ltm:      ctx.ct_dst_ltm(&key.dst),
+                    ct_src_ltm:      ctx.ct_src_ltm(&key.src),
+                    ct_src_dport_ltm:  ctx.ct_src_dport_ltm(&key.src, key.dport),
+                    ct_dst_sport_ltm:  ctx.ct_dst_sport_ltm(&key.dst, key.sport),
+                    ct_dst_src_ltm:    ctx.ct_dst_src_ltm(&key.dst, &key.src),
+                };
                 csv_lines.push(row.to_csv_line());
             }
         } // context_tables lock released here
 
         let n = csv_lines.len();
+
+        // ── Debug summary ─────────────────────────────────────────────────────
+        {
+            let pcap_rows    = keys.len();
+            let fallback_rows = n.saturating_sub(pcap_rows);
+            eprintln!("[feature_extractor] flow_table={} | pcap_rows={} | fallback_rows={} | total={}",
+                self.flow_table.len(), pcap_rows, fallback_rows, n);
+
+            if n > 0 {
+                // Count how many rows have each packet-level field as zero.
+                // Fields are in fixed CSV column positions (0-indexed):
+                //  6=dur 7=sbytes 8=dbytes 14=Sload 15=Dload 16=Spkts 17=Dpkts
+                // 18=swin 19=dwin 20=stcpb 21=dtcpb 22=smeansz 23=dmeansz
+                // 24=trans_depth 25=res_bdy_len 26=Sjit 27=Djit
+                // 31=Sintpkt 32=Dintpkt 33=tcprtt 34=synack 35=ackdat
+                let field_names = [
+                    (6,  "dur"),
+                    (7,  "sbytes"),  (8,  "dbytes"),
+                    (14, "Sload"),   (15, "Dload"),
+                    (16, "Spkts"),   (17, "Dpkts"),
+                    (18, "swin"),    (19, "dwin"),
+                    (20, "stcpb"),   (21, "dtcpb"),
+                    (22, "smeansz"), (23, "dmeansz"),
+                    (24, "trans_depth"), (25, "res_bdy_len"),
+                    (26, "Sjit"),    (27, "Djit"),
+                    (31, "Sintpkt"), (32, "Dintpkt"),
+                    (33, "tcprtt"), (34, "synack"), (35, "ackdat"),
+                ];
+                let mut zero_counts = vec![0usize; field_names.len()];
+                for line in &csv_lines {
+                    let cols: Vec<&str> = line.split(',').collect();
+                    for (i, &(col_idx, _)) in field_names.iter().enumerate() {
+                        if cols.get(col_idx).map(|v| *v == "0" || *v == "0.000000" || *v == "0.0000").unwrap_or(true) {
+                            zero_counts[i] += 1;
+                        }
+                    }
+                }
+                let mut all_zero: Vec<&str> = Vec::new();
+                let mut partial:  Vec<String> = Vec::new();
+                for (i, &(_, name)) in field_names.iter().enumerate() {
+                    if zero_counts[i] == n {
+                        all_zero.push(name);
+                    } else if zero_counts[i] > 0 {
+                        partial.push(format!("{}({}/{})", name, zero_counts[i], n));
+                    }
+                }
+                if !all_zero.is_empty() {
+                    eprintln!("[feature_extractor] ALL-ZERO fields (pcap not capturing these): {:?}", all_zero);
+                }
+                if !partial.is_empty() {
+                    eprintln!("[feature_extractor] Partially zero fields: {:?}", partial);
+                }
+                if all_zero.is_empty() && partial.is_empty() {
+                    eprintln!("[feature_extractor] All packet-level fields have non-zero values.");
+                }
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         // Evict terminated/idle flows.
         for key in evict_keys {
@@ -985,7 +1155,7 @@ fn split_endpoint(ep: &str) -> (String, Option<u16>) {
 //      pub fn new() -> Self {
 //          Self {
 //              heuristics: NetworkHeuristics::new(),
-//              feature_extractor: FeatureExtractor::new(None)
+//              feature_extractor: FeatureExtractor::new()
 //                                     .expect("OnePace.csv init failed"),
 //          }
 //      }

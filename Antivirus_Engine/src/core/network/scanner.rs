@@ -20,7 +20,7 @@ impl NetworkScanner {
     pub fn new() -> Self {
         Self {
             heuristics:        NetworkHeuristics::new(),
-            feature_extractor: FeatureExtractor::new(None)
+            feature_extractor: FeatureExtractor::new()
                 .expect("Failed to initialise OnePace.csv"),
         }
     }

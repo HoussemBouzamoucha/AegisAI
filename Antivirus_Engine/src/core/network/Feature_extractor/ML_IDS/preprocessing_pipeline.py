@@ -77,7 +77,7 @@ EXPECTED_FEATURE_COLS = [
 ]
 
 # Detection thresholds
-THRESHOLD_MALICIOUS  = 0.65
+THRESHOLD_MALICIOUS  = 0.80
 THRESHOLD_SUSPICIOUS = 0.40
 
 # =============================================================================
