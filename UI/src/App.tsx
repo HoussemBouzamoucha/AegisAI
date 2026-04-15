@@ -8,6 +8,7 @@ import ProcessMonitor from './components/ProcessMonitor';
 import NetworkMonitor from './components/NetworkMonitor';
 import MemoryMonitor from './components/MemoryMonitor';
 import History from './components/History';
+import EntityManager from './components/EntityManager';
 
 export default function App() {
   const { view, checkEngine } = useStore();

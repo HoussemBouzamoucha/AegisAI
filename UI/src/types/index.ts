@@ -6,7 +6,7 @@
 
 export type ThreatLevel = 'Clean' | 'Suspicious' | 'Malicious';
 export type ProcessThreat = 'Safe' | 'Suspicious' | 'Malicious' | 'Critical';
-export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history';
+export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history' | 'entities';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // File Classification

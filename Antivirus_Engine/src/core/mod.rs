@@ -3,6 +3,7 @@ pub mod utils;
 
 pub mod action;
 pub mod detection;
+pub mod entity;
 pub mod file_system;
 pub mod memory;
 pub mod network;
