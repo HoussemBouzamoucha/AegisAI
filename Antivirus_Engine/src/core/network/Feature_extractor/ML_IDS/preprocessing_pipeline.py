@@ -15,6 +15,8 @@ import ipaddress
 import json
 import warnings
 import argparse
+import socket
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 warnings.filterwarnings('ignore')
 
@@ -60,6 +62,34 @@ FEATURE_NAMES_47 = [
 
 CAT_COLS = ['proto', 'state', 'service']
 
+# IP prefixes belonging to well-known clean infrastructure.
+# Connections to/from these ranges are never fed to the model.
+CLEAN_PREFIXES = [
+    # Google
+    '8.8.', '8.34.', '8.35.', '34.', '35.', '64.233.', '66.102.',
+    '66.249.', '72.14.', '74.125.', '108.177.', '142.250.', '172.217.',
+    '173.194.', '209.85.', '216.58.', '216.239.',
+    # Microsoft / Azure
+    '13.64.', '13.65.', '13.66.', '13.67.', '13.68.', '13.69.',
+    '13.70.', '13.71.', '13.72.', '13.73.', '13.74.', '13.75.',
+    '20.', '40.', '52.', '104.40.', '104.41.', '104.42.', '104.43.', '104.44.',
+    # Cloudflare
+    '1.1.1.', '1.0.0.', '104.16.', '104.17.', '104.18.', '104.19.',
+    '104.20.', '104.21.', '172.64.', '172.65.', '172.66.', '172.67.',
+    '162.158.', '198.41.',
+    # Apple
+    '17.',
+    # Amazon / AWS
+    '54.', '18.', '3.', '52.', '99.', '205.251.',
+]
+
+def _is_clean_ip(ip: str) -> bool:
+    """Return True if the IP matches a known-clean infrastructure prefix."""
+    ip = ip.strip()
+    if ip.lower().startswith('::ffff:') and '.' in ip:
+        ip = ip[7:]
+    return any(ip.startswith(p) for p in CLEAN_PREFIXES)
+
 # Final 56-feature order expected by the trained model
 EXPECTED_FEATURE_COLS = [
     'sport', 'dsport', 'proto', 'state', 'dur', 'sbytes', 'dbytes',
@@ -78,7 +108,89 @@ EXPECTED_FEATURE_COLS = [
 
 # Detection thresholds
 THRESHOLD_MALICIOUS  = 0.80
-THRESHOLD_SUSPICIOUS = 0.40
+THRESHOLD_SUSPICIOUS = 0.55
+
+# =============================================================================
+# Human-readable label helpers
+# =============================================================================
+
+# Well-known IPs → friendly hostname (avoids a DNS round-trip for common hosts)
+_KNOWN_HOSTS: dict[str, str] = {
+    '127.0.0.1': 'localhost', '::1': 'localhost', '0.0.0.0': 'unspecified',
+    '8.8.8.8':   'dns.google', '8.8.4.4': 'dns.google',
+    '1.1.1.1':   'cloudflare-dns.com', '1.0.0.1': 'cloudflare-dns.com',
+    '9.9.9.9':   'dns.quad9.net',
+    '208.67.222.222': 'resolver1.opendns.com',
+    '192.168.1.1': 'gateway', '192.168.0.1': 'gateway',
+    '10.0.0.1':  'gateway', '172.16.0.1': 'gateway',
+}
+
+# Port → service name for the most common ports
+_PORT_NAMES: dict[int, str] = {
+    20: 'FTP-data', 21: 'FTP', 22: 'SSH', 23: 'Telnet',
+    25: 'SMTP', 53: 'DNS', 67: 'DHCP', 68: 'DHCP',
+    80: 'HTTP', 110: 'POP3', 123: 'NTP', 143: 'IMAP',
+    443: 'HTTPS', 445: 'SMB', 465: 'SMTPS', 514: 'Syslog',
+    587: 'SMTP-sub', 636: 'LDAPS', 993: 'IMAPS', 995: 'POP3S',
+    1080: 'SOCKS', 1194: 'OpenVPN', 1433: 'MSSQL', 1521: 'Oracle',
+    3306: 'MySQL', 3389: 'RDP', 5432: 'PostgreSQL',
+    5900: 'VNC', 6379: 'Redis', 6881: 'BitTorrent',
+    8080: 'HTTP-alt', 8443: 'HTTPS-alt', 8888: 'HTTP-alt',
+    27017: 'MongoDB', 51820: 'WireGuard',
+}
+
+_dns_executor = ThreadPoolExecutor(max_workers=16)
+_dns_cache: dict[str, str] = {}
+
+def _resolve_ip(ip: str) -> str:
+    """Return a friendly hostname for an IP. Cached, 0.5 s DNS timeout."""
+    ip = ip.strip()
+    if not ip or ip in ('*', '0.0.0.0', '::'):
+        return ip
+
+    if ip in _dns_cache:
+        return _dns_cache[ip]
+
+    # Strip IPv4-mapped IPv6 prefix before lookup
+    lookup = ip[7:] if ip.lower().startswith('::ffff:') and '.' in ip else ip
+
+    # Static table first
+    if lookup in _KNOWN_HOSTS:
+        _dns_cache[ip] = _KNOWN_HOSTS[lookup]
+        return _dns_cache[ip]
+
+    # Loopback / link-local shortcut
+    try:
+        addr = ipaddress.ip_address(lookup)
+        if addr.is_loopback:
+            _dns_cache[ip] = 'localhost'
+            return 'localhost'
+        if addr.is_link_local:
+            _dns_cache[ip] = f'link-local ({lookup})'
+            return _dns_cache[ip]
+    except ValueError:
+        pass
+
+    # Reverse DNS with timeout
+    try:
+        future = _dns_executor.submit(socket.gethostbyaddr, lookup)
+        hostname = future.result(timeout=0.5)[0]
+        # Truncate very long FQDNs to keep UI compact
+        if len(hostname) > 40:
+            parts = hostname.split('.')
+            hostname = '.'.join(parts[-3:]) if len(parts) >= 3 else hostname[:40]
+        _dns_cache[ip] = hostname
+    except (FuturesTimeout, OSError, Exception):
+        _dns_cache[ip] = ip   # fall back to raw IP
+
+    return _dns_cache[ip]
+
+
+def _port_label(port: int) -> str:
+    """Return 'SERVICE (port)' for known ports, or just the port number."""
+    name = _PORT_NAMES.get(port)
+    return f'{name} ({port})' if name else str(port)
+
 
 # =============================================================================
 # Helpers
@@ -184,6 +296,103 @@ def run_inference(csv_path: str) -> None:
     if missing:
         _fail(f'CSV is missing columns: {missing}')
 
+    # Split into pcap-captured rows (reliable features) and fallback rows
+    # (OS-table only — packet-level fields are all zero, unreliable for inference).
+    if 'pcap_data' in df.columns:
+        df_pcap     = df[df['pcap_data'] == 1].copy()
+        df_fallback = df[df['pcap_data'] != 1].copy()
+    else:
+        # Older CSV without the column — treat everything as pcap data.
+        df_pcap     = df.copy()
+        df_fallback = df.iloc[0:0].copy()  # empty
+
+    if df_pcap.empty:
+        # No pcap rows yet — return all connections as Clean (no packet data to judge).
+        flows = []
+        for _, row in df_fallback.iterrows():
+            srcip  = str(row.get('srcip',  ''))
+            dstip  = str(row.get('dstip',  ''))
+            sport  = int(row.get('sport',  0) or 0)
+            dsport = int(row.get('dsport', 0) or 0)
+            flows.append({
+                'srcip': srcip, 'dstip': dstip, 'sport': sport, 'dsport': dsport,
+                'proto': str(row.get('proto', '')), 'is_ipv6': False,
+                'prediction': 'Clean', 'probability': 0.0, 'reasons': [],
+                'src_host': _resolve_ip(srcip), 'dst_host': _resolve_ip(dstip),
+                'src_service': _port_label(sport), 'dst_service': _port_label(dsport),
+            })
+        total = len(flows)
+        print(json.dumps({
+            'success': True,
+            'summary': {
+                'total_flows': total, 'clean_flows': total,
+                'suspicious_flows': 0, 'malicious_flows': 0,
+                'malicious_rate': 0.0,
+            },
+            'flows': flows,
+        }))
+        return
+
+    # Filter out private→private connections — internal traffic between local
+    # hosts is almost never malicious and reliably causes false positives.
+    def _is_private(ip: str) -> bool:
+        try:
+            ip = ip.strip()
+            if ip.lower().startswith('::ffff:') and '.' in ip:
+                ip = ip[7:]
+            return ipaddress.ip_address(ip).is_private
+        except ValueError:
+            return False
+
+    both_private = df_pcap['srcip'].astype(str).apply(_is_private) & \
+                   df_pcap['dstip'].astype(str).apply(_is_private)
+    df_private  = df_pcap[both_private].copy()
+    df_pcap     = df_pcap[~both_private].copy()
+
+    def _clean_rows_to_flows(rows_df: 'pd.DataFrame') -> list:
+        out = []
+        for _, row in rows_df.iterrows():
+            srcip  = str(row.get('srcip',  ''))
+            dstip  = str(row.get('dstip',  ''))
+            sport  = int(row.get('sport',  0) or 0)
+            dsport = int(row.get('dsport', 0) or 0)
+            out.append({
+                'srcip': srcip, 'dstip': dstip, 'sport': sport, 'dsport': dsport,
+                'proto': str(row.get('proto', '')), 'is_ipv6': False,
+                'prediction': 'Clean', 'probability': 0.0, 'reasons': [],
+                'src_host': _resolve_ip(srcip), 'dst_host': _resolve_ip(dstip),
+                'src_service': _port_label(sport), 'dst_service': _port_label(dsport),
+            })
+        return out
+
+    if df_pcap.empty:
+        # All pcap flows are private→private, report them as Clean.
+        flows = _clean_rows_to_flows(pd.concat([df_private, df_fallback]))
+        total = len(flows)
+        print(json.dumps({'success': True, 'summary': {
+            'total_flows': total, 'clean_flows': total,
+            'suspicious_flows': 0, 'malicious_flows': 0, 'malicious_rate': 0.0,
+        }, 'flows': flows}))
+        return
+
+    # Whitelist known-clean infrastructure (Google, Microsoft, Cloudflare, etc.).
+    is_clean = df_pcap['srcip'].astype(str).apply(_is_clean_ip) | \
+               df_pcap['dstip'].astype(str).apply(_is_clean_ip)
+    df_whitelisted = df_pcap[is_clean].copy()
+    df_pcap        = df_pcap[~is_clean].copy()
+
+    if df_pcap.empty:
+        flows = _clean_rows_to_flows(pd.concat([df_private, df_whitelisted, df_fallback]))
+        total = len(flows)
+        print(json.dumps({'success': True, 'summary': {
+            'total_flows': total, 'clean_flows': total,
+            'suspicious_flows': 0, 'malicious_flows': 0, 'malicious_rate': 0.0,
+        }, 'flows': flows}))
+        return
+
+    # Run inference only on the pcap-captured rows.
+    df = df_pcap
+
     # ── 2. Load model ─────────────────────────────────────────────────────────
     model_path = MODEL_PATH_CAL if os.path.exists(MODEL_PATH_CAL) else MODEL_PATH_RAW
     if not os.path.exists(model_path):
@@ -281,8 +490,10 @@ def run_inference(csv_path: str) -> None:
         subnet_encoders = joblib.load(SUBNET_ENC_PATH)
         for col in ['src_subnet', 'dst_subnet']:
             le = subnet_encoders[col]
+            # Unknown subnets → 0 (neutral, in-distribution) instead of -1
+            # (which the model never saw during training and treats as anomalous).
             X[col] = X[col].map(
-                lambda x, _le=le: int(_le.transform([x])[0]) if x in _le.classes_ else -1
+                lambda x, _le=le: int(_le.transform([x])[0]) if x in _le.classes_ else 0
             )
     else:
         for col in ['src_subnet', 'dst_subnet']:
@@ -292,8 +503,14 @@ def run_inference(csv_path: str) -> None:
     if os.path.exists(SRC_FREQ_PATH) and os.path.exists(DST_FREQ_PATH):
         src_counts = joblib.load(SRC_FREQ_PATH)
         dst_counts = joblib.load(DST_FREQ_PATH)
+        # Unknown IPs fall back to the training median rather than 0,
+        # so unseen real-world IPs don't look artificially rare/suspicious.
+        src_median_log = float(np.log1p(src_counts.median()))
+        dst_median_log = float(np.log1p(dst_counts.median()))
         X['src_freq'] = np.log1p(X['srcip'].map(src_counts).fillna(0))
         X['dst_freq'] = np.log1p(X['dstip'].map(dst_counts).fillna(0))
+        X['src_freq'] = X['src_freq'].replace(0.0, src_median_log)
+        X['dst_freq'] = X['dst_freq'].replace(0.0, dst_median_log)
     else:
         src_counts = X['srcip'].value_counts()
         dst_counts = X['dstip'].value_counts()
@@ -337,25 +554,58 @@ def run_inference(csv_path: str) -> None:
         _fail(f'Model prediction failed: {e}')
 
     # ── 14. Build JSON output ─────────────────────────────────────────────────
+
+    # Resolve all unique IPs in parallel before building the flow list.
+    all_ips = set(id_cols['srcip'].astype(str).tolist() + id_cols['dstip'].astype(str).tolist())
+    for ip in all_ips:
+        _resolve_ip(ip)   # warms the cache concurrently via the thread pool
+
     flows = []
     for i, (pred, prob) in enumerate(zip(predictions, mal_proba)):
-        srcip = str(id_cols.iloc[i]['srcip'])
-        dstip = str(id_cols.iloc[i]['dstip'])
+        srcip  = str(id_cols.iloc[i]['srcip'])
+        dstip  = str(id_cols.iloc[i]['dstip'])
+        sport  = int(id_cols.iloc[i]['sport'])
+        dsport = int(id_cols.iloc[i]['dsport'])
         is_ipv6 = (':' in srcip and not srcip.lower().startswith('::ffff:')) or \
                   (':' in dstip and not dstip.lower().startswith('::ffff:'))
 
         reasons = _build_reasons(raw_for_reasons.iloc[i], pred, prob) if pred != 'Clean' else []
 
         flows.append({
-            'srcip':       srcip,
-            'dstip':       dstip,
-            'sport':       int(id_cols.iloc[i]['sport']),
-            'dsport':      int(id_cols.iloc[i]['dsport']),
-            'proto':       str(id_cols.iloc[i]['proto']),
-            'is_ipv6':     is_ipv6,
-            'prediction':  pred,
-            'probability': round(float(prob), 4),
-            'reasons':     reasons,
+            'srcip':        srcip,
+            'dstip':        dstip,
+            'sport':        sport,
+            'dsport':       dsport,
+            'proto':        str(id_cols.iloc[i]['proto']),
+            'is_ipv6':      is_ipv6,
+            'prediction':   pred,
+            'probability':  round(float(prob), 4),
+            'reasons':      reasons,
+            'src_host':     _resolve_ip(srcip),
+            'dst_host':     _resolve_ip(dstip),
+            'dst_service':  _port_label(dsport),
+            'src_service':  _port_label(sport),
+        })
+
+    # Add private→private, whitelisted, and fallback rows back as Clean.
+    for _, row in pd.concat([df_private, df_whitelisted, df_fallback]).iterrows():
+        srcip  = str(row.get('srcip',  ''))
+        dstip  = str(row.get('dstip',  ''))
+        sport  = int(row.get('sport',  0) or 0)
+        dsport = int(row.get('dsport', 0) or 0)
+        flows.append({
+            'srcip':  srcip, 'dstip':  dstip,
+            'sport':  sport, 'dsport': dsport,
+            'proto':  str(row.get('proto', '')),
+            'is_ipv6': (':' in srcip and not srcip.lower().startswith('::ffff:')) or
+                       (':' in dstip and not dstip.lower().startswith('::ffff:')),
+            'prediction':  'Clean',
+            'probability': 0.0,
+            'reasons':     [],
+            'src_host':    _resolve_ip(srcip),
+            'dst_host':    _resolve_ip(dstip),
+            'dst_service': _port_label(dsport),
+            'src_service': _port_label(sport),
         })
 
     total      = len(flows)

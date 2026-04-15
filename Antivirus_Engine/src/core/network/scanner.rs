@@ -8,6 +8,7 @@ use crate::core::network::types::{
     enumerate_network_connections, NetworkConnection, NetworkScanStatistics,
 };
 use anyhow::Result;
+use crate::core::types::ThreatLevel;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,8 +41,16 @@ impl NetworkScanner {
         let duration_ms = start.elapsed().as_millis() as u64;
         let stats = NetworkScanStatistics::from_results(&connections, duration_ms);
 
-        // ── UNSW-NB15 feature extraction → OnePace.csv ───────────────────────
-        if let Err(e) = self.feature_extractor.extract_and_append(&connections) {
+        // ── Feature extraction → OnePace.csv (Suspicious only) ───────────────
+        // Clean connections are safe — skip the ML pipeline entirely.
+        // Malicious connections are already flagged by heuristics — ML adds nothing.
+        // Only Suspicious connections need ML confirmation.
+        let suspicious: Vec<NetworkConnection> = connections.iter()
+            .filter(|c| c.threat_level == ThreatLevel::Suspicious)
+            .cloned()
+            .collect();
+
+        if let Err(e) = self.feature_extractor.extract_and_append(&suspicious) {
             eprintln!("[feature_extractor] CSV write error: {e}");
         }
         // ─────────────────────────────────────────────────────────────────────

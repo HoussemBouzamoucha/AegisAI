@@ -58,7 +58,7 @@ Sjit,Djit,Stime,Ltime,Sintpkt,Dintpkt,\
 tcprtt,synack,ackdat,is_sm_ips_ports,ct_state_ttl,\
 ct_flw_http_mthd,is_ftp_login,ct_ftp_cmd,\
 ct_srv_src,ct_srv_dst,ct_dst_ltm,ct_src_ltm,\
-ct_src_dport_ltm,ct_dst_sport_ltm,ct_dst_src_ltm";
+ct_src_dport_ltm,ct_dst_sport_ltm,ct_dst_src_ltm,pcap_data";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tuneable constants
@@ -805,8 +805,9 @@ impl FeatureExtractor {
     pub fn new() -> Result<Arc<Self>> {
         let path = default_csv_path();
 
-        if !path.exists() {
-            // Use BufWriter for the initial header write (Issue 9).
+        // Write an empty (header-only) CSV on startup so the file always exists
+        // with a valid structure before the first scan runs.
+        {
             let f = File::create(&path)
                 .with_context(|| format!("Cannot create {}", path.display()))?;
             let mut w = BufWriter::new(f);
@@ -841,6 +842,13 @@ impl FeatureExtractor {
     /// packet was more than `FLOW_IDLE_SECS` seconds ago are evicted from the
     /// flow table after their row is written — preventing unbounded growth.
     pub fn extract_and_append(&self, connections: &[NetworkConnection]) -> Result<usize> {
+        // Short-circuit: if no suspicious connections were passed in, reset the
+        // CSV to header-only so the ML pipeline sees nothing to classify.
+        if connections.is_empty() {
+            self.write_snapshot(&[])?;
+            return Ok(0);
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -857,6 +865,25 @@ impl FeatureExtractor {
             })
             .collect();
 
+        // Build a canonical key set from the suspicious connections so that
+        // Pass 1 (pcap) only emits rows for flows the heuristics actually flagged.
+        // Without this gate, Pass 1 would dump every pcap-captured flow into the
+        // CSV even when all heuristic-scored connections are clean.
+        let suspicious_keys: std::collections::HashSet<FlowKey> = connections
+            .iter()
+            .map(|c| {
+                let (src, sp) = split_endpoint(&c.local_address);
+                let (dst, dp) = split_endpoint(&c.remote_address);
+                let proto_num: u8 = match c.protocol.to_lowercase().as_str() {
+                    "tcp"  => 6,
+                    "udp"  => 17,
+                    "icmp" => 1,
+                    _      => 0,
+                };
+                FlowKey::new(src, dst, sp.unwrap_or(0), dp.unwrap_or(0), proto_num)
+            })
+            .collect();
+
         // Snapshot the keys first (can't hold a DashMap iterator while removing).
         let keys: Vec<FlowKey> = self.flow_table.iter().map(|e| e.key().clone()).collect();
 
@@ -869,34 +896,41 @@ impl FeatureExtractor {
             let mut covered: std::collections::HashSet<FlowKey> =
                 std::collections::HashSet::new();
 
-            // ── Pass 1: pcap-captured flows ──────────────────────────────────
+            // ── Pass 1: pcap-captured flows (suspicious only) ─────────────────
+            // Only emit pcap rows for flows that the heuristics engine flagged as
+            // Suspicious. This ensures the ML model only sees what heuristics
+            // asked it to confirm — never raw packet data for clean connections.
             for key in &keys {
                 let Some(acc_ref) = self.flow_table.get(key) else { continue };
                 let acc = acc_ref.value();
-                if acc.pkts.is_empty() && acc.src_pkt_count == 0 { continue; }
 
                 let proto_str = proto_name(key.proto).to_string();
-                let svc       = acc.service;
-
                 let live_state = conn_state.get(&(
                     key.src.clone(), key.sport,
                     key.dst.clone(), key.dport,
                     proto_str.clone(),
                 ));
 
-                let state = live_state
-                    .cloned()
-                    .unwrap_or_else(|| acc.state.clone());
-
-                // Eviction: terminated or idle beyond threshold.
+                // Always evaluate eviction so the flow_table doesn't grow without
+                // bound just because a flow was heuristically clean.
                 let is_terminated = live_state.is_none()
                     && (acc.state.contains("FIN")
                         || acc.state.contains("RST")
                         || acc.state.contains("CLO"));
-                let is_idle = (now - acc.ltime()) > FLOW_IDLE_SECS;
+                let is_idle = acc.pkts.is_empty() && acc.src_pkt_count == 0
+                    || (now - acc.ltime()) > FLOW_IDLE_SECS;
                 if is_terminated || (live_state.is_none() && is_idle) {
                     evict_keys.push(key.clone());
                 }
+
+                // Only write a CSV row for flows the heuristics flagged as Suspicious.
+                if !suspicious_keys.contains(key) { continue; }
+                if acc.pkts.is_empty() && acc.src_pkt_count == 0 { continue; }
+
+                let svc = acc.service;
+                let state = live_state
+                    .cloned()
+                    .unwrap_or_else(|| acc.state.clone());
 
                 let is_sm = u8::from(key.src == key.dst || key.sport == key.dport);
                 ctx.push(&key.src, &key.dst, key.sport, key.dport, svc);
@@ -942,7 +976,7 @@ impl FeatureExtractor {
                     ct_dst_src_ltm:    ctx.ct_dst_src_ltm(&key.dst, &key.src),
                 };
                 covered.insert(key.clone());
-                csv_lines.push(row.to_csv_line());
+                csv_lines.push(format!("{},1", row.to_csv_line())); // pcap_data=1
             }
 
             // ── Pass 2: OS-table fallback (no pcap data for this connection) ─
@@ -1010,7 +1044,7 @@ impl FeatureExtractor {
                     ct_dst_sport_ltm:  ctx.ct_dst_sport_ltm(&key.dst, key.sport),
                     ct_dst_src_ltm:    ctx.ct_dst_src_ltm(&key.dst, &key.src),
                 };
-                csv_lines.push(row.to_csv_line());
+                csv_lines.push(format!("{},0", row.to_csv_line())); // pcap_data=0 (fallback)
             }
         } // context_tables lock released here
 
@@ -1079,20 +1113,20 @@ impl FeatureExtractor {
             self.flow_table.remove(&key);
         }
 
-        // Write CSV lines (already buffered via BufWriter in append_lines).
-        self.append_lines(&csv_lines)?;
+        // Overwrite the CSV with header + current snapshot so the model always
+        // sees only the live network state — never stale rows from prior scans.
+        self.write_snapshot(&csv_lines)?;
         Ok(n)
     }
 
     pub fn csv_path(&self) -> &std::path::Path { &self.output_path }
 
-    fn append_lines(&self, lines: &[String]) -> Result<()> {
-        if lines.is_empty() { return Ok(()); }
-        let file = OpenOptions::new()
-            .append(true).create(true)
-            .open(&self.output_path)
-            .with_context(|| format!("Cannot open {}", self.output_path.display()))?;
+    /// Truncate and rewrite the CSV from scratch: header + current rows only.
+    fn write_snapshot(&self, lines: &[String]) -> Result<()> {
+        let file = File::create(&self.output_path)
+            .with_context(|| format!("Cannot write {}", self.output_path.display()))?;
         let mut w = BufWriter::new(file);
+        writeln!(w, "{}", CSV_HEADER)?;
         for line in lines { writeln!(w, "{}", line)?; }
         w.flush()?;
         Ok(())

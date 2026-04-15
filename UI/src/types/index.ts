@@ -237,6 +237,10 @@ export interface MlFlowResult {
   prediction: 'Clean' | 'Suspicious' | 'Malicious';
   probability: number;
   reasons: string[];
+  src_host?: string;
+  dst_host?: string;
+  src_service?: string;
+  dst_service?: string;
 }
 
 export interface MlIdsSummary {

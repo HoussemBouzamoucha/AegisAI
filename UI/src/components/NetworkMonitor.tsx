@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useStore } from '../store';
-import { RefreshCw, Search, ChevronDown, ChevronRight, Link, BrainCircuit, ShieldAlert, ShieldCheck, AlertTriangle, X, Info } from 'lucide-react';
+import { RefreshCw, Search, ChevronDown, ChevronRight, BrainCircuit, ShieldAlert, ShieldCheck, AlertTriangle, X, Info, Cpu, Globe } from 'lucide-react';
 import type { MlFlowResult, MlIdsSummary } from '../types';
 
 function StatCard({ label, value, color, sub }: { label: string; value: string | number; color: string; sub?: string }) {
@@ -171,20 +171,47 @@ function MlResultsPanel({ flows, summary, onClose }: {
                     cursor: flagged ? 'pointer' : 'default',
                   }}
                 >
-                  {/* SRC IP + IPv6 badge */}
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color, display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{flow.srcip}</span>
-                    {flow.is_ipv6 && (
-                      <span style={{ flexShrink: 0, fontSize: 8, padding: '1px 4px', borderRadius: 3, background: 'rgba(139,92,246,0.15)', color: '#a78bfa', fontFamily: 'var(--font-hud)', letterSpacing: '0.05em' }}>
-                        IPv6
+                  {/* SRC IP + hostname + IPv6 badge */}
+                  <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color, display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {flow.src_host && flow.src_host !== flow.srcip ? flow.src_host : flow.srcip}
+                      </span>
+                      {flow.is_ipv6 && (
+                        <span style={{ flexShrink: 0, fontSize: 8, padding: '1px 4px', borderRadius: 3, background: 'rgba(139,92,246,0.15)', color: '#a78bfa', fontFamily: 'var(--font-hud)', letterSpacing: '0.05em' }}>
+                          IPv6
+                        </span>
+                      )}
+                    </span>
+                    {flow.src_host && flow.src_host !== flow.srcip && (
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {flow.srcip}
                       </span>
                     )}
                   </span>
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {flow.dstip}
+                  {/* DST IP + hostname */}
+                  <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {flow.dst_host && flow.dst_host !== flow.dstip ? flow.dst_host : flow.dstip}
+                    </span>
+                    {flow.dst_host && flow.dst_host !== flow.dstip && (
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {flow.dstip}
+                      </span>
+                    )}
                   </span>
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{flow.sport}</span>
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{flow.dsport}</span>
+                  {/* SRC port + service name */}
+                  <span style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                      {flow.src_service && flow.src_service !== String(flow.sport) ? flow.src_service : flow.sport}
+                    </span>
+                  </span>
+                  {/* DST port + service name */}
+                  <span style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                      {flow.dst_service && flow.dst_service !== String(flow.dsport) ? flow.dst_service : flow.dsport}
+                    </span>
+                  </span>
                   <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
                     {flow.proto.toUpperCase()}
                   </span>
@@ -390,6 +417,9 @@ export default function NetworkMonitor() {
             }}
           />
         </div>
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', whiteSpace: 'nowrap' }}>
+          Click flagged rows to see heuristic signals
+        </span>
       </div>
 
       {networkError && (
@@ -424,7 +454,7 @@ export default function NetworkMonitor() {
               return (
                 <div key={`${connection.protocol}-${connection.local_address}-${index}`}>
                   <div
-                    onClick={() => toggleRow(index)}
+                    onClick={() => connection.is_threat && toggleRow(index)}
                     style={{
                       display: 'grid',
                       gridTemplateColumns: '90px 1.4fr 1.4fr 110px 100px 100px 100px 24px',
@@ -433,7 +463,7 @@ export default function NetworkMonitor() {
                       padding: '12px 16px',
                       borderBottom: '1px solid var(--border)',
                       background: connection.is_threat ? `${color}0f` : 'transparent',
-                      cursor: 'pointer',
+                      cursor: connection.is_threat ? 'pointer' : 'default',
                     }}
                   >
                     <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color }}>{connection.protocol.toUpperCase()}</span>
@@ -444,28 +474,50 @@ export default function NetworkMonitor() {
                     <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text)' }}>{connection.process_name ?? '-'}</span>
                     <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontFamily: 'var(--font-mono)', fontSize: 10, color }}>{connection.threat_level}</span>
                     <span style={{ justifySelf: 'end', color: 'var(--text-dim)' }}>
-                      {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      {connection.is_threat && (expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />)}
                     </span>
                   </div>
-                  {expanded && (
-                    <div style={{ padding: '0 16px 16px 106px', display: 'flex', flexDirection: 'column', gap: 10, background: 'var(--surface)' }}>
-                      {connection.detection_signals.length > 0 ? (
-                        <div style={{ display: 'grid', gap: 8 }}>
-                          {connection.detection_signals.map((signal, signalIndex) => (
-                            <div key={signalIndex} style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '10px 12px', background: 'var(--base)', borderRadius: 8, border: '1px solid var(--border)' }}>
-                              <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 24, borderRadius: '50%', background: 'var(--border)', color: 'var(--text-dim)' }}>
-                                <Link size={14} />
-                              </span>
-                              <div style={{ flex: 1 }}>
-                                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text)' }}>{signal.description}</div>
-                                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', marginTop: 3 }}>Source: {signal.source.toUpperCase()} · Score: {signal.score}</div>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
+                  {expanded && connection.is_threat && (
+                    <div style={{
+                      padding: '10px 16px 14px 106px',
+                      background: 'var(--base)',
+                      borderTop: `1px solid ${color}22`,
+                      display: 'flex', flexDirection: 'column', gap: 7,
+                    }}>
+                      {/* Header row */}
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                        <span style={{ fontFamily: 'var(--font-hud)', fontSize: 9, color: 'var(--text-dim)', letterSpacing: '0.1em' }}>
+                          HEURISTIC SIGNALS
+                        </span>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
+                          total score: <span style={{ color }}>{connection.threat_score}</span>
+                        </span>
+                      </div>
+
+                      {connection.detection_signals.length > 0 ? connection.detection_signals.map((signal, si) => {
+                        const srcIcon = signal.source === 'process'
+                          ? <Cpu size={10} color={color} style={{ flexShrink: 0 }} />
+                          : <Globe size={10} color={color} style={{ flexShrink: 0 }} />;
+                        return (
+                          <div key={si} style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                            <span style={{ marginTop: 1 }}>{srcIcon}</span>
+                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text)', flex: 1 }}>
+                              {signal.description}
+                            </span>
+                            <span style={{
+                              flexShrink: 0,
+                              fontFamily: 'var(--font-hud)', fontSize: 9,
+                              padding: '1px 6px', borderRadius: 3,
+                              background: `${color}18`, color,
+                              letterSpacing: '0.05em',
+                            }}>
+                              +{signal.score}
+                            </span>
+                          </div>
+                        );
+                      }) : (
                         <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
-                          No detection signals for this connection.
+                          No heuristic signals recorded.
                         </div>
                       )}
                     </div>
