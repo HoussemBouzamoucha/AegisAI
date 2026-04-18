@@ -259,6 +259,118 @@ export interface MlIdsResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Entity / Graph / Correlate Types  (Step 3 — backend entity pipeline)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type UnifiedThreat = 'Clean' | 'Suspicious' | 'Malicious' | 'Critical';
+export type EntityKind    = 'process' | 'file' | 'network' | 'memory';
+export type EdgeKind =
+  | 'same_process' | 'parent_child' | 'process_opened_file'
+  | 'shared_file_hash' | 'shared_c2' | 'network_owner' | 'memory_injection';
+
+export type AttackPatternName =
+  | 'ProcessInjection' | 'C2Communication' | 'MalwareExecution'
+  | 'LateralMovement'  | 'MultiStageAttack' | 'SuspiciousSpawn';
+
+export interface EntityJoinKeys {
+  pid?:        number;
+  parent_pid?: number;
+  file_path?:  string;
+  file_hash?:  string;
+  remote_ip?:  string;
+  remote_port?: number;
+}
+
+export interface CorrelateEntityNode {
+  entity_id:         string;
+  entity_type:       EntityKind;
+  threat_level:      UnifiedThreat;
+  combined_score:    number;
+  heuristic_score:   number;
+  ml_score?:         number;
+  join_keys:         EntityJoinKeys;
+  detection_signals: DetectionSignal[];
+  label:             string;
+  sub_label?:        string;
+}
+
+export interface JoinReason {
+  type:        'SharedPid' | 'ParentChildChain' | 'SharedRemoteIp' | 'SharedFileHash';
+  pid?:        number;
+  parent_pid?: number;
+  child_pid?:  number;
+  ip?:         string;
+  hash?:       string;
+}
+
+export interface CorrelateCluster {
+  anchor_id:       string;
+  members:         CorrelateEntityNode[];
+  join_reason:     JoinReason;
+  cluster_score:   number;
+  has_threat:      boolean;
+  max_threat_level: UnifiedThreat;
+}
+
+export interface GraphNodeData {
+  entity_id:       string;
+  entity_type:     EntityKind;
+  threat_level:    UnifiedThreat;
+  combined_score:  number;
+  heuristic_score: number;
+  ml_score?:       number;
+  label:           string;
+  sub_label?:      string;
+}
+
+export interface GraphEdgeData {
+  from:      string;
+  to:        string;
+  edge_type: EdgeKind;
+  weight:    number;
+}
+
+export interface AttackChain {
+  chain_id:     string;
+  pattern:      AttackPatternName;
+  node_ids:     string[];
+  chain_score:  number;
+  severity:     UnifiedThreat;
+  description:  string;
+  mitre_tactic: string;
+}
+
+export interface CorrelateGraph {
+  nodes:         GraphNodeData[];
+  edges:         GraphEdgeData[];
+  attack_chains: AttackChain[];
+}
+
+export interface CorrelateStats {
+  total_entities:         number;
+  threat_entities:        number;
+  process_entities:       number;
+  network_entities:       number;
+  memory_entities:        number;
+  total_clusters:         number;
+  threat_clusters:        number;
+  graph_nodes:            number;
+  graph_edges:            number;
+  attack_chains_detected: number;
+  include_memory:         boolean;
+  scan_duration_ms:       number;
+}
+
+export interface CorrelateResult {
+  success:    boolean;
+  entities:   CorrelateEntityNode[];
+  clusters:   CorrelateCluster[];
+  graph:      CorrelateGraph;
+  statistics: CorrelateStats;
+  error?:     string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -34,6 +34,7 @@ export default function App() {
           {view === 'network'   && <NetworkMonitor />}
           {view === 'memory'    && <MemoryMonitor />}
           {view === 'history'   && <History />}
+          {view === 'entities'  && <EntityManager />}
         </main>
       </div>
     </div>

@@ -5,6 +5,7 @@ pub mod action;
 pub mod detection;
 pub mod entity;
 pub mod file_system;
+pub mod graph;
 pub mod memory;
 pub mod network;
 pub mod process;

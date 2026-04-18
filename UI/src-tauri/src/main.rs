@@ -547,6 +547,29 @@ async fn run_ml_ids(csv_path: Option<String>) -> Result<serde_json::Value, Strin
 }
 
 #[tauri::command]
+async fn correlate_entities(
+    include_memory: Option<bool>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id":             next_id(),
+        "cmd":            "correlate",
+        "include_memory": include_memory.unwrap_or(false),
+    });
+    // Memory scan can take up to 120 s; add 60 s overhead for process + network.
+    let timeout = if include_memory.unwrap_or(false) {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(60)
+    };
+    let json = daemon_request(&state, request, timeout)?;
+    if let Some(err) = json["error"].as_str() {
+        return Err(err.to_string());
+    }
+    Ok(json)
+}
+
+#[tauri::command]
 async fn get_engine_status(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
@@ -599,6 +622,7 @@ fn main() {
             check_engine,
             get_engine_status,
             run_ml_ids,
+            correlate_entities,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -8,7 +8,7 @@
 //   System process in wrong location                 +8   (svchost.exe not in system32)
 //   Known malware process name                       +10
 //   Suspicious name pattern                          +5
-//   Zero threads                                     +6   (hollowing / zombie)
+//   Zero threads                                     +6   (hollowing / zombie))
 //   CPU usage > 90%                                  +3   (possible miner)
 //   Memory > 1GB                                     +2
 //   Suspicious command line argument                 +3   per arg, capped at +9

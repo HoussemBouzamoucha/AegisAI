@@ -6,7 +6,7 @@ import type {
   ProcessInfo, ProcessScanResult, ScanHistoryEntry,
   NetworkConnection, NetworkStats, NetworkScanResult,
   MemoryRegion, MemoryStats, MemoryScanResult as MemoryScanResultType,
-  MlIdsResult,
+  MlIdsResult, CorrelateResult,
 } from '../types';
 
 interface AppState {
@@ -47,6 +47,12 @@ interface AppState {
   memoryStats: MemoryStats | null;
   memoryError: string | null;
   scanMemory: (pid?: number) => Promise<void>;
+
+  correlating:      boolean;
+  correlateResult:  CorrelateResult | null;
+  correlateError:   string | null;
+  correlateEntities: (includeMemory?: boolean) => Promise<void>;
+  clearCorrelate:   () => void;
 
   history: ScanHistoryEntry[];
   addHistory: (entry: ScanHistoryEntry) => void;
@@ -297,6 +303,26 @@ export const useStore = create<AppState>((set, get) => ({
       set({ processError: String(e) });
     }
   },
+
+  correlating:     false,
+  correlateResult: null,
+  correlateError:  null,
+
+  correlateEntities: async (includeMemory = false) => {
+    set({ correlating: true, correlateError: null });
+    try {
+      const args: Record<string, unknown> = { includeMemory };
+      const result = await invoke<CorrelateResult>('correlate_entities', args);
+      if (!result.success) throw new Error(result.error ?? 'Correlation failed');
+      set({ correlateResult: result });
+    } catch (e: any) {
+      set({ correlateError: String(e) });
+    } finally {
+      set({ correlating: false });
+    }
+  },
+
+  clearCorrelate: () => set({ correlateResult: null, correlateError: null }),
 
   history: [],
   addHistory: (entry) =>

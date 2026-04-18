@@ -1,0 +1,10 @@
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+# Force MSVC cl.exe for C compilation, overriding any CC env var pointing to GCC
+linker = "link.exe"
+
+[env]
+# Clear CC so zstd-sys and other cc-rs crates use MSVC cl.exe, not mingw gcc
+CC_x86_64_pc_windows_msvc = { value = "cl.exe", force = true }
