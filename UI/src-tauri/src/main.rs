@@ -165,12 +165,12 @@ fn next_id() -> String { REQUEST_ID.fetch_add(1, Ordering::SeqCst).to_string() }
 
 fn get_engine_path() -> PathBuf {
     PathBuf::from(
-        r"C:\Users\houss\Desktop\AegisAI\antivirus_engine\target\release\antivirus.exe"
+        r"C:\Users\houss\Desktop\AegisAI\Antivirus_Engine\target\x86_64-pc-windows-msvc\release\antivirus.exe"
     )
 }
 
 fn get_engine_dir() -> PathBuf {
-    PathBuf::from(r"C:\Users\houss\Desktop\AegisAI\antivirus_engine")
+    PathBuf::from(r"C:\Users\houss\Desktop\AegisAI\Antivirus_Engine")
 }
 
 // ─── Spawn daemon ─────────────────────────────────────────────────────────────

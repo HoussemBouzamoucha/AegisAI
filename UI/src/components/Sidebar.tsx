@@ -1,4 +1,4 @@
-import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi, Activity } from 'lucide-react';
+import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi, Activity, Share2 } from 'lucide-react';
 import { useStore } from '../store';
 import type { View } from '../types';
 
@@ -10,6 +10,7 @@ const NAV: { id: View; label: string; icon: React.ReactNode; }[] = [
   { id: 'network',   label: 'NETWORK',   icon: <Wifi size={18} /> },
   { id: 'memory',    label: 'MEMORY',    icon: <Activity size={18} /> },
   { id: 'history',   label: 'HISTORY',   icon: <ClockIcon size={18} /> },
+  { id: 'graph',     label: 'THREAT GRAPH', icon: <Share2 size={18} /> },
 ];
 
 export default function Sidebar() {

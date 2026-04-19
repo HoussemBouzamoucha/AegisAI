@@ -2,9 +2,9 @@
 target = "x86_64-pc-windows-msvc"
 
 [target.x86_64-pc-windows-msvc]
-# Force MSVC cl.exe for C compilation, overriding any CC env var pointing to GCC
-linker = "link.exe"
+linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\bin\\HostX64\\x64\\link.exe"
 
 [env]
-# Clear CC so zstd-sys and other cc-rs crates use MSVC cl.exe, not mingw gcc
-CC_x86_64_pc_windows_msvc = { value = "cl.exe", force = true }
+CC_x86_64_pc_windows_msvc = "C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\bin\\HostX64\\x64\\cl.exe"
+AR_x86_64_pc_windows_msvc = "C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\bin\\HostX64\\x64\\lib.exe"
+INCLUDE = "C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\include;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\shared;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\um"

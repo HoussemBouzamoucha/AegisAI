@@ -1,16 +1,19 @@
 import { useMemo, useState } from 'react';
 import {
-  Search, ChevronDown, ChevronRight,
+  Search, ChevronDown, ChevronRight, X,
   Cpu, Wifi, HardDrive, FolderOpen,
   GitMerge, ShieldAlert, ShieldCheck, AlertTriangle,
   Info, BrainCircuit, Link2, GitBranch, Globe, FileStack,
-  Zap, Network, Loader,
+  Zap, Network, Loader, Terminal, Hash,
+  Activity, Clock, User, Server, Shield, Lock,
+  Tag, Fingerprint, Flag,
 } from 'lucide-react';
 import { useStore } from '../store';
 import type {
   DetectionSignal, MlFlowResult,
   CorrelateEntityNode, CorrelateCluster, AttackChain,
   UnifiedThreat, EntityKind, AttackPatternName,
+  ProcessInfo, NetworkConnection, MemoryRegion, ScanResult,
 } from '../types';
 
 // ─── Local entity types (client-side view) ────────────────────────────────────
@@ -38,6 +41,11 @@ interface EntityNode {
   join_keys:         JoinKeys;
   label:             string;
   sub_label?:        string;
+  // Raw source data for detail panel
+  rawProcess?:  ProcessInfo;
+  rawNetwork?:  NetworkConnection;
+  rawMemory?:   MemoryRegion;
+  rawFile?:     ScanResult;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -123,8 +131,8 @@ function TypeIcon({ type, size = 12 }: { type: EntityType | EntityKind; size?: n
 
 function TypeBadge({ type }: { type: EntityType | EntityKind }) {
   const t = String(type).toLowerCase();
-  const bg:   Record<string, string> = { process: 'rgba(6,182,212,0.12)',   network: 'rgba(16,185,129,0.12)', memory: 'rgba(245,158,11,0.12)', file: 'rgba(148,163,184,0.1)' };
-  const fg:   Record<string, string> = { process: 'var(--cyan)',             network: 'var(--green)',          memory: 'var(--amber)',          file: 'var(--text-dim)'       };
+  const bg:    Record<string, string> = { process: 'rgba(6,182,212,0.12)',   network: 'rgba(16,185,129,0.12)', memory: 'rgba(245,158,11,0.12)', file: 'rgba(148,163,184,0.1)' };
+  const fg:    Record<string, string> = { process: 'var(--cyan)',             network: 'var(--green)',          memory: 'var(--amber)',          file: 'var(--text-dim)'       };
   const label: Record<string, string> = { process: 'PROCESS', network: 'NETWORK', memory: 'MEMORY', file: 'FILE' };
   return (
     <span style={{
@@ -207,132 +215,508 @@ function JoinKeyChip({ icon, label, value }: { icon: React.ReactNode; label: str
   );
 }
 
-// ─── Flat entity row ──────────────────────────────────────────────────────────
+// ─── Detail Field Row ─────────────────────────────────────────────────────────
 
-function EntityRow({ entity, expanded, onToggle, indent = false }: {
-  entity: EntityNode; expanded: boolean; onToggle: () => void; indent?: boolean;
+function DetailField({ icon, label, value, mono = true, color, copyable = false }: {
+  icon?: React.ReactNode;
+  label: string;
+  value: string | number | null | undefined;
+  mono?: boolean;
+  color?: string;
+  copyable?: boolean;
 }) {
-  const color = threatColor(entity.threat_level);
-  const isClean = entity.threat_level === 'Clean';
+  if (value === null || value === undefined || value === '') return null;
+  const valStr = String(value);
   return (
-    <div style={{ borderBottom: '1px solid var(--border)' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'var(--font-hud)', fontSize: 8, color: 'var(--text-dim)', letterSpacing: '0.08em' }}>
+        {icon}
+        {label}
+      </div>
       <div
-        onClick={() => !isClean && onToggle()}
+        title={copyable ? 'Click to copy' : undefined}
+        onClick={copyable ? () => navigator.clipboard.writeText(valStr) : undefined}
         style={{
-          display: 'grid', gridTemplateColumns: '26px 110px 1fr 160px 140px 26px',
-          gap: 12, alignItems: 'center',
-          padding: `10px ${indent ? 12 : 16}px`,
-          background: !isClean ? `${color}07` : 'transparent',
-          cursor: !isClean ? 'pointer' : 'default',
+          fontFamily: mono ? 'var(--font-mono)' : 'inherit',
+          fontSize: 10, color: color ?? 'var(--text)',
+          wordBreak: 'break-all', lineHeight: 1.5,
+          cursor: copyable ? 'pointer' : 'default',
+          padding: '4px 8px', borderRadius: 4,
+          background: 'var(--base)', border: '1px solid var(--border)',
         }}
       >
-        <span style={{ color: 'var(--text-dim)', justifySelf: 'center' }}>
-          {!isClean && (expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />)}
-        </span>
-        <TypeBadge type={entity.entity_type} />
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
-          <span style={{
-            fontFamily: 'var(--font-mono)', fontSize: 10,
-            color: !isClean ? color : 'var(--text)',
+        {valStr}
+      </div>
+    </div>
+  );
+}
+
+function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ fontFamily: 'var(--font-hud)', fontSize: 9, color: 'var(--text-dim)', letterSpacing: '0.12em', borderBottom: '1px solid var(--border)', paddingBottom: 5 }}>
+        {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function FlagChip({ label, color }: { label: string; color: string }) {
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4,
+      padding: '2px 8px', borderRadius: 4,
+      background: `${color}15`, border: `1px solid ${color}35`,
+      fontFamily: 'var(--font-hud)', fontSize: 8, color, letterSpacing: '0.06em',
+    }}>
+      {label}
+    </span>
+  );
+}
+
+// ─── Entity Detail Panel ──────────────────────────────────────────────────────
+
+function EntityDetailPanel({ entity, onClose }: { entity: EntityNode; onClose: () => void }) {
+  const color   = threatColor(entity.threat_level);
+  const isClean = entity.threat_level === 'Clean';
+  const h       = Math.min(entity.heuristic_score / entity.heuristic_max, 1);
+
+  return (
+    <div style={{
+      width: 340, flexShrink: 0, display: 'flex', flexDirection: 'column',
+      background: 'var(--surface)', border: '1px solid var(--border)',
+      borderRadius: 10, overflow: 'hidden',
+    }}>
+      {/* Panel header */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10,
+        padding: '12px 14px', borderBottom: `1px solid ${color}30`,
+        background: `${color}06`, flexShrink: 0,
+      }}>
+        <div style={{
+          width: 32, height: 32, borderRadius: 7, flexShrink: 0,
+          background: `${color}18`, border: `1px solid ${color}40`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <TypeIcon type={entity.entity_type} size={14} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{
+            fontFamily: 'var(--font-mono)', fontSize: 11,
+            color: isClean ? 'var(--text)' : color,
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }}>{entity.label}</span>
-          {entity.sub_label && (
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {entity.sub_label}
-            </span>
-          )}
-          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 2 }}>
-            {entity.join_keys.pid !== undefined && (
-              <JoinKeyChip icon={<Cpu size={8} />} label="PID" value={entity.join_keys.pid} />
-            )}
-            {entity.join_keys.remote_ip && (
-              <JoinKeyChip icon={<Wifi size={8} />} label="IP" value={entity.join_keys.remote_ip} />
-            )}
-            {entity.join_keys.file_hash && (
-              <JoinKeyChip icon={<Link2 size={8} />} label="SHA256" value={`${entity.join_keys.file_hash.slice(0, 10)}…`} />
-            )}
+          }}>{entity.label}</div>
+          <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+            <TypeBadge type={entity.entity_type} />
+            {isClean
+              ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontFamily: 'var(--font-hud)', fontSize: 8, color: 'var(--green)' }}><ShieldCheck size={8} /> CLEAN</span>
+              : <ThreatBadge level={entity.threat_level} />}
           </div>
         </div>
-        <ScoreBar entity={entity} />
-        <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
-          {!isClean
-            ? <ThreatBadge level={entity.threat_level} />
-            : <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--green)' }}>
-                <ShieldCheck size={10} /> CLEAN
-              </span>}
-        </div>
-        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', textAlign: 'right' }}>
-          {!isClean && entity.detection_signals.length > 0 && `${entity.detection_signals.length}sig`}
-        </span>
+        <button
+          onClick={onClose}
+          style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', cursor: 'pointer', padding: 4, borderRadius: 4, flexShrink: 0 }}
+        >
+          <X size={14} />
+        </button>
       </div>
-      {expanded && !isClean && (
-        <div style={{
-          padding: '12px 16px 14px 52px', background: 'var(--base)',
-          borderTop: `1px solid ${color}22`,
-          display: 'flex', flexDirection: 'column', gap: 10,
-        }}>
+
+      {/* Scrollable body */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+        {/* ── Score Breakdown ─────────────────────────────────────────────── */}
+        <DetailSection title="THREAT SCORES">
+          {/* Visual score bars */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 12px', background: 'var(--base)', borderRadius: 6, border: '1px solid var(--border)' }}>
+            {/* Heuristic */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: 'var(--text-dim)', width: 70, flexShrink: 0 }}>HEURISTIC</span>
+              <div style={{ flex: 1, height: 5, background: 'var(--elevated)', borderRadius: 3, overflow: 'hidden' }}>
+                <div style={{ width: `${h * 100}%`, height: '100%', background: scoreColor(h), borderRadius: 3 }} />
+              </div>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: scoreColor(h), width: 46, textAlign: 'right', flexShrink: 0 }}>
+                {entity.heuristic_score} / {entity.heuristic_max}
+              </span>
+            </div>
+            {/* ML */}
+            {entity.ml_score !== undefined && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: '#a78bfa', width: 70, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <BrainCircuit size={8} /> ML MODEL
+                </span>
+                <div style={{ flex: 1, height: 5, background: 'var(--elevated)', borderRadius: 3, overflow: 'hidden' }}>
+                  <div style={{ width: `${entity.ml_score * 100}%`, height: '100%', background: '#a78bfa', borderRadius: 3 }} />
+                </div>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: '#a78bfa', width: 46, textAlign: 'right', flexShrink: 0 }}>
+                  {(entity.ml_score * 100).toFixed(1)}%
+                </span>
+              </div>
+            )}
+            {/* Combined */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: scoreColor(entity.combined_score), width: 70, flexShrink: 0 }}>COMBINED Σ</span>
+              <div style={{ flex: 1, height: 7, background: 'var(--elevated)', borderRadius: 3, overflow: 'hidden' }}>
+                <div style={{ width: `${entity.combined_score * 100}%`, height: '100%', background: scoreColor(entity.combined_score), borderRadius: 3 }} />
+              </div>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: scoreColor(entity.combined_score), width: 46, textAlign: 'right', flexShrink: 0, fontWeight: 700 }}>
+                {(entity.combined_score * 100).toFixed(1)}%
+              </span>
+            </div>
+          </div>
           {entity.ml_score !== undefined && (
-            <div style={{
-              padding: '8px 12px', background: 'rgba(167,139,250,0.06)',
-              border: '1px solid rgba(167,139,250,0.2)', borderRadius: 6,
-              display: 'flex', gap: 20,
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 9 }}>
-                <span style={{ color: 'var(--text-dim)' }}>HEURISTIC</span>
-                <span style={{ color: scoreColor(entity.heuristic_score / entity.heuristic_max) }}>
-                  {entity.heuristic_score} / {entity.heuristic_max}
-                </span>
-                <span style={{ color: 'var(--text-dim)' }}>× 0.4</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 9 }}>
-                <BrainCircuit size={9} color="#a78bfa" />
-                <span style={{ color: 'var(--text-dim)' }}>ML MODEL</span>
-                <span style={{ color: '#a78bfa' }}>{((entity.ml_score) * 100).toFixed(1)}%</span>
-                <span style={{ color: 'var(--text-dim)' }}>× 0.6</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 9 }}>
-                <span style={{ color: 'var(--text-dim)' }}>COMBINED Σ</span>
-                <span style={{ color: scoreColor(entity.combined_score), fontWeight: 700 }}>
-                  {(entity.combined_score * 100).toFixed(1)}%
-                </span>
-              </div>
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: 'var(--text-dim)', opacity: 0.7 }}>
+              Formula: H×{(0.4).toFixed(1)} + ML×{(0.6).toFixed(1)} when ML available
             </div>
           )}
-          {entity.detection_signals.length > 0 ? (
-            <>
-              <div style={{ fontFamily: 'var(--font-hud)', fontSize: 9, color: 'var(--text-dim)', letterSpacing: '0.1em' }}>
-                DETECTION SIGNALS
-              </div>
-              {entity.detection_signals.map((sig, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-                  <Info size={10} color={color} style={{ flexShrink: 0, marginTop: 1 }} />
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text)', flex: 1 }}>
-                    {sig.description}
-                  </span>
-                  <span style={{ flexShrink: 0, fontFamily: 'var(--font-hud)', fontSize: 9, padding: '1px 6px', borderRadius: 3, background: `${color}18`, color }}>
-                    +{sig.score}
-                  </span>
-                  <span style={{ flexShrink: 0, fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
-                    [{sig.source}]
-                  </span>
-                </div>
-              ))}
-            </>
-          ) : (
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
-              No detection signals recorded.
-            </span>
+        </DetailSection>
+
+        {/* ── Identity ────────────────────────────────────────────────────── */}
+        <DetailSection title="IDENTITY">
+          <DetailField icon={<Fingerprint size={8} />} label="ENTITY ID" value={entity.entity_id} copyable />
+          {entity.sub_label && (
+            <DetailField icon={<Tag size={8} />} label="SUB LABEL" value={entity.sub_label} />
           )}
+        </DetailSection>
+
+        {/* ── Join Keys ───────────────────────────────────────────────────── */}
+        {(entity.join_keys.pid !== undefined ||
+          entity.join_keys.parent_pid !== undefined ||
+          entity.join_keys.remote_ip ||
+          entity.join_keys.remote_port !== undefined ||
+          entity.join_keys.file_path ||
+          entity.join_keys.file_hash) && (
+          <DetailSection title="JOIN KEYS">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {entity.join_keys.pid !== undefined && (
+                <DetailField icon={<Cpu size={8} />} label="PID" value={entity.join_keys.pid} />
+              )}
+              {entity.join_keys.parent_pid !== undefined && (
+                <DetailField icon={<GitBranch size={8} />} label="PARENT PID" value={entity.join_keys.parent_pid} />
+              )}
+              {entity.join_keys.remote_ip && (
+                <DetailField icon={<Globe size={8} />} label="REMOTE IP" value={entity.join_keys.remote_ip} copyable />
+              )}
+              {entity.join_keys.remote_port !== undefined && (
+                <DetailField icon={<Server size={8} />} label="REMOTE PORT" value={entity.join_keys.remote_port} />
+              )}
+              {entity.join_keys.file_path && (
+                <DetailField icon={<FolderOpen size={8} />} label="FILE PATH" value={entity.join_keys.file_path} copyable />
+              )}
+              {entity.join_keys.file_hash && (
+                <DetailField icon={<Hash size={8} />} label="FILE HASH (SHA256)" value={entity.join_keys.file_hash} copyable />
+              )}
+            </div>
+          </DetailSection>
+        )}
+
+        {/* ── Process-specific fields ─────────────────────────────────────── */}
+        {entity.rawProcess && (
+          <>
+            <DetailSection title="PROCESS ATTRIBUTES">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <DetailField icon={<Cpu size={8} />}      label="NAME"       value={entity.rawProcess.name} />
+                <DetailField icon={<FolderOpen size={8} />} label="EXE PATH" value={entity.rawProcess.exe_path} copyable />
+                <DetailField icon={<Terminal size={8} />} label="COMMAND LINE" value={entity.rawProcess.command_line} copyable />
+                <DetailField icon={<Activity size={8} />} label="STATUS"     value={entity.rawProcess.status} />
+                <DetailField icon={<User size={8} />}     label="USER"       value={entity.rawProcess.user} />
+              </div>
+            </DetailSection>
+
+            <DetailSection title="RESOURCE USAGE">
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                {[
+                  { label: 'CPU', value: `${entity.rawProcess.cpu_usage.toFixed(2)}%`, color: entity.rawProcess.cpu_usage > 50 ? 'var(--amber)' : 'var(--text)' },
+                  { label: 'MEMORY', value: `${entity.rawProcess.memory_mb} MB` },
+                  { label: 'VIRTUAL MEM', value: `${entity.rawProcess.virtual_memory_mb} MB` },
+                  { label: 'THREADS', value: entity.rawProcess.thread_count },
+                  { label: 'HANDLES', value: entity.rawProcess.handle_count ?? 'N/A' },
+                  { label: 'MODULES', value: entity.rawProcess.module_count ?? 'N/A' },
+                ].map(({ label, value, color }) => (
+                  <div key={label} style={{ padding: '6px 8px', background: 'var(--base)', borderRadius: 5, border: '1px solid var(--border)' }}>
+                    <div style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', letterSpacing: '0.08em', marginBottom: 3 }}>{label}</div>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: color ?? 'var(--text)', fontWeight: 600 }}>{String(value)}</div>
+                  </div>
+                ))}
+              </div>
+            </DetailSection>
+
+            {entity.rawProcess.anomaly_flags.length > 0 && (
+              <DetailSection title="ANOMALY FLAGS">
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {entity.rawProcess.anomaly_flags.map((flag) => {
+                    const flagColor =
+                      flag === 'hollow' || flag === 'packed' ? 'var(--red)'
+                      : flag === 'temp_dir' || flag === 'no_path' ? 'var(--amber)'
+                      : 'var(--cyan)';
+                    return <FlagChip key={flag} label={flag.toUpperCase()} color={flagColor} />;
+                  })}
+                </div>
+              </DetailSection>
+            )}
+
+            {entity.rawProcess.start_time !== null && entity.rawProcess.start_time !== undefined && (
+              <DetailSection title="TIMING">
+                <DetailField
+                  icon={<Clock size={8} />}
+                  label="STARTED"
+                  value={new Date(entity.rawProcess.start_time * 1000).toLocaleString()}
+                />
+              </DetailSection>
+            )}
+          </>
+        )}
+
+        {/* ── Network-specific fields ─────────────────────────────────────── */}
+        {entity.rawNetwork && (
+          <DetailSection title="NETWORK ATTRIBUTES">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                {[
+                  { label: 'PROTOCOL',   value: entity.rawNetwork.protocol.toUpperCase() },
+                  { label: 'STATE',      value: entity.rawNetwork.state },
+                  { label: 'PROCESS',    value: entity.rawNetwork.process_name ?? 'N/A' },
+                  { label: 'OWNER PID',  value: entity.rawNetwork.pid ?? 'N/A' },
+                ].map(({ label, value }) => (
+                  <div key={label} style={{ padding: '6px 8px', background: 'var(--base)', borderRadius: 5, border: '1px solid var(--border)' }}>
+                    <div style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', letterSpacing: '0.08em', marginBottom: 3 }}>{label}</div>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text)', fontWeight: 600 }}>{String(value)}</div>
+                  </div>
+                ))}
+              </div>
+              <DetailField icon={<Server size={8} />} label="LOCAL ADDRESS"  value={entity.rawNetwork.local_address} copyable />
+              <DetailField icon={<Globe size={8} />}  label="REMOTE ADDRESS" value={entity.rawNetwork.remote_address} copyable />
+            </div>
+          </DetailSection>
+        )}
+
+        {/* ── Memory-specific fields ──────────────────────────────────────── */}
+        {entity.rawMemory && (
+          <>
+            <DetailSection title="MEMORY REGION ATTRIBUTES">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  {[
+                    { label: 'REGION START', value: `0x${entity.rawMemory.region_start.toString(16).toUpperCase()}` },
+                    { label: 'SIZE',         value: `${(entity.rawMemory.region_size / 1024).toFixed(1)} KB` },
+                    { label: 'PROTECTION',   value: entity.rawMemory.protection },
+                    { label: 'PROCESS',      value: entity.rawMemory.process_name },
+                    { label: 'PID',          value: entity.rawMemory.pid },
+                  ].map(({ label, value }) => (
+                    <div key={label} style={{ padding: '6px 8px', background: 'var(--base)', borderRadius: 5, border: '1px solid var(--border)' }}>
+                      <div style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', letterSpacing: '0.08em', marginBottom: 3 }}>{label}</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text)', fontWeight: 600 }}>{String(value)}</div>
+                    </div>
+                  ))}
+                </div>
+                {entity.rawMemory.process_path && (
+                  <DetailField icon={<FolderOpen size={8} />} label="PROCESS PATH" value={entity.rawMemory.process_path} copyable />
+                )}
+                {entity.rawMemory.command_line && (
+                  <DetailField icon={<Terminal size={8} />} label="COMMAND LINE" value={entity.rawMemory.command_line} copyable />
+                )}
+              </div>
+            </DetailSection>
+
+            <DetailSection title="MEMORY FLAGS">
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {[
+                  { label: 'EXEC',      active: entity.rawMemory.is_executable, color: 'var(--red)' },
+                  { label: 'WRITE',     active: entity.rawMemory.is_writable,   color: 'var(--amber)' },
+                  { label: 'READ',      active: entity.rawMemory.is_readable,   color: 'var(--cyan)' },
+                  { label: 'COMMITTED', active: entity.rawMemory.is_committed,  color: 'var(--green)' },
+                  { label: 'PRIVATE',   active: entity.rawMemory.is_private,    color: 'var(--cyan)' },
+                ].map(({ label, active, color }) => (
+                  <span key={label} style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 4,
+                    padding: '2px 8px', borderRadius: 4,
+                    background: active ? `${color}15` : 'var(--elevated)',
+                    border: `1px solid ${active ? `${color}35` : 'var(--border)'}`,
+                    fontFamily: 'var(--font-hud)', fontSize: 8,
+                    color: active ? color : 'var(--text-dim)',
+                  }}>
+                    <Lock size={7} />
+                    {label}
+                  </span>
+                ))}
+              </div>
+            </DetailSection>
+
+            {entity.rawMemory.content_sample && (
+              <DetailSection title="CONTENT SAMPLE">
+                <div style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--amber)',
+                  padding: '8px 10px', background: 'rgba(245,158,11,0.06)',
+                  border: '1px solid rgba(245,158,11,0.2)', borderRadius: 6,
+                  wordBreak: 'break-all', lineHeight: 1.6, maxHeight: 80, overflowY: 'auto',
+                }}>
+                  {entity.rawMemory.content_sample}
+                </div>
+              </DetailSection>
+            )}
+          </>
+        )}
+
+        {/* ── File-specific fields ────────────────────────────────────────── */}
+        {entity.rawFile && (
+          <>
+            <DetailSection title="FILE ATTRIBUTES">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <DetailField icon={<FolderOpen size={8} />} label="PATH"      value={entity.rawFile.path} copyable />
+                <DetailField icon={<Hash size={8} />}       label="SHA256"    value={entity.rawFile.hash} copyable />
+                <DetailField icon={<Shield size={8} />}     label="SIGNATURE" value={entity.rawFile.signature} />
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  {[
+                    { label: 'CATEGORY',   value: entity.rawFile.file_category.replace('_', ' ').toUpperCase() },
+                    { label: 'CONFIDENCE', value: `${(entity.rawFile.confidence_score * 100).toFixed(1)}%` },
+                  ].map(({ label, value }) => (
+                    <div key={label} style={{ padding: '6px 8px', background: 'var(--base)', borderRadius: 5, border: '1px solid var(--border)' }}>
+                      <div style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', letterSpacing: '0.08em', marginBottom: 3 }}>{label}</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text)', fontWeight: 600 }}>{value}</div>
+                    </div>
+                  ))}
+                </div>
+                {entity.rawFile.reason && (
+                  <div style={{
+                    padding: '7px 10px', background: 'var(--base)', borderRadius: 5,
+                    border: '1px solid var(--border)',
+                    fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text)',
+                    lineHeight: 1.5,
+                  }}>
+                    <div style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', letterSpacing: '0.08em', marginBottom: 4 }}>REASON</div>
+                    {entity.rawFile.reason}
+                  </div>
+                )}
+              </div>
+            </DetailSection>
+
+            {entity.rawFile.context_flags.length > 0 && (
+              <DetailSection title="CONTEXT FLAGS">
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {entity.rawFile.context_flags.map((flag) => (
+                    <FlagChip key={flag} label={flag.replace(/_/g, ' ').toUpperCase()} color="var(--amber)" />
+                  ))}
+                </div>
+              </DetailSection>
+            )}
+          </>
+        )}
+
+        {/* ── Detection Signals ───────────────────────────────────────────── */}
+        {entity.detection_signals.length > 0 && (
+          <DetailSection title={`DETECTION SIGNALS (${entity.detection_signals.length})`}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {entity.detection_signals.map((sig, i) => {
+                const sigColor = sig.score >= 8 ? 'var(--red)' : sig.score >= 5 ? 'var(--amber)' : 'var(--cyan)';
+                return (
+                  <div key={i} style={{
+                    padding: '7px 10px', borderRadius: 6,
+                    background: `${sigColor}06`, border: `1px solid ${sigColor}25`,
+                    display: 'flex', flexDirection: 'column', gap: 4,
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <Info size={9} color={sigColor} style={{ flexShrink: 0 }} />
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text)', flex: 1, lineHeight: 1.5 }}>
+                        {sig.description}
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, paddingLeft: 17 }}>
+                      <span style={{ fontFamily: 'var(--font-hud)', fontSize: 8, padding: '1px 6px', borderRadius: 3, background: `${sigColor}20`, color: sigColor }}>
+                        +{sig.score}
+                      </span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: 'var(--text-dim)' }}>
+                        source: {sig.source}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </DetailSection>
+        )}
+
+        {entity.detection_signals.length === 0 && entity.threat_level === 'Clean' && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px', borderRadius: 6, background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.2)' }}>
+            <ShieldCheck size={12} color="var(--green)" />
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--green)' }}>No threats detected for this entity</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Flat entity row ──────────────────────────────────────────────────────────
+
+function EntityRow({ entity, selected, onSelect, indent = false }: {
+  entity: EntityNode; selected: boolean; onSelect: () => void; indent?: boolean;
+}) {
+  const color   = threatColor(entity.threat_level);
+  const isClean = entity.threat_level === 'Clean';
+  return (
+    <div
+      onClick={onSelect}
+      style={{
+        display: 'grid', gridTemplateColumns: '110px 1fr 160px 140px 26px',
+        gap: 12, alignItems: 'center',
+        padding: `10px ${indent ? 12 : 16}px`,
+        background: selected
+          ? `${color}14`
+          : !isClean ? `${color}07` : 'transparent',
+        cursor: 'pointer',
+        borderBottom: '1px solid var(--border)',
+        borderLeft: selected ? `3px solid ${color}` : '3px solid transparent',
+        transition: 'background 0.12s',
+      }}
+    >
+      <TypeBadge type={entity.entity_type} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: 10,
+          color: !isClean ? color : 'var(--text)',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>{entity.label}</span>
+        {entity.sub_label && (
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {entity.sub_label}
+          </span>
+        )}
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 2 }}>
+          {entity.join_keys.pid !== undefined && (
+            <JoinKeyChip icon={<Cpu size={8} />} label="PID" value={entity.join_keys.pid} />
+          )}
+          {entity.join_keys.remote_ip && (
+            <JoinKeyChip icon={<Wifi size={8} />} label="IP" value={entity.join_keys.remote_ip} />
+          )}
+          {entity.join_keys.file_hash && (
+            <JoinKeyChip icon={<Link2 size={8} />} label="SHA256" value={`${entity.join_keys.file_hash.slice(0, 10)}…`} />
+          )}
+          {entity.rawProcess?.anomaly_flags?.map((f) => (
+            <span key={f} style={{ display: 'inline-flex', alignItems: 'center', gap: 3, padding: '1px 5px', borderRadius: 3, background: 'rgba(255,51,85,0.12)', fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--red)' }}>
+              <Flag size={7} />{f}
+            </span>
+          ))}
         </div>
-      )}
+      </div>
+      <ScoreBar entity={entity} />
+      <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
+        {!isClean
+          ? <ThreatBadge level={entity.threat_level} />
+          : <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--green)' }}>
+              <ShieldCheck size={10} /> CLEAN
+            </span>}
+      </div>
+      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', textAlign: 'right' }}>
+        {entity.detection_signals.length > 0 && `${entity.detection_signals.length}sig`}
+      </span>
     </div>
   );
 }
 
 // ─── Client-side PID cluster row ──────────────────────────────────────────────
 
-function PidClusterRow({ pid, entities, expandedIds }: {
-  pid: number; entities: EntityNode[]; expandedIds: Set<string>;
+function PidClusterRow({ pid, entities, selectedId, onSelect }: {
+  pid: number; entities: EntityNode[]; selectedId: string | null; onSelect: (e: EntityNode) => void;
 }) {
   const [open, setOpen] = useState(false);
   const maxThreat = entities.reduce<UnifiedThreat>((best, e) => {
@@ -378,7 +762,7 @@ function PidClusterRow({ pid, entities, expandedIds }: {
       {open && (
         <div style={{ paddingLeft: 32, borderTop: `1px solid ${color}20` }}>
           {entities.map((e) => (
-            <EntityRow key={e.entity_id} entity={e} expanded={expandedIds.has(e.entity_id)} onToggle={() => {}} indent />
+            <EntityRow key={e.entity_id} entity={e} selected={selectedId === e.entity_id} onSelect={() => onSelect(e)} indent />
           ))}
         </div>
       )}
@@ -438,31 +822,63 @@ function BackendClusterRow({ cluster }: { cluster: CorrelateCluster }) {
       </div>
       {open && (
         <div style={{ paddingLeft: 32, borderTop: `1px solid ${color}20` }}>
-          {cluster.members.map((m) => (
-            <div key={m.entity_id} style={{
-              display: 'flex', alignItems: 'center', gap: 12,
-              padding: '8px 16px', borderBottom: '1px solid var(--border)',
-              background: m.threat_level !== 'Clean' ? `${threatColor(m.threat_level)}06` : 'transparent',
-            }}>
-              <TypeBadge type={m.entity_type} />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{
-                  fontFamily: 'var(--font-mono)', fontSize: 10,
-                  color: m.threat_level !== 'Clean' ? threatColor(m.threat_level) : 'var(--text)',
-                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                }}>{m.label}</div>
-                {m.sub_label && (
-                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {m.sub_label}
+          {cluster.members.map((m) => {
+            const nc = threatColor(m.threat_level);
+            return (
+              <div key={m.entity_id} style={{
+                display: 'flex', alignItems: 'center', gap: 12,
+                padding: '8px 16px', borderBottom: '1px solid var(--border)',
+                background: m.threat_level !== 'Clean' ? `${nc}06` : 'transparent',
+              }}>
+                <TypeBadge type={m.entity_type} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{
+                    fontFamily: 'var(--font-mono)', fontSize: 10,
+                    color: m.threat_level !== 'Clean' ? nc : 'var(--text)',
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>{m.label}</div>
+                  {m.sub_label && (
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {m.sub_label}
+                    </div>
+                  )}
+                  {/* Inline join keys for backend members */}
+                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 3 }}>
+                    {m.join_keys.pid !== undefined && (
+                      <JoinKeyChip icon={<Cpu size={7} />} label="PID" value={m.join_keys.pid} />
+                    )}
+                    {m.join_keys.remote_ip && (
+                      <JoinKeyChip icon={<Globe size={7} />} label="IP" value={m.join_keys.remote_ip} />
+                    )}
+                    {m.join_keys.file_hash && (
+                      <JoinKeyChip icon={<Hash size={7} />} label="SHA256" value={`${m.join_keys.file_hash.slice(0, 8)}…`} />
+                    )}
                   </div>
-                )}
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+                  {/* Mini score bars */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 7, color: 'var(--text-dim)' }}>H</span>
+                    <div style={{ width: 50, height: 3, background: 'var(--elevated)', borderRadius: 2 }}>
+                      <div style={{ width: `${Math.min(m.heuristic_score / 40, 1) * 100}%`, height: '100%', background: scoreColor(m.heuristic_score / 40), borderRadius: 2 }} />
+                    </div>
+                    {m.ml_score !== undefined && (
+                      <>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 7, color: '#a78bfa' }}>ML</span>
+                        <div style={{ width: 50, height: 3, background: 'var(--elevated)', borderRadius: 2 }}>
+                          <div style={{ width: `${m.ml_score * 100}%`, height: '100%', background: '#a78bfa', borderRadius: 2 }} />
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  <span style={{ fontFamily: 'var(--font-hud)', fontSize: 11, color: scoreColor(m.combined_score), fontWeight: 700 }}>
+                    {(m.combined_score * 100).toFixed(0)}%
+                  </span>
+                  <ThreatBadge level={m.threat_level} />
+                </div>
               </div>
-              <span style={{ fontFamily: 'var(--font-hud)', fontSize: 10, color: scoreColor(m.combined_score), fontWeight: 700 }}>
-                {(m.combined_score * 100).toFixed(0)}%
-              </span>
-              <ThreatBadge level={m.threat_level} />
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -485,7 +901,6 @@ function AttackChainCard({ chain, nodeMap }: {
       border: `1px solid ${color}30`, borderRadius: 8,
       background: `${color}06`, overflow: 'hidden',
     }}>
-      {/* Header */}
       <div
         onClick={() => setOpen((p) => !p)}
         style={{
@@ -527,7 +942,6 @@ function AttackChainCard({ chain, nodeMap }: {
         </div>
       </div>
 
-      {/* Expanded */}
       {open && (
         <div style={{ borderTop: `1px solid ${color}20`, padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 10 }}>
           {/* MITRE */}
@@ -598,7 +1012,7 @@ export default function EntityManager() {
   const [threatFilter,  setThreatFilter] = useState<ThreatFilter>('all');
   const [viewMode,      setViewMode]     = useState<ViewMode>('flat');
   const [search,        setSearch]       = useState('');
-  const [expandedIds,   setExpandedIds]  = useState<Set<string>>(new Set());
+  const [selectedEntity, setSelectedEntity] = useState<EntityNode | null>(null);
   const [includeMemory, setIncludeMemory] = useState(false);
 
   // ── Build client-side entity nodes from store ──────────────────────────────
@@ -615,6 +1029,7 @@ export default function EntityManager() {
         detection_signals: p.detection_signals,
         join_keys: { pid: p.pid, parent_pid: p.parent_pid ?? undefined, file_path: p.exe_path ?? undefined },
         label: p.name, sub_label: p.exe_path ?? undefined,
+        rawProcess: p,
       });
     });
 
@@ -630,6 +1045,7 @@ export default function EntityManager() {
         join_keys: { pid: conn.pid ?? undefined, remote_ip: parsed?.ip, remote_port: parsed?.port },
         label: `${conn.protocol.toUpperCase()} → ${conn.remote_address}`,
         sub_label: conn.process_name ? `${conn.process_name} · ${conn.state}` : conn.state,
+        rawNetwork: conn,
       });
     });
 
@@ -643,6 +1059,7 @@ export default function EntityManager() {
         join_keys: { pid: r.pid },
         label: `${r.process_name} @ 0x${r.region_start.toString(16).toUpperCase()}`,
         sub_label: `${r.protection} · size: ${(r.region_size / 1024).toFixed(1)} KB`,
+        rawMemory: r,
       });
     });
 
@@ -656,6 +1073,7 @@ export default function EntityManager() {
         detection_signals: f.detection_signals,
         join_keys: { file_path: f.path, file_hash: f.hash ?? undefined },
         label: fileName, sub_label: f.path,
+        rawFile: f,
       });
     });
 
@@ -732,16 +1150,14 @@ export default function EntityManager() {
     return m;
   }, [correlateResult]);
 
-  const toggleExpand = (id: string) => {
-    setExpandedIds((prev) => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
-    });
-  };
-
   const noData     = entities.length === 0;
   const hasBackend = !!correlateResult;
+
+  // Deselect when view changes
+  const handleViewMode = (mode: ViewMode) => {
+    setViewMode(mode);
+    setSelectedEntity(null);
+  };
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: 32, gap: 24, overflow: 'hidden' }}>
@@ -831,7 +1247,7 @@ export default function EntityManager() {
             { key: 'clusters',     label: hasBackend ? `CLUSTERS (${stats.backendClusters})` : `CLUSTERS (${clientClusters.length})` },
             { key: 'attack_chains', label: `ATTACK CHAINS (${stats.chains})` },
           ] as const).map(({ key, label }) => (
-            <button key={key} onClick={() => setViewMode(key)} style={{
+            <button key={key} onClick={() => handleViewMode(key)} style={{
               padding: '5px 11px', borderRadius: 5, fontSize: 9, fontFamily: 'var(--font-hud)',
               border: `1px solid ${viewMode === key ? 'var(--border-md)' : 'transparent'}`,
               background: viewMode === key ? (key === 'attack_chains' ? 'rgba(255,51,85,0.08)' : 'var(--green-glow)') : 'transparent',
@@ -893,173 +1309,205 @@ export default function EntityManager() {
       </div>
 
       {/* Table header (flat only) */}
-      {viewMode === 'flat' && filtered.length > 0 && (
+      {viewMode === 'flat' && filtered.length > 0 && !selectedEntity && (
         <div style={{
-          display: 'grid', gridTemplateColumns: '26px 110px 1fr 160px 140px 26px',
+          display: 'grid', gridTemplateColumns: '110px 1fr 160px 140px 26px',
           gap: 12, padding: '6px 16px',
           fontFamily: 'var(--font-hud)', fontSize: 9, color: 'var(--text-dim)', letterSpacing: '0.1em',
           background: 'var(--base)', border: '1px solid var(--border)', borderRadius: '8px 8px 0 0',
           flexShrink: 0,
         }}>
-          {['', 'TYPE', 'ENTITY / ATTRIBUTES', 'SCORE  (H · ML · Σ)', 'VERDICT', ''].map((h) => (
+          {['TYPE', 'ENTITY / ATTRIBUTES', 'SCORE  (H · ML · Σ)', 'VERDICT', ''].map((h) => (
+            <span key={h}>{h}</span>
+          ))}
+        </div>
+      )}
+      {viewMode === 'flat' && filtered.length > 0 && selectedEntity && (
+        <div style={{
+          display: 'grid', gridTemplateColumns: '110px 1fr 160px 140px 26px',
+          gap: 12, padding: '6px 16px',
+          fontFamily: 'var(--font-hud)', fontSize: 9, color: 'var(--text-dim)', letterSpacing: '0.1em',
+          background: 'var(--base)', border: '1px solid var(--border)', borderRadius: '8px 8px 0 0',
+          flexShrink: 0,
+        }}>
+          {['TYPE', 'ENTITY / ATTRIBUTES', 'SCORE  (H · ML · Σ)', 'VERDICT', ''].map((h) => (
             <span key={h}>{h}</span>
           ))}
         </div>
       )}
 
-      {/* Main content */}
-      <div style={{
-        flex: 1, overflowY: 'auto',
-        background: 'var(--surface)', border: '1px solid var(--border)',
-        borderRadius: viewMode === 'flat' && filtered.length > 0 ? '0 0 8px 8px' : 8,
-        marginTop: viewMode === 'flat' && filtered.length > 0 ? -1 : 0,
-      }}>
+      {/* Main content: list + optional detail panel */}
+      <div style={{ flex: 1, display: 'flex', gap: 12, overflow: 'hidden', minHeight: 0 }}>
 
-        {/* ── No data placeholder ──────────────────────────────────────────── */}
-        {noData && viewMode !== 'attack_chains' && (
-          <div style={{
-            display: 'flex', flexDirection: 'column', alignItems: 'center',
-            justifyContent: 'center', height: '100%', gap: 12,
-          }}>
-            <GitMerge size={32} color="var(--text-dim)" style={{ opacity: 0.4 }} />
-            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-dim)' }}>No entity data yet</div>
-            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)', opacity: 0.6 }}>
-              Run a scan from Processes, Network, Memory, or Scanner
+        {/* List column */}
+        <div style={{
+          flex: 1, overflowY: 'auto',
+          background: 'var(--surface)', border: '1px solid var(--border)',
+          borderRadius: viewMode === 'flat' && filtered.length > 0 ? '0 0 8px 8px' : 8,
+          marginTop: viewMode === 'flat' && filtered.length > 0 ? -1 : 0,
+          minWidth: 0,
+        }}>
+
+          {/* ── No data placeholder ──────────────────────────────────────────── */}
+          {noData && viewMode !== 'attack_chains' && (
+            <div style={{
+              display: 'flex', flexDirection: 'column', alignItems: 'center',
+              justifyContent: 'center', height: '100%', gap: 12,
+            }}>
+              <GitMerge size={32} color="var(--text-dim)" style={{ opacity: 0.4 }} />
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-dim)' }}>No entity data yet</div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)', opacity: 0.6 }}>
+                Run a scan from Processes, Network, Memory, or Scanner
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* ── Flat list ────────────────────────────────────────────────────── */}
-        {!noData && viewMode === 'flat' && (
-          filtered.length === 0 ? (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 120, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-              No entities match the current filter
-            </div>
-          ) : (
-            filtered.map((entity) => (
-              <EntityRow
-                key={entity.entity_id} entity={entity}
-                expanded={expandedIds.has(entity.entity_id)}
-                onToggle={() => toggleExpand(entity.entity_id)}
-              />
-            ))
-          )
-        )}
-
-        {/* ── Cluster view ─────────────────────────────────────────────────── */}
-        {viewMode === 'clusters' && !noData && (
-          hasBackend ? (
-            backendClusters.length === 0 ? (
-              <div style={{
-                display: 'flex', flexDirection: 'column', alignItems: 'center',
-                justifyContent: 'center', height: 180, gap: 8,
-              }}>
-                <GitMerge size={24} color="var(--text-dim)" style={{ opacity: 0.4 }} />
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-                  No correlated clusters found
-                </div>
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', opacity: 0.6 }}>
-                  Run CORRELATE to analyse cross-scanner relationships
-                </div>
+          {/* ── Flat list ────────────────────────────────────────────────────── */}
+          {!noData && viewMode === 'flat' && (
+            filtered.length === 0 ? (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 120, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)' }}>
+                No entities match the current filter
               </div>
             ) : (
-              <>
-                <div style={{
-                  display: 'flex', alignItems: 'center', gap: 8,
-                  padding: '8px 16px', borderBottom: '1px solid var(--border)',
-                  background: 'rgba(99,102,241,0.06)',
-                }}>
-                  <GitMerge size={11} color="#818cf8" />
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: '#818cf8' }}>
-                    Backend correlation active · {backendClusters.length} clusters · 4 strategies (PID, ParentChild, SharedIP, FileHash)
-                  </span>
-                  <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
-                    {correlateResult?.statistics.scan_duration_ms}ms
-                  </span>
-                </div>
-                {backendClusters.map((c) => (
-                  <BackendClusterRow key={c.anchor_id} cluster={c} />
-                ))}
-              </>
-            )
-          ) : (
-            // Fallback: client-side PID clusters
-            clientClusters.length === 0 ? (
-              <div style={{
-                display: 'flex', flexDirection: 'column', alignItems: 'center',
-                justifyContent: 'center', height: 180, gap: 8,
-              }}>
-                <GitMerge size={24} color="var(--text-dim)" style={{ opacity: 0.4 }} />
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-                  No multi-scanner clusters found
-                </div>
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', opacity: 0.6 }}>
-                  Click CORRELATE for full cross-scanner analysis (PID + ParentChild + SharedIP + FileHash)
-                </div>
-              </div>
-            ) : (
-              clientClusters.map(([pid, nodes]) => (
-                <PidClusterRow key={pid} pid={pid} entities={nodes} expandedIds={expandedIds} />
+              filtered.map((entity) => (
+                <EntityRow
+                  key={entity.entity_id}
+                  entity={entity}
+                  selected={selectedEntity?.entity_id === entity.entity_id}
+                  onSelect={() => setSelectedEntity(
+                    selectedEntity?.entity_id === entity.entity_id ? null : entity
+                  )}
+                />
               ))
             )
-          )
-        )}
+          )}
 
-        {/* ── Attack chains ─────────────────────────────────────────────────── */}
-        {viewMode === 'attack_chains' && (
-          !hasBackend ? (
-            <div style={{
-              display: 'flex', flexDirection: 'column', alignItems: 'center',
-              justifyContent: 'center', height: '100%', gap: 12,
-            }}>
-              <ShieldAlert size={32} color="var(--text-dim)" style={{ opacity: 0.4 }} />
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-dim)' }}>
-                Attack chain analysis requires backend correlation
-              </div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)', opacity: 0.6 }}>
-                Click CORRELATE to run the graph analyser
-              </div>
-            </div>
-          ) : attackChains.length === 0 ? (
-            <div style={{
-              display: 'flex', flexDirection: 'column', alignItems: 'center',
-              justifyContent: 'center', height: '100%', gap: 12,
-            }}>
-              <ShieldCheck size={32} color="var(--green)" style={{ opacity: 0.6 }} />
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-dim)' }}>
-                No attack chains detected
-              </div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)', opacity: 0.6 }}>
-                {correlateResult?.statistics.total_entities ?? 0} entities analysed ·{' '}
-                {correlateResult?.statistics.graph_edges ?? 0} edges in graph
-              </div>
-            </div>
-          ) : (
-            <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {/* Graph stats banner */}
-              <div style={{
-                display: 'flex', gap: 24, padding: '10px 14px',
-                background: 'var(--elevated)', borderRadius: 6,
-                border: '1px solid var(--border)',
-              }}>
-                {[
-                  { label: 'GRAPH NODES',   value: correlateResult?.statistics.graph_nodes },
-                  { label: 'GRAPH EDGES',   value: correlateResult?.statistics.graph_edges },
-                  { label: 'THREAT NODES',  value: correlateResult?.statistics.threat_entities },
-                  { label: 'CHAINS',        value: attackChains.length },
-                  { label: 'SCAN DURATION', value: `${correlateResult?.statistics.scan_duration_ms}ms` },
-                ].map(({ label, value }) => (
-                  <div key={label} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <span style={{ fontFamily: 'var(--font-hud)', fontSize: 8, color: 'var(--text-dim)', letterSpacing: '0.1em' }}>{label}</span>
-                    <span style={{ fontFamily: 'var(--font-hud)', fontSize: 16, fontWeight: 700, color: 'var(--text-bright)' }}>{value}</span>
+          {/* ── Cluster view ─────────────────────────────────────────────────── */}
+          {viewMode === 'clusters' && !noData && (
+            hasBackend ? (
+              backendClusters.length === 0 ? (
+                <div style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'center',
+                  justifyContent: 'center', height: 180, gap: 8,
+                }}>
+                  <GitMerge size={24} color="var(--text-dim)" style={{ opacity: 0.4 }} />
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)' }}>
+                    No correlated clusters found
                   </div>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', opacity: 0.6 }}>
+                    Run CORRELATE to analyse cross-scanner relationships
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '8px 16px', borderBottom: '1px solid var(--border)',
+                    background: 'rgba(99,102,241,0.06)',
+                  }}>
+                    <GitMerge size={11} color="#818cf8" />
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: '#818cf8' }}>
+                      Backend correlation active · {backendClusters.length} clusters · 4 strategies (PID, ParentChild, SharedIP, FileHash)
+                    </span>
+                    <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
+                      {correlateResult?.statistics.scan_duration_ms}ms
+                    </span>
+                  </div>
+                  {backendClusters.map((c) => (
+                    <BackendClusterRow key={c.anchor_id} cluster={c} />
+                  ))}
+                </>
+              )
+            ) : (
+              clientClusters.length === 0 ? (
+                <div style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'center',
+                  justifyContent: 'center', height: 180, gap: 8,
+                }}>
+                  <GitMerge size={24} color="var(--text-dim)" style={{ opacity: 0.4 }} />
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)' }}>
+                    No multi-scanner clusters found
+                  </div>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', opacity: 0.6 }}>
+                    Click CORRELATE for full cross-scanner analysis (PID + ParentChild + SharedIP + FileHash)
+                  </div>
+                </div>
+              ) : (
+                clientClusters.map(([pid, nodes]) => (
+                  <PidClusterRow
+                    key={pid} pid={pid} entities={nodes}
+                    selectedId={selectedEntity?.entity_id ?? null}
+                    onSelect={setSelectedEntity}
+                  />
+                ))
+              )
+            )
+          )}
+
+          {/* ── Attack chains ─────────────────────────────────────────────────── */}
+          {viewMode === 'attack_chains' && (
+            !hasBackend ? (
+              <div style={{
+                display: 'flex', flexDirection: 'column', alignItems: 'center',
+                justifyContent: 'center', height: '100%', gap: 12,
+              }}>
+                <ShieldAlert size={32} color="var(--text-dim)" style={{ opacity: 0.4 }} />
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-dim)' }}>
+                  Attack chain analysis requires backend correlation
+                </div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)', opacity: 0.6 }}>
+                  Click CORRELATE to run the graph analyser
+                </div>
+              </div>
+            ) : attackChains.length === 0 ? (
+              <div style={{
+                display: 'flex', flexDirection: 'column', alignItems: 'center',
+                justifyContent: 'center', height: '100%', gap: 12,
+              }}>
+                <ShieldCheck size={32} color="var(--green)" style={{ opacity: 0.6 }} />
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-dim)' }}>
+                  No attack chains detected
+                </div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)', opacity: 0.6 }}>
+                  {correlateResult?.statistics.total_entities ?? 0} entities analysed ·{' '}
+                  {correlateResult?.statistics.graph_edges ?? 0} edges in graph
+                </div>
+              </div>
+            ) : (
+              <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {/* Graph stats banner */}
+                <div style={{
+                  display: 'flex', gap: 24, padding: '10px 14px',
+                  background: 'var(--elevated)', borderRadius: 6,
+                  border: '1px solid var(--border)',
+                }}>
+                  {[
+                    { label: 'GRAPH NODES',   value: correlateResult?.statistics.graph_nodes },
+                    { label: 'GRAPH EDGES',   value: correlateResult?.statistics.graph_edges },
+                    { label: 'THREAT NODES',  value: correlateResult?.statistics.threat_entities },
+                    { label: 'CHAINS',        value: attackChains.length },
+                    { label: 'SCAN DURATION', value: `${correlateResult?.statistics.scan_duration_ms}ms` },
+                  ].map(({ label, value }) => (
+                    <div key={label} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <span style={{ fontFamily: 'var(--font-hud)', fontSize: 8, color: 'var(--text-dim)', letterSpacing: '0.1em' }}>{label}</span>
+                      <span style={{ fontFamily: 'var(--font-hud)', fontSize: 16, fontWeight: 700, color: 'var(--text-bright)' }}>{value}</span>
+                    </div>
+                  ))}
+                </div>
+                {attackChains.map((chain) => (
+                  <AttackChainCard key={chain.chain_id} chain={chain} nodeMap={nodeMap} />
                 ))}
               </div>
-              {attackChains.map((chain) => (
-                <AttackChainCard key={chain.chain_id} chain={chain} nodeMap={nodeMap} />
-              ))}
-            </div>
-          )
+            )
+          )}
+        </div>
+
+        {/* Detail panel — shown when an entity is selected */}
+        {selectedEntity && (
+          <EntityDetailPanel
+            entity={selectedEntity}
+            onClose={() => setSelectedEntity(null)}
+          />
         )}
       </div>
 
@@ -1076,7 +1524,15 @@ export default function EntityManager() {
             · Backend: {correlateResult?.statistics.total_entities} entities · {correlateResult?.statistics.threat_clusters} threat clusters
           </span>
         )}
-        <span style={{ marginLeft: 'auto' }}>{filtered.length} / {entities.length} entities shown</span>
+        <span style={{ marginLeft: 'auto' }}>
+          {selectedEntity ? (
+            <span style={{ color: 'var(--cyan)' }}>
+              1 entity selected · click to dismiss
+            </span>
+          ) : (
+            `${filtered.length} / ${entities.length} entities shown · click a row to inspect`
+          )}
+        </span>
       </div>
     </div>
   );

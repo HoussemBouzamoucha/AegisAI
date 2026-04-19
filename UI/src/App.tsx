@@ -9,6 +9,7 @@ import NetworkMonitor from './components/NetworkMonitor';
 import MemoryMonitor from './components/MemoryMonitor';
 import History from './components/History';
 import EntityManager from './components/EntityManager';
+import ThreatGraph from './components/ThreatGraph';
 
 export default function App() {
   const { view, checkEngine } = useStore();
@@ -35,6 +36,7 @@ export default function App() {
           {view === 'memory'    && <MemoryMonitor />}
           {view === 'history'   && <History />}
           {view === 'entities'  && <EntityManager />}
+          {view === 'graph'     && <ThreatGraph />}
         </main>
       </div>
     </div>
