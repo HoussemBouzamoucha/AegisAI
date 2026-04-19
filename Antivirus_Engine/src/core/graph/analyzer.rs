@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::types::{AttackChain, AttackPattern, EdgeType, GraphEdge, ThreatGraph};
+use super::types::{AttackChain, AttackPattern, CriticalPath, EdgeType, GraphEdge, ThreatGraph};
 
 pub struct GraphAnalyzer;
 
@@ -37,6 +37,74 @@ impl GraphAnalyzer {
         });
 
         chains
+    }
+
+    // ── Critical path (Dijkstra-like max-weight path) ─────────────────────────
+    //
+    // Strategy:
+    //  1. Build a threat sub-graph: only nodes with threat_level != Clean, plus
+    //     edges where at least one endpoint is a threat node.
+    //  2. Edge weight = avg(combined_score_a, combined_score_b) × type_multiplier.
+    //     combined_score already incorporates ML for network entities (H×0.4+ML×0.6).
+    //  3. Depth-bounded DFS (max depth 6) with a per-path visited set prevents
+    //     cycles.  Starting only from threat nodes keeps the search space small
+    //     (typically < 20 nodes, < 50 edges → microseconds of wall-clock time).
+    //  4. The path with the highest cumulative edge-weight sum is returned.
+
+    pub fn find_critical_path(graph: &ThreatGraph) -> Option<CriticalPath> {
+        // ── Collect threat node IDs ────────────────────────────────────────────
+        let threat_ids: HashSet<&str> = graph.nodes.values()
+            .filter(|n| !is_clean(&n.threat_level))
+            .map(|n| n.entity_id.as_str())
+            .collect();
+
+        if threat_ids.is_empty() {
+            return None;
+        }
+
+        // ── Build bidirectional weighted adjacency (threat-anchored edges) ─────
+        // We include any edge where at least one endpoint is a threat node so that
+        // a clean pivot (e.g. a shared process) can still connect threat entities.
+        let mut adj: HashMap<&str, Vec<(&str, f32, &str)>> = HashMap::new();
+
+        for edge in &graph.edges {
+            let from = edge.from.as_str();
+            let to   = edge.to.as_str();
+
+            if !threat_ids.contains(from) && !threat_ids.contains(to) {
+                continue; // skip clean↔clean edges
+            }
+
+            let from_score = graph.nodes.get(from).map_or(0.0, |n| n.combined_score);
+            let to_score   = graph.nodes.get(to  ).map_or(0.0, |n| n.combined_score);
+            let weight     = edge_weight(from_score, to_score, &edge.edge_type);
+
+            adj.entry(from).or_default().push((to,   weight, edge.edge_type.as_str()));
+            adj.entry(to  ).or_default().push((from, weight, edge.edge_type.as_str()));
+        }
+
+        // ── DFS from every threat node ─────────────────────────────────────────
+        let mut best: Option<CriticalPath> = None;
+
+        for &start in &threat_ids {
+            let mut visited: HashSet<&str>  = HashSet::new();
+            let mut path_nodes: Vec<String> = vec![start.to_string()];
+            let mut path_hops: Vec<(String, f32)> = Vec::new(); // (edge_type, weight)
+            visited.insert(start);
+
+            dfs_max_path(
+                start,
+                0.0,
+                &adj,
+                &mut visited,
+                &mut path_nodes,
+                &mut path_hops,
+                &mut best,
+                6, // max depth (7 nodes)
+            );
+        }
+
+        best
     }
 
     // ── Pattern 1: ProcessInjection ───────────────────────────────────────────
@@ -361,3 +429,104 @@ macro_rules! unwrap_or_continue {
 }
 
 use unwrap_or_continue;
+
+// ─── Critical-path helpers ────────────────────────────────────────────────────
+
+/// Edge weight for the critical-path search.
+///
+/// Formula:  avg(combined_score_a, combined_score_b) × type_multiplier
+///
+/// combined_score already encodes the ML signal for network entities
+/// (H×0.4 + ML×0.6 when an ML score is present), so no extra term is needed.
+///
+/// Type multipliers reflect the relative severity of each relationship:
+///   MemoryInjection   1.50  — in-memory code injection is a critical IOC
+///   NetworkOwner      1.40  — process owning a C2 connection is high-severity
+///   SharedC2          1.30  — shared command-and-control infrastructure
+///   ProcessOpenedFile 1.20  — file-to-process execution chain
+///   ParentChild       1.10  — process lineage is a meaningful escalation signal
+///   SameProcess       1.00  — same-PID grouping (structural, less directional)
+///   SharedFileHash    0.90  — same binary at different paths (lower severity alone)
+fn edge_weight(score_a: f32, score_b: f32, edge_type: &EdgeType) -> f32 {
+    let avg = (score_a + score_b) / 2.0;
+    let multiplier = match edge_type {
+        EdgeType::MemoryInjection   => 1.50,
+        EdgeType::NetworkOwner      => 1.40,
+        EdgeType::SharedC2          => 1.30,
+        EdgeType::ProcessOpenedFile => 1.20,
+        EdgeType::ParentChild       => 1.10,
+        EdgeType::SameProcess       => 1.00,
+        EdgeType::SharedFileHash    => 0.90,
+    };
+    avg * multiplier
+}
+
+/// Recursive depth-bounded DFS for the maximum-weight simple path.
+///
+/// At each step we extend the current path by one unvisited neighbour and
+/// recurse.  On return we roll back the path (backtracking).  The best
+/// complete path (≥2 nodes) seen so far is stored in `best`.
+#[allow(clippy::too_many_arguments)]
+fn dfs_max_path<'a>(
+    current:    &'a str,
+    running:    f32,
+    adj:        &HashMap<&'a str, Vec<(&'a str, f32, &'a str)>>,
+    visited:    &mut HashSet<&'a str>,
+    path_nodes: &mut Vec<String>,
+    path_hops:  &mut Vec<(String, f32)>,   // (edge_type, weight) per hop
+    best:       &mut Option<CriticalPath>,
+    depth_left: usize,
+) {
+    // Record best if this path has ≥2 nodes and beats the current champion.
+    if path_nodes.len() >= 2 {
+        let is_better = best.as_ref().map_or(true, |b| running > b.total_score);
+        if is_better {
+            let (edge_types, edge_weights): (Vec<String>, Vec<f32>) =
+                path_hops.iter().map(|(et, w)| (et.clone(), *w)).unzip();
+            *best = Some(CriticalPath {
+                node_ids:     path_nodes.clone(),
+                edge_types,
+                edge_weights,
+                total_score:  running,
+            });
+        }
+    }
+
+    if depth_left == 0 {
+        return;
+    }
+
+    // Iterate over neighbours in descending weight order so we explore the
+    // most promising branch first (makes the best-path pruning more effective).
+    let mut neighbours: Vec<(&str, f32, &str)> = adj
+        .get(current)
+        .cloned()
+        .unwrap_or_default();
+    neighbours.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (neighbour, weight, edge_type) in neighbours {
+        if visited.contains(neighbour) {
+            continue;
+        }
+
+        visited.insert(neighbour);
+        path_nodes.push(neighbour.to_string());
+        path_hops.push((edge_type.to_string(), weight));
+
+        dfs_max_path(
+            neighbour,
+            running + weight,
+            adj,
+            visited,
+            path_nodes,
+            path_hops,
+            best,
+            depth_left - 1,
+        );
+
+        // Backtrack
+        visited.remove(neighbour);
+        path_nodes.pop();
+        path_hops.pop();
+    }
+}

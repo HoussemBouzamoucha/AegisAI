@@ -14,7 +14,7 @@ use core::types::ThreatLevel;
 use core::entity::{
     EntityManager, EntityCorrelator, CorrelatedCluster, JoinReason, EntityNode,
 };
-use core::graph::{GraphBuilder, GraphAnalyzer, GraphNode, GraphEdge, AttackChain};
+use core::graph::{GraphBuilder, GraphAnalyzer, GraphNode, GraphEdge, AttackChain, CriticalPath};
 
 use std::path::Path;
 use std::env;
@@ -587,6 +587,15 @@ fn serialize_graph_edge(edge: &GraphEdge) -> serde_json::Value {
     })
 }
 
+fn serialize_critical_path(cp: &CriticalPath) -> serde_json::Value {
+    json!({
+        "node_ids":     cp.node_ids,
+        "edge_types":   cp.edge_types,
+        "edge_weights": cp.edge_weights,
+        "total_score":  cp.total_score,
+    })
+}
+
 fn serialize_attack_chain(chain: &AttackChain) -> serde_json::Value {
     json!({
         "chain_id":     chain.chain_id,
@@ -660,6 +669,9 @@ fn daemon_correlate(
     let attack_chains = GraphAnalyzer::find_attack_chains(&graph);
     graph.attack_chains = attack_chains;
 
+    let critical_path = GraphAnalyzer::find_critical_path(&graph);
+    graph.critical_path = critical_path;
+
     // ── Build correlator clusters ─────────────────────────────────────────────
     let correlator = EntityCorrelator::new(&manager);
     let all_clusters    = correlator.find_all_clusters();
@@ -700,6 +712,7 @@ fn daemon_correlate(
             "nodes":         graph_nodes_json,
             "edges":         graph_edges_json,
             "attack_chains": chains_json,
+            "critical_path": graph.critical_path.as_ref().map(serialize_critical_path),
         },
         "statistics": {
             "total_entities":        total_entities,

@@ -340,10 +340,22 @@ export interface AttackChain {
   mitre_tactic: string;
 }
 
+export interface CriticalPath {
+  /** Entity IDs in traversal order (source → sink). */
+  node_ids:     string[];
+  /** Edge-type string for each hop, length = node_ids.length - 1. */
+  edge_types:   string[];
+  /** Weight for each hop (avg combined scores × type multiplier). */
+  edge_weights: number[];
+  /** Sum of all hop weights — the total path score. */
+  total_score:  number;
+}
+
 export interface CorrelateGraph {
   nodes:         GraphNodeData[];
   edges:         GraphEdgeData[];
   attack_chains: AttackChain[];
+  critical_path?: CriticalPath | null;
 }
 
 export interface CorrelateStats {

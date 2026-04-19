@@ -155,12 +155,33 @@ pub struct AttackChain {
     pub mitre_tactic: String,
 }
 
+// ─── Critical path ────────────────────────────────────────────────────────────
+
+/// The maximum-weight simple path through the threat graph.
+///
+/// Computed by a depth-bounded DFS over the threat subgraph using
+/// per-edge weights that incorporate both heuristic and ML scores.
+/// `edge_types` and `edge_weights` have length `node_ids.len() - 1`.
+#[derive(Debug, Clone)]
+pub struct CriticalPath {
+    /// Entity IDs in traversal order (source → sink).
+    pub node_ids:     Vec<String>,
+    /// Edge-type string for each hop (e.g. "network_owner", "memory_injection").
+    pub edge_types:   Vec<String>,
+    /// Weight of each hop (avg combined scores × edge-type severity multiplier).
+    pub edge_weights: Vec<f32>,
+    /// Cumulative sum of all hop weights — the "total path score".
+    pub total_score:  f32,
+}
+
 // ─── Threat graph ─────────────────────────────────────────────────────────────
 
 pub struct ThreatGraph {
     pub nodes:         HashMap<String, GraphNode>,
     pub edges:         Vec<GraphEdge>,
     pub attack_chains: Vec<AttackChain>,
+    /// The most malicious simple path found by the critical-path analyser.
+    pub critical_path: Option<CriticalPath>,
     /// Forward adjacency list: entity_id → list of reachable entity_ids.
     pub adjacency:     HashMap<String, Vec<String>>,
 }
@@ -171,6 +192,7 @@ impl ThreatGraph {
             nodes:         HashMap::new(),
             edges:         Vec::new(),
             attack_chains: Vec::new(),
+            critical_path: None,
             adjacency:     HashMap::new(),
         }
     }
