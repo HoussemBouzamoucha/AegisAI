@@ -275,6 +275,57 @@ impl EntityManager {
         }
     }
 
+    /// Boost child-process scores when their parent is already a threat.
+    ///
+    /// +3 heuristic points for a Suspicious parent, +6 for Malicious/Critical.
+    /// Threat level is re-evaluated using the same thresholds as the process
+    /// heuristics (4 / 10 / 15).  Never downgrades an existing verdict.
+    pub fn apply_parent_context_boost(&self) {
+        use std::collections::HashMap;
+
+        // Build pid → threat_level for all threat-level process entities.
+        let parent_threats: HashMap<u32, UnifiedThreatLevel> = self.nodes
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Process && e.is_threat())
+            .filter_map(|e| e.join_keys.pid.map(|pid| (pid, e.threat_level.clone())))
+            .collect();
+
+        if parent_threats.is_empty() { return; }
+
+        // Collect (entity_id, boost) for processes whose parent is a threat.
+        let boosts: Vec<(String, i32)> = self.nodes
+            .iter()
+            .filter(|e| e.entity_type == EntityType::Process)
+            .filter_map(|e| {
+                let ppid = e.join_keys.parent_pid?;
+                let boost = match parent_threats.get(&ppid)? {
+                    UnifiedThreatLevel::Malicious | UnifiedThreatLevel::Critical => 6,
+                    UnifiedThreatLevel::Suspicious => 3,
+                    _ => return None,
+                };
+                Some((e.entity_id.clone(), boost))
+            })
+            .collect();
+
+        for (id, boost) in boosts {
+            if let Some(mut entry) = self.nodes.get_mut(&id) {
+                entry.heuristic_score += boost;
+                let new_level = if entry.heuristic_score >= 15 {
+                    UnifiedThreatLevel::Critical
+                } else if entry.heuristic_score >= 10 {
+                    UnifiedThreatLevel::Malicious
+                } else if entry.heuristic_score >= 4 {
+                    UnifiedThreatLevel::Suspicious
+                } else {
+                    UnifiedThreatLevel::Clean
+                };
+                if new_level > entry.threat_level {
+                    entry.threat_level = new_level;
+                }
+            }
+        }
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// All entities sharing a PID — links processes, network connections, and

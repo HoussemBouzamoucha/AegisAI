@@ -172,6 +172,10 @@ pub struct CriticalPath {
     pub edge_weights: Vec<f32>,
     /// Cumulative sum of all hop weights — the "total path score".
     pub total_score:  f32,
+    /// Plain-English sentence describing the full attack chain in traversal order.
+    /// Example: "malicious.docx was loaded by word.exe, which spawned
+    /// powershell.exe, which connected to TCP → 185.x.x.x:443"
+    pub narrative:    String,
 }
 
 // ─── Threat graph ─────────────────────────────────────────────────────────────

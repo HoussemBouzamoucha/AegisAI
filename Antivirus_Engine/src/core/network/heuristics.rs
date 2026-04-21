@@ -23,7 +23,7 @@ use crate::core::types::DetectionSignal;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const THRESHOLD_MALICIOUS:  i32 = 35;
-const THRESHOLD_SUSPICIOUS: i32 = 8; // TEST: lowered from 15 — restore after ML pipeline is verified
+const THRESHOLD_SUSPICIOUS: i32 = 15;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Known-clean process whitelist

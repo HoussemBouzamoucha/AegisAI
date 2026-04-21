@@ -151,6 +151,7 @@ fn run_daemon() {
                 daemon_kill_process(&process_scanner, pid, &id)
             }
             "correlate" => daemon_correlate(
+                &scanner,
                 &process_scanner,
                 &network_scanner,
                 &memory_scanner,
@@ -593,6 +594,7 @@ fn serialize_critical_path(cp: &CriticalPath) -> serde_json::Value {
         "edge_types":   cp.edge_types,
         "edge_weights": cp.edge_weights,
         "total_score":  cp.total_score,
+        "narrative":    cp.narrative,
     })
 }
 
@@ -608,6 +610,78 @@ fn serialize_attack_chain(chain: &AttackChain) -> serde_json::Value {
     })
 }
 
+// ─── ML pipeline helper ───────────────────────────────────────────────────────
+
+/// Locate the preprocessing_pipeline.py script relative to the engine binary.
+///
+/// Layout:  Antivirus_Engine/target/{profile}/antivirus.exe
+///          Antivirus_Engine/src/core/network/Feature_extractor/ML_IDS/preprocessing_pipeline.py
+fn find_ml_script() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let engine_root = exe
+        .parent()?   // {profile}/
+        .parent()?   // target/
+        .parent()?;  // Antivirus_Engine/
+
+    let script = engine_root
+        .join("src").join("core").join("network")
+        .join("Feature_extractor").join("ML_IDS")
+        .join("preprocessing_pipeline.py");
+
+    if script.exists() { Some(script) } else { None }
+}
+
+/// Run the ML IDS pipeline on the OnePace.csv written by the network scanner,
+/// then patch `ml_score` into each matching network entity in the manager.
+///
+/// Silently no-ops if Python is unavailable or the CSV is missing — the graph
+/// falls back to heuristic-only scoring in that case.
+fn run_ml_and_patch_scores(manager: &EntityManager) {
+    let Some(script) = find_ml_script() else { return; };
+
+    let csv = {
+        let home = std::env::var("USERPROFILE")
+            .unwrap_or_else(|_| "C:\\Users\\Public".to_string());
+        format!("{}\\OnePace.csv", home)
+    };
+
+    for py in &["python", "python3", "py"] {
+        let output = match std::process::Command::new(py)
+            .args([script.to_str().unwrap_or(""), "--infer", "--csv", &csv])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _                           => continue,
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let result: serde_json::Value = match serde_json::from_str(stdout.trim()) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+
+        if let Some(flows) = result["flows"].as_array() {
+            for flow in flows {
+                let proto  = flow["proto"].as_str().unwrap_or("").to_uppercase();
+                let srcip  = flow["srcip"].as_str().unwrap_or("");
+                let sport  = flow["sport"].as_u64().unwrap_or(0);
+                let dstip  = flow["dstip"].as_str().unwrap_or("");
+                let dsport = flow["dsport"].as_u64().unwrap_or(0);
+                let prob   = flow["probability"].as_f64().unwrap_or(0.0) as f32;
+
+                if prob < 0.01 { continue; }
+
+                // Reconstruct the entity_id format used by manager.ingest_network:
+                //   net:{proto}:{local_address}:{remote_address}
+                // where local = srcip:sport, remote = dstip:dsport.
+                let entity_id = format!("net:{}:{}:{}:{}:{}", proto, srcip, sport, dstip, dsport);
+                manager.update_ml_score(&entity_id, prob);
+            }
+        }
+        break; // successfully ran — no need to try other interpreters
+    }
+}
+
 // ─── Daemon correlate ─────────────────────────────────────────────────────────
 
 /// Run all background scanners, build the entity graph, run attack-chain
@@ -617,6 +691,7 @@ fn serialize_attack_chain(chain: &AttackChain) -> serde_json::Value {
 /// When false the graph uses only process and network entities; when true all
 /// four entity types are included.
 fn daemon_correlate(
+    file_scanner:    &FileSystemScanner,
     process_scanner: &ProcessScanner,
     network_scanner: &NetworkScanner,
     memory_scanner:  &MemoryScanner,
@@ -636,7 +711,18 @@ fn daemon_correlate(
     match process_scanner.scan_all_processes() {
         Ok(processes) => {
             proc_count = processes.len();
-            for p in &processes { manager.ingest_process(p); }
+            for p in &processes {
+                manager.ingest_process(p);
+                // Fix #4: scan exe file for threat-level processes so the graph
+                // can draw ProcessOpenedFile edges (malicious file → process).
+                if p.is_threat {
+                    if let Some(ref exe) = p.exe_path {
+                        if let Ok(result) = file_scanner.scan_file(Path::new(exe)) {
+                            manager.ingest_file(&result);
+                        }
+                    }
+                }
+            }
         }
         Err(e) => eprintln!("CORRELATE: process scan error: {}", e),
     }
@@ -649,6 +735,13 @@ fn daemon_correlate(
         }
         Err(e) => eprintln!("CORRELATE: network scan error: {}", e),
     }
+
+    // Fix #1: Run the ML pipeline on the OnePace.csv written by the network
+    // scanner above and patch ml_score into each matching network entity.
+    run_ml_and_patch_scores(&manager);
+
+    // Fix #3: Boost child-process scores when their parent is a threat.
+    manager.apply_parent_context_boost();
 
     // ── Ingest: Memory scanner (optional) ────────────────────────────────────
     if include_memory {

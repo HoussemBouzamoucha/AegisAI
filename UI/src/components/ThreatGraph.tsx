@@ -301,15 +301,24 @@ export default function ThreatGraph() {
       {/* Critical path banner */}
       {criticalPath && criticalPath.node_ids.length >= 2 && (
         <div style={{
-          display: 'flex', alignItems: 'center', gap: 14,
-          padding: '10px 16px', borderRadius: 8, flexShrink: 0,
+          display: 'flex', alignItems: 'flex-start', gap: 14,
+          padding: '12px 16px', borderRadius: 8, flexShrink: 0,
           background: 'rgba(245,158,11,0.07)',
           border: `1px solid ${CRITICAL_COLOR}40`,
         }}>
-          <TrendingUp size={14} color={CRITICAL_COLOR} style={{ flexShrink: 0 }} />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontFamily: 'var(--font-hud)', fontSize: 10, color: CRITICAL_COLOR, letterSpacing: '0.08em', marginBottom: 3 }}>
-              CRITICAL PATH — TOTAL SCORE {criticalPath.total_score.toFixed(3)}
+          <TrendingUp size={14} color={CRITICAL_COLOR} style={{ flexShrink: 0, marginTop: 3 }} />
+          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {/* Narrative — primary headline */}
+            {criticalPath.narrative && (
+              <div style={{
+                fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-bright)',
+                lineHeight: 1.7, fontWeight: 500,
+              }}>
+                {criticalPath.narrative}
+              </div>
+            )}
+            <div style={{ fontFamily: 'var(--font-hud)', fontSize: 9, color: `${CRITICAL_COLOR}90`, letterSpacing: '0.08em' }}>
+              CRITICAL PATH · SCORE {criticalPath.total_score.toFixed(3)} · {criticalPath.node_ids.length} NODES
             </div>
             {/* Path node chain */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
@@ -939,6 +948,22 @@ function LegendPanel({ hasBackend, nodeCount, correlateResult, criticalPath }: {
               <span style={{ fontFamily: 'var(--font-hud)', fontSize: 12, fontWeight: 700, color: CRITICAL_COLOR }}>{value}</span>
             </div>
           ))}
+          {/* Narrative */}
+          {criticalPath.narrative && (
+            <>
+              <div style={{ height: 1, background: `${CRITICAL_COLOR}25`, margin: '2px 0' }} />
+              <div style={{ fontFamily: 'var(--font-hud)', fontSize: 8, color: `${CRITICAL_COLOR}80`, letterSpacing: '0.08em' }}>
+                CHAIN NARRATIVE
+              </div>
+              <div style={{
+                fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text)',
+                lineHeight: 1.7, padding: '6px 8px', borderRadius: 5,
+                background: `${CRITICAL_COLOR}08`, border: `1px solid ${CRITICAL_COLOR}20`,
+              }}>
+                {criticalPath.narrative}
+              </div>
+            </>
+          )}
           {/* Multiplier breakdown */}
           <div style={{ height: 1, background: `${CRITICAL_COLOR}25`, margin: '2px 0' }} />
           <div style={{ fontFamily: 'var(--font-hud)', fontSize: 8, color: `${CRITICAL_COLOR}80`, letterSpacing: '0.08em' }}>

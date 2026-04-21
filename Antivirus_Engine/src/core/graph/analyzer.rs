@@ -36,7 +36,7 @@ impl GraphAnalyzer {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        chains
+        deduplicate_chains(chains)
     }
 
     // ── Critical path (Dijkstra-like max-weight path) ─────────────────────────
@@ -102,6 +102,10 @@ impl GraphAnalyzer {
                 &mut best,
                 6, // max depth (7 nodes)
             );
+        }
+
+        if let Some(ref mut path) = best {
+            path.narrative = build_narrative(path, graph);
         }
 
         best
@@ -430,6 +434,109 @@ macro_rules! unwrap_or_continue {
 
 use unwrap_or_continue;
 
+// ─── Chain deduplication ─────────────────────────────────────────────────────
+//
+// MultiStageAttack fires on every connected threat component ≥3 nodes, which
+// means it often duplicates LateralMovement / SuspiciousSpawn / C2Communication
+// that already cover the same nodes with more specific descriptions.
+//
+// Rule: suppress MultiStageAttack chains whose node set is fully covered by the
+// union of already-kept specific-pattern chains.  Specific chains are always
+// kept, even when they share nodes with each other.
+
+fn deduplicate_chains(chains: Vec<AttackChain>) -> Vec<AttackChain> {
+    // Collect all nodes covered by non-MultiStageAttack chains.
+    // Build an owned set so we can consume `chains` below.
+    let specific_nodes: HashSet<String> = chains
+        .iter()
+        .filter(|c| c.pattern.as_str() != "MultiStageAttack")
+        .flat_map(|c| c.node_ids.iter().cloned())
+        .collect();
+
+    chains
+        .into_iter()
+        .filter(|c| {
+            if c.pattern.as_str() != "MultiStageAttack" {
+                return true; // always keep specific chains
+            }
+            // Keep a MultiStageAttack only if it introduces at least one node
+            // not already surfaced by a specific chain.
+            c.node_ids.iter().any(|id| !specific_nodes.contains(id))
+        })
+        .collect()
+}
+
+// ─── Narrative builder ────────────────────────────────────────────────────────
+
+/// Build a plain-English sentence that narrates the critical path in order.
+///
+/// Format:
+///   "[A] [verb] [B], which [verb] [C], which [verb] [D]"
+///
+/// Example:
+///   "malicious.docx was loaded by word.exe, which spawned powershell.exe,
+///    which connected to TCP → 185.x.x.x:443"
+fn build_narrative(path: &CriticalPath, graph: &ThreatGraph) -> String {
+    if path.node_ids.is_empty() {
+        return String::new();
+    }
+
+    let label = |id: &str| -> &str {
+        graph.nodes.get(id).map(|n| n.label.as_str()).unwrap_or("?")
+    };
+    let etype = |id: &str| -> &str {
+        graph.nodes.get(id).map(|n| n.entity_type.as_str()).unwrap_or("")
+    };
+
+    let mut sentence = label(&path.node_ids[0]).to_string();
+
+    for i in 0..path.edge_types.len() {
+        let from_id  = &path.node_ids[i];
+        let to_id    = &path.node_ids[i + 1];
+        let verb     = hop_verb(&path.edge_types[i], etype(from_id), etype(to_id));
+        let to_label = label(to_id);
+
+        if i == 0 {
+            // First hop: "[A] [verb] [B]"
+            sentence.push(' ');
+        } else {
+            // Subsequent hops: ", which [verb] [B]"
+            sentence.push_str(", which ");
+        }
+        sentence.push_str(verb);
+        sentence.push(' ');
+        sentence.push_str(to_label);
+    }
+
+    sentence
+}
+
+/// Plain-English verb phrase for a single graph hop.
+///
+/// `from_type` and `to_type` are the entity_type strings
+/// ("process" | "file" | "network" | "memory").
+fn hop_verb(edge_type: &str, from_type: &str, _to_type: &str) -> &'static str {
+    match edge_type {
+        "network_owner" => match from_type {
+            "process" => "connected to",
+            _         => "was used by",
+        },
+        "process_opened_file" => match from_type {
+            "file"    => "was loaded by",
+            _         => "loaded",
+        },
+        "parent_child"      => "spawned",
+        "memory_injection"  => match from_type {
+            "process" => "has a suspicious memory region at",
+            _         => "was injected into",
+        },
+        "shared_c2"         => "shares C2 infrastructure with",
+        "same_process"      => "runs in the same process as",
+        "shared_file_hash"  => "is the same binary as",
+        _                   => "is linked to",
+    }
+}
+
 // ─── Critical-path helpers ────────────────────────────────────────────────────
 
 /// Edge weight for the critical-path search.
@@ -488,6 +595,7 @@ fn dfs_max_path<'a>(
                 edge_types,
                 edge_weights,
                 total_score:  running,
+                narrative:    String::new(), // filled in by find_critical_path
             });
         }
     }

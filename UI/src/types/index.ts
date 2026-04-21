@@ -349,6 +349,8 @@ export interface CriticalPath {
   edge_weights: number[];
   /** Sum of all hop weights — the total path score. */
   total_score:  number;
+  /** Plain-English sentence describing the full attack chain in traversal order. */
+  narrative:    string;
 }
 
 export interface CorrelateGraph {

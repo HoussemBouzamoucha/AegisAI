@@ -3,7 +3,8 @@
     "allow": [
       "Bash(wsl:*)",
       "Bash(cargo check:*)",
-      "Bash(cargo build *)"
+      "Bash(cargo build *)",
+      "Bash(npx tsc *)"
     ]
   }
 }
