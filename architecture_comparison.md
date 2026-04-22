@@ -567,6 +567,7 @@ and "what the live scanner produces."
 
 ### The Key Insight: The Feature Vector Is the Contract
 
+
 The feature vector you define for each scanner has to serve two masters:
 
 1. **Training time**: dataset rows get transformed into this vector and fed to the model
