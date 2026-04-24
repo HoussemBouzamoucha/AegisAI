@@ -266,7 +266,43 @@ export type UnifiedThreat = 'Clean' | 'Suspicious' | 'Malicious' | 'Critical';
 export type EntityKind    = 'process' | 'file' | 'network' | 'memory';
 export type EdgeKind =
   | 'same_process' | 'parent_child' | 'process_opened_file'
-  | 'shared_file_hash' | 'shared_c2' | 'network_owner' | 'memory_injection';
+  | 'shared_file_hash' | 'shared_c2' | 'network_owner' | 'memory_injection'
+  | 'cross_injection';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unified Process Entity  (one atom per process — all owned evidence embedded)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ProcessEntity {
+  entity_id:     string;            // "proc:{pid}"
+  pid:           number;
+  name:          string;
+  exe_path:      string | null;
+  command_line:  string | null;
+  parent_pid:    number | null;
+  user:          string | null;
+
+  threat_level:   UnifiedThreat;
+  combined_score: number;           // max(sub-scores) blended with ML when available
+
+  // Per-domain sub-scores (each in [0,1])
+  process_score:  number;           // process heuristic / 30
+  network_score:  number;           // max network heuristic / 40
+  memory_score:   number;           // max memory heuristic / 40
+  file_score:     number;           // max file confidence_score
+
+  // Owned sub-entities (by PID or exe_path match)
+  network:        NetworkConnection[];
+  memory:         MemoryRegion[];
+  files:          ScanResult[];
+
+  // Merged from all sub-entities
+  detection_signals: DetectionSignal[];
+  anomaly_flags:     string[];
+
+  ml_score?:      number;           // max GRU probability from owned connections
+  raw:            ProcessInfo;      // original process record
+}
 
 export type AttackPatternName =
   | 'ProcessInjection' | 'C2Communication' | 'MalwareExecution'

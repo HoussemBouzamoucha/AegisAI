@@ -14,7 +14,11 @@ import type {
   CorrelateEntityNode, CorrelateCluster, AttackChain,
   UnifiedThreat, EntityKind, AttackPatternName,
   ProcessInfo, NetworkConnection, MemoryRegion, ScanResult,
+  ProcessEntity,
 } from '../types';
+import {
+  buildProcessEntities, orphanConnections, orphanFiles,
+} from '../lib/entityUtils';
 
 // ─── Local entity types (client-side view) ────────────────────────────────────
 
@@ -42,10 +46,12 @@ interface EntityNode {
   label:             string;
   sub_label?:        string;
   // Raw source data for detail panel
-  rawProcess?:  ProcessInfo;
-  rawNetwork?:  NetworkConnection;
-  rawMemory?:   MemoryRegion;
-  rawFile?:     ScanResult;
+  rawProcess?:        ProcessInfo;
+  rawNetwork?:        NetworkConnection;
+  rawMemory?:         MemoryRegion;
+  rawFile?:           ScanResult;
+  // Unified process entity (present for EntityType === 'Process')
+  rawProcessEntity?:  ProcessEntity;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -410,6 +416,38 @@ function EntityDetailPanel({ entity, onClose }: { entity: EntityNode; onClose: (
           </DetailSection>
         )}
 
+        {/* ── Per-domain evidence breakdown (unified entities only) ────────── */}
+        {entity.rawProcessEntity && (() => {
+          const pe = entity.rawProcessEntity!;
+          type DomainRow = { label: string; score: number; count: number; unit: string; color: string };
+          const rows: DomainRow[] = [
+            { label: 'PROCESS',  score: pe.process_score, count: 1,               unit: 'heuristic',   color: 'var(--cyan)' },
+            { label: 'NETWORK',  score: pe.network_score, count: pe.network.length, unit: 'connections', color: 'var(--green)' },
+            { label: 'MEMORY',   score: pe.memory_score,  count: pe.memory.length,  unit: 'regions',     color: 'var(--amber)' },
+            { label: 'FILES',    score: pe.file_score,    count: pe.files.length,   unit: 'threat files', color: 'var(--text-dim)' },
+          ];
+          return (
+            <DetailSection title="EVIDENCE BREAKDOWN">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5, padding: '10px 12px', background: 'var(--base)', borderRadius: 6, border: '1px solid var(--border)' }}>
+                {rows.map(({ label, score, count, unit, color }) => (
+                  <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color, width: 52, flexShrink: 0 }}>{label}</span>
+                    <div style={{ flex: 1, height: 4, background: 'var(--elevated)', borderRadius: 2, overflow: 'hidden' }}>
+                      <div style={{ width: `${score * 100}%`, height: '100%', background: color, borderRadius: 2, opacity: score > 0 ? 1 : 0.2 }} />
+                    </div>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: scoreColor(score), width: 32, textAlign: 'right', flexShrink: 0 }}>
+                      {(score * 100).toFixed(0)}%
+                    </span>
+                    <span style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', width: 60, flexShrink: 0 }}>
+                      {count} {unit}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </DetailSection>
+          );
+        })()}
+
         {/* ── Process-specific fields ─────────────────────────────────────── */}
         {entity.rawProcess && (
           <>
@@ -465,6 +503,106 @@ function EntityDetailPanel({ entity, onClose }: { entity: EntityNode; onClose: (
               </DetailSection>
             )}
           </>
+        )}
+
+        {/* ── Embedded network connections (unified entity) ───────────────── */}
+        {entity.rawProcessEntity && entity.rawProcessEntity.network.length > 0 && (
+          <DetailSection title={`OWNED CONNECTIONS (${entity.rawProcessEntity.network.length})`}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              {entity.rawProcessEntity.network.map((conn, i) => {
+                const cc = conn.is_threat ? (conn.threat_level === 'Malicious' ? 'var(--red)' : 'var(--amber)') : 'var(--text-dim)';
+                return (
+                  <div key={i} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '5px 8px', borderRadius: 4,
+                    background: conn.is_threat ? `${cc}06` : 'var(--elevated)',
+                    border: `1px solid ${conn.is_threat ? `${cc}25` : 'var(--border)'}`,
+                  }}>
+                    <Wifi size={9} color={cc} style={{ flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: cc, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {conn.protocol.toUpperCase()} → {conn.remote_address}
+                      </div>
+                      <div style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', marginTop: 1 }}>
+                        {conn.state}
+                      </div>
+                    </div>
+                    {conn.is_threat && (
+                      <span style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: cc, padding: '1px 5px', borderRadius: 3, background: `${cc}18`, flexShrink: 0 }}>
+                        {conn.threat_level.toUpperCase()}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </DetailSection>
+        )}
+
+        {/* ── Embedded memory regions (unified entity) ───────────────────── */}
+        {entity.rawProcessEntity && entity.rawProcessEntity.memory.length > 0 && (
+          <DetailSection title={`MEMORY REGIONS (${entity.rawProcessEntity.memory.length})`}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              {entity.rawProcessEntity.memory.map((r, i) => {
+                const mc = r.is_threat ? (r.threat_level === 'Malicious' ? 'var(--red)' : 'var(--amber)') : 'var(--text-dim)';
+                return (
+                  <div key={i} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '5px 8px', borderRadius: 4,
+                    background: r.is_threat ? `${mc}06` : 'var(--elevated)',
+                    border: `1px solid ${r.is_threat ? `${mc}25` : 'var(--border)'}`,
+                  }}>
+                    <HardDrive size={9} color={mc} style={{ flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: mc }}>
+                        0x{r.region_start.toString(16).toUpperCase()} · {(r.region_size / 1024).toFixed(1)} KB
+                      </div>
+                      <div style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', marginTop: 1 }}>
+                        {r.protection}{r.is_executable ? ' · EXEC' : ''}{r.is_writable ? ' · WRITE' : ''}
+                      </div>
+                    </div>
+                    {r.is_threat && (
+                      <span style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: mc, padding: '1px 5px', borderRadius: 3, background: `${mc}18`, flexShrink: 0 }}>
+                        {r.threat_level.toUpperCase()}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </DetailSection>
+        )}
+
+        {/* ── Embedded files (unified entity) ────────────────────────────── */}
+        {entity.rawProcessEntity && entity.rawProcessEntity.files.length > 0 && (
+          <DetailSection title={`ASSOCIATED FILES (${entity.rawProcessEntity.files.length})`}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              {entity.rawProcessEntity.files.map((f, i) => {
+                const fc = f.level === 'Malicious' ? 'var(--red)' : 'var(--amber)';
+                const fname = f.path.split(/[/\\]/).pop() ?? f.path;
+                return (
+                  <div key={i} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '5px 8px', borderRadius: 4,
+                    background: `${fc}06`, border: `1px solid ${fc}25`,
+                  }}>
+                    <FolderOpen size={9} color={fc} style={{ flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: fc, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={f.path}>
+                        {fname}
+                      </div>
+                      <div style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', marginTop: 1 }}>
+                        {f.file_category} · {(f.confidence_score * 100).toFixed(0)}% confidence
+                      </div>
+                    </div>
+                    <span style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: fc, padding: '1px 5px', borderRadius: 3, background: `${fc}18`, flexShrink: 0 }}>
+                      {f.level.toUpperCase()}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </DetailSection>
         )}
 
         {/* ── Network-specific fields ─────────────────────────────────────── */}
@@ -1016,68 +1154,78 @@ export default function EntityManager() {
   const [includeMemory, setIncludeMemory] = useState(false);
 
   // ── Build client-side entity nodes from store ──────────────────────────────
+  // Each process becomes ONE unified entity with all owned network/memory/files
+  // embedded inside it. Orphan connections (no matching process) and orphan
+  // files (not a running exe) are kept as standalone entities.
   const entities = useMemo<EntityNode[]>(() => {
     const nodes: EntityNode[] = [];
     const mlFlows = mlIdsResult?.flows ?? [];
 
-    processes.forEach((p) => {
-      const threat = unifyThreat(p.threat_level);
+    // ── Process entities (unified) ─────────────────────────────────────────
+    const processEntities = buildProcessEntities(
+      processes, networkConnections, memoryRegions, scanResults, mlFlows,
+    );
+    processEntities.forEach((pe) => {
       nodes.push({
-        entity_id: `proc:${p.pid}:${p.name}`, entity_type: 'Process',
-        heuristic_score: p.threat_score, heuristic_max: 30,
-        combined_score: combined(p.threat_score, 30), threat_level: threat,
-        detection_signals: p.detection_signals,
-        join_keys: { pid: p.pid, parent_pid: p.parent_pid ?? undefined, file_path: p.exe_path ?? undefined },
-        label: p.name, sub_label: p.exe_path ?? undefined,
-        rawProcess: p,
+        entity_id:         pe.entity_id,
+        entity_type:       'Process',
+        heuristic_score:   pe.raw.threat_score,
+        heuristic_max:     30,
+        ml_score:          pe.ml_score,
+        combined_score:    pe.combined_score,
+        threat_level:      pe.threat_level,
+        detection_signals: pe.detection_signals,
+        join_keys:         { pid: pe.pid, parent_pid: pe.parent_pid ?? undefined, file_path: pe.exe_path ?? undefined },
+        label:             pe.name,
+        sub_label:         pe.exe_path ?? undefined,
+        rawProcess:        pe.raw,
+        rawProcessEntity:  pe,
       });
     });
 
-    networkConnections.forEach((conn) => {
-      const ml    = mlFlows.length > 0 ? matchMlScore(conn.remote_address, mlFlows) : undefined;
+    // ── Orphan network connections (pid not in process list) ───────────────
+    orphanConnections(networkConnections, processes).forEach((conn) => {
+      const ml     = mlFlows.length > 0 ? matchMlScore(conn.remote_address, mlFlows) : undefined;
       const threat = unifyThreat(conn.threat_level);
       const parsed = parseRemoteIp(conn.remote_address);
       nodes.push({
-        entity_id: `net:${conn.protocol}:${conn.local_address}:${conn.remote_address}`, entity_type: 'Network',
-        heuristic_score: conn.threat_score, heuristic_max: 40, ml_score: ml,
-        combined_score: combined(conn.threat_score, 40, ml), threat_level: threat,
+        entity_id:         `net:${conn.protocol}:${conn.local_address}:${conn.remote_address}`,
+        entity_type:       'Network',
+        heuristic_score:   conn.threat_score, heuristic_max: 40, ml_score: ml,
+        combined_score:    combined(conn.threat_score, 40, ml), threat_level: threat,
         detection_signals: conn.detection_signals,
-        join_keys: { pid: conn.pid ?? undefined, remote_ip: parsed?.ip, remote_port: parsed?.port },
-        label: `${conn.protocol.toUpperCase()} → ${conn.remote_address}`,
-        sub_label: conn.process_name ? `${conn.process_name} · ${conn.state}` : conn.state,
-        rawNetwork: conn,
+        join_keys:         { pid: conn.pid ?? undefined, remote_ip: parsed?.ip, remote_port: parsed?.port },
+        label:             `${conn.protocol.toUpperCase()} → ${conn.remote_address}`,
+        sub_label:         conn.process_name ? `${conn.process_name} · ${conn.state}` : conn.state,
+        rawNetwork:        conn,
       });
     });
 
-    memoryRegions.forEach((r) => {
-      const threat = r.threat_level === 'Malicious' ? 'Malicious' : 'Suspicious' as UnifiedThreat;
+    // ── Orphan files (not the exe of any running process) ─────────────────
+    orphanFiles(scanResults, processes).forEach((f) => {
+      const threat    = f.level === 'Malicious' ? 'Malicious' : 'Suspicious' as UnifiedThreat;
+      const fileName  = f.path.split(/[/\\]/).pop() ?? f.path;
       nodes.push({
-        entity_id: `mem:${r.pid}:${r.region_start.toString(16)}`, entity_type: 'Memory',
-        heuristic_score: r.threat_score, heuristic_max: 40,
-        combined_score: combined(r.threat_score, 40), threat_level: threat,
-        detection_signals: r.detection_signals,
-        join_keys: { pid: r.pid },
-        label: `${r.process_name} @ 0x${r.region_start.toString(16).toUpperCase()}`,
-        sub_label: `${r.protection} · size: ${(r.region_size / 1024).toFixed(1)} KB`,
-        rawMemory: r,
-      });
-    });
-
-    scanResults.filter((f) => f.level !== 'Clean').forEach((f) => {
-      const threat = f.level === 'Malicious' ? 'Malicious' : 'Suspicious' as UnifiedThreat;
-      const fileName = f.path.split(/[/\\]/).pop() ?? f.path;
-      nodes.push({
-        entity_id: `file:${f.hash ?? f.path}`, entity_type: 'File',
-        heuristic_score: Math.round(f.confidence_score * 20), heuristic_max: 20,
-        combined_score: combined(Math.round(f.confidence_score * 20), 20), threat_level: threat,
+        entity_id:         `file:${f.hash ?? f.path}`,
+        entity_type:       'File',
+        heuristic_score:   Math.round(f.confidence_score * 20), heuristic_max: 20,
+        combined_score:    combined(Math.round(f.confidence_score * 20), 20), threat_level: threat,
         detection_signals: f.detection_signals,
-        join_keys: { file_path: f.path, file_hash: f.hash ?? undefined },
-        label: fileName, sub_label: f.path,
-        rawFile: f,
+        join_keys:         { file_path: f.path, file_hash: f.hash ?? undefined },
+        label:             fileName, sub_label: f.path,
+        rawFile:           f,
       });
     });
 
-    return nodes;
+    // Deduplicate by entity_id — keep highest combined_score entry
+    const seen = new Map<string, EntityNode>();
+    for (const node of nodes) {
+      const prev = seen.get(node.entity_id);
+      if (!prev || node.combined_score > prev.combined_score) {
+        seen.set(node.entity_id, node);
+      }
+    }
+    return Array.from(seen.values());
   }, [processes, networkConnections, memoryRegions, scanResults, mlIdsResult]);
 
   // ── Stats ──────────────────────────────────────────────────────────────────
@@ -1086,15 +1234,16 @@ export default function EntityManager() {
     return {
       total:   entities.length,
       process: entities.filter((e) => e.entity_type === 'Process').length,
-      network: entities.filter((e) => e.entity_type === 'Network').length,
-      memory:  entities.filter((e) => e.entity_type === 'Memory').length,
-      file:    entities.filter((e) => e.entity_type === 'File').length,
+      // Raw counts — connections/regions/files may be embedded in process entities
+      network: networkConnections.length,
+      memory:  memoryRegions.length,
+      file:    scanResults.filter((f) => f.level !== 'Clean').length,
       threats: entities.filter((e) => e.threat_level !== 'Clean').length,
       withML:  entities.filter((e) => e.ml_score !== undefined).length,
       chains:  cr?.graph?.attack_chains?.length ?? 0,
       backendClusters: cr?.clusters?.length ?? 0,
     };
-  }, [entities, correlateResult]);
+  }, [entities, correlateResult, networkConnections, memoryRegions, scanResults]);
 
   // ── Filter + sort ──────────────────────────────────────────────────────────
   const filtered = useMemo(() => {
@@ -1225,10 +1374,10 @@ export default function EntityManager() {
       {/* Stats */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: 10, flexShrink: 0 }}>
         <StatCard label="TOTAL ENTITIES" value={stats.total}   color="var(--text-bright)" />
-        <StatCard label="PROCESS"        value={stats.process} color="var(--cyan)"    sub="heuristics" />
-        <StatCard label="NETWORK"        value={stats.network} color="var(--green)"   sub="heuristics" />
-        <StatCard label="MEMORY"         value={stats.memory}  color="var(--amber)"   sub="heuristics" />
-        <StatCard label="FILE"           value={stats.file}    color="var(--text-dim)" sub="heuristics" />
+        <StatCard label="PROCESSES"      value={stats.process} color="var(--cyan)"    sub="unified entities" />
+        <StatCard label="CONNECTIONS"    value={stats.network} color="var(--green)"   sub="embedded in proc" />
+        <StatCard label="MEM REGIONS"    value={stats.memory}  color="var(--amber)"   sub="embedded in proc" />
+        <StatCard label="THREAT FILES"   value={stats.file}    color="var(--text-dim)" sub="embedded / orphan" />
         <StatCard label="THREATS"        value={stats.threats} color={stats.threats > 0 ? 'var(--red)' : 'var(--green)'} sub="non-clean" />
         <StatCard label="ML SCORED"      value={stats.withML}  color="#a78bfa"         sub="network+ML" />
         <StatCard label="ATTACK CHAINS"  value={stats.chains}  color={stats.chains > 0 ? 'var(--red)' : 'var(--text-dim)'} sub="from graph" />
@@ -1263,18 +1412,22 @@ export default function EntityManager() {
         {viewMode === 'flat' && (
           <>
             <div style={{ display: 'flex', gap: 3 }}>
-              {(['all', 'Process', 'Network', 'Memory', 'File'] as const).map((t) => (
-                <button key={t} onClick={() => setTypeFilter(t)} style={{
-                  padding: '5px 10px', borderRadius: 5, fontSize: 9, fontFamily: 'var(--font-hud)',
-                  border: `1px solid ${typeFilter === t ? 'var(--border-md)' : 'transparent'}`,
-                  background: typeFilter === t ? 'var(--elevated)' : 'transparent',
-                  color: typeFilter === t ? 'var(--text)' : 'var(--text-dim)', cursor: 'pointer',
-                }}>
-                  {t === 'all'
-                    ? `ALL (${stats.total})`
-                    : `${t.toUpperCase()} (${stats[t.toLowerCase() as 'process' | 'network' | 'memory' | 'file']})`}
-                </button>
-              ))}
+              {(['all', 'Process', 'Network', 'File'] as const).map((t) => {
+                // entity counts for filter badges
+                const count = t === 'all'
+                  ? stats.total
+                  : entities.filter((e) => e.entity_type === t).length;
+                return (
+                  <button key={t} onClick={() => setTypeFilter(t as TypeFilter)} style={{
+                    padding: '5px 10px', borderRadius: 5, fontSize: 9, fontFamily: 'var(--font-hud)',
+                    border: `1px solid ${typeFilter === t ? 'var(--border-md)' : 'transparent'}`,
+                    background: typeFilter === t ? 'var(--elevated)' : 'transparent',
+                    color: typeFilter === t ? 'var(--text)' : 'var(--text-dim)', cursor: 'pointer',
+                  }}>
+                    {t === 'all' ? `ALL (${count})` : `${t.toUpperCase()} (${count})`}
+                  </button>
+                );
+              })}
             </div>
             <div style={{ width: 1, height: 16, background: 'var(--border)' }} />
             {(['all', 'threats'] as const).map((t) => (

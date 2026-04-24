@@ -1,0 +1,231 @@
+================================================================================
+  AegisAI — API Feature Extractor: High-Level Logic
+  Files: api_parameters.rs  +  API_feature_extractor.rs
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+  OVERVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+The API Feature Extractor bridges live Windows API telemetry with two
+consumers:
+
+  1. The GRU-Attention model (Python / Sys_API/inference.py)
+       → produces a per-process malware probability (0–1)
+       → feeds into GraphNode::ml_score
+
+  2. The Threat Graph edge layer (graph/builder.rs)
+       → each detected edge signal carries a weight multiplier
+       → multiplier is applied to GraphEdge::weight when the edge is drawn
+         between the calling process and its target entity
+
+
+────────────────────────────────────────────────────────────────────────────────
+  COMPONENT SPLIT
+────────────────────────────────────────────────────────────────────────────────
+
+  api_parameters.rs                         API_feature_extractor.rs
+  ─────────────────────────────────────     ────────────────────────────────────
+  Static knowledge base                     Runtime engine
+
+  • ApiCategory  (semantic bucket)          • ApiFeatureExtractor  (main struct)
+  • EdgeSignal   (graph relationship)       • Per-PID ring buffer (VecDeque)
+  • ApiParam     (typed parameter value)    • ingest_call()
+  • ApiCall      (one captured call event)  • extract_features()
+  • ParsedTarget (resolved target entity)   • classify_edge_signals()
+  • ApiParameterSchema (per-API metadata)   • detect_injection_sequence()
+  • ApiKnowledgeBase   (registry of ~75     • detect_c2_sequence()
+      APIs with params + edge signals)      • run_gru_inference()
+  • resolve_target()                        • combined_score()
+      converts ApiCall → ParsedTarget
+
+
+────────────────────────────────────────────────────────────────────────────────
+  DATA FLOW  (one process, one assessment cycle)
+────────────────────────────────────────────────────────────────────────────────
+
+  [ETW Provider / Hook Callback]
+          │
+          │  ApiCall { name, pid, timestamp_ms, params: Vec<ApiParam> }
+          ▼
+  ApiFeatureExtractor::ingest_call()
+    → appends to VecDeque<ApiCall> keyed by PID
+    → oldest call evicted when buffer reaches BUFFER_CAPACITY (512)
+          │
+          ▼
+  ApiFeatureExtractor::extract_features(pid)
+    │
+    ├─ build_sequence()
+    │    → Vec<String> of API names in arrival order
+    │    → this is the raw input to the GRU model
+    │
+    ├─ build_category_counts()
+    │    → HashMap<ApiCategory, u32>   (histogram feature vector)
+    │    → ProcessAccess: N,  MemoryWrite: N,  NetworkConnect: N, …
+    │
+    ├─ compute_injection_score()
+    │    → sum of threat_weight for all MemoryInjection-signal APIs
+    │    → clamped to [0, 1]   (heuristic_injection_score)
+    │
+    ├─ detect_injection_sequence()    ← Boolean flag
+    │    Looks for the 4-step classic injection chain:
+    │      Step 1: OpenProcess / NtOpenProcess
+    │      Step 2: VirtualAllocEx / NtAllocateVirtualMemory
+    │      Step 3: WriteProcessMemory / NtWriteVirtualMemory
+    │      Step 4: CreateRemoteThread / NtCreateThreadEx /
+    │              RtlCreateUserThread / NtQueueApcThread / SetThreadContext
+    │    All 4 must appear in order in the buffer.
+    │
+    ├─ detect_c2_sequence()           ← Boolean flag
+    │    Looks for the 3-phase C2 communication pattern:
+    │      Phase 1: connect / WSAConnect / InternetConnectA/W
+    │      Phase 2: send / WSASend / HttpSendRequestA/W  (data out)
+    │      Phase 3: recv / WSARecv                        (command in)
+    │
+    ├─ classify_edge_signals()
+    │    For each API call in the buffer:
+    │      a) kb.edge_signal_for(name)  → EdgeSignal variant
+    │      b) kb.resolve_target(call)   → ParsedTarget
+    │           • ProcessId(u32)  for injection/token APIs
+    │           • FilePath(str)   for file/exec/registry APIs
+    │           • NetworkEndpoint for connect/send/DNS APIs
+    │    Groups by (EdgeSignal, target) → deduplicated DetectedEdgeSignal list
+    │    Each DetectedEdgeSignal carries:
+    │      • edge_type  (MemoryInjection, NetworkOwner, …)
+    │      • multiplier (see table below)
+    │      • trigger_apis  (API names that contributed)
+    │      • target         (the entity on the other end)
+    │
+    └─ run_gru_inference()
+         Spawns Python subprocess:
+           python -c "
+             sys.path.insert(0, './Sys_API')
+             from inference import predict_process
+             calls = json.loads(sys.stdin.read())
+             print(json.dumps(predict_process(calls)))
+           "
+         Writes JSON sequence to stdin.
+         Reads JSON prediction from stdout:
+           { probability, label, verdict, trigger_chunk, top_api_calls }
+         Returns GruPrediction or None on failure.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  EDGE TYPE → MULTIPLIER TABLE
+────────────────────────────────────────────────────────────────────────────────
+
+  EdgeSignal          Multiplier   Rationale
+  ──────────────────  ──────────   ─────────────────────────────────────────────
+  MemoryInjection       ×1.50      RWX allocation + write into another process.
+                                   Classic shellcode / DLL injection.
+                                   Triggered by: OpenProcess, VirtualAllocEx,
+                                   WriteProcessMemory, CreateRemoteThread, etc.
+
+  NetworkOwner          ×1.40      This process owns a C2 network connection.
+                                   Triggered by: connect, WSAConnect,
+                                   InternetConnect*, HttpSendRequest*, recv.
+
+  SharedC2              ×1.30      Multiple processes connecting to the same
+                                   remote IP — lateral movement or shared loader.
+                                   Detected at the network-scanner / graph layer.
+
+  ProcessOpenedFile     ×1.20      A flagged process opened a flagged file
+                                   (loader writing a dropper, ransomware opening
+                                   victim files, etc.)
+                                   Triggered by: CreateFileW, NtCreateFile,
+                                   WriteFile, DeleteFile, MoveFileEx, etc.
+
+  ParentChild           ×1.10      Flagged process spawned another process
+                                   (propagation / privilege escalation chain).
+                                   Triggered by: CreateProcess*, ShellExecute*,
+                                   WinExec, NtCreateProcess*.
+
+  SameProcess           ×1.00      Two entities share the same OS PID (baseline).
+                                   Triggered by: CreateToolhelp32Snapshot,
+                                   NtQuerySystemInformation, etc.
+
+  SharedFileHash        ×0.90      Two processes loaded the same file by hash
+                                   (weaker spread indicator, detected at file layer).
+
+
+────────────────────────────────────────────────────────────────────────────────
+  COMBINED THREAT SCORE
+────────────────────────────────────────────────────────────────────────────────
+
+  combined_score = 0.40 × (heuristic_score / 40.0)  +  0.60 × gru_probability
+
+  • heuristic_score  — from ProcessScanner (path, name, handle, module checks)
+  • gru_probability  — sigmoid output of the GRU-Attention model
+  • If GRU inference fails, combined_score = heuristic_score / 40.0  (full weight)
+
+  This value is written into GraphNode::ml_score and propagates to
+  GraphEdge::weight = max(combined_score_from, combined_score_to).
+
+
+────────────────────────────────────────────────────────────────────────────────
+  GRU MODEL DETAILS  (Sys_API/)
+────────────────────────────────────────────────────────────────────────────────
+
+  Architecture : Embedding(279 × 64) → GRU(hidden=128) → Masked Attention → FC
+  Input        : ordered list of Windows API call names (strings)
+  Output       : { probability ∈ [0,1], label, verdict, top_api_calls }
+
+  Preprocessing (preprocessing_pipeline.py):
+    • Drop empty / non-string entries
+    • Keep only vocab-known API names  (unknown calls silently ignored)
+    • Reject if fewer than 5 valid calls remain
+    • Encode: API name → integer ID via vocab.pkl
+
+  Inference (inference.py):
+    • Short sequences (≤ 177 calls)  → single forward pass
+    • Long sequences  (> 177 calls)  → sliding window (stride=100),
+                                        pick chunk with highest probability
+    • Returns top-10 attention-weighted API calls for explainability
+
+
+────────────────────────────────────────────────────────────────────────────────
+  GRAPH INTEGRATION SUMMARY
+────────────────────────────────────────────────────────────────────────────────
+
+  After extract_features(pid) returns:
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  ApiFeatures.gru.probability                                 │
+  │    → GraphNode::ml_score  (drives combined_score weighting)  │
+  │                                                              │
+  │  ApiFeatures.detected_edges[i]                               │
+  │    .edge_type   → matches GraphEdge::edge_type               │
+  │    .multiplier  → applied to GraphEdge::weight               │
+  │    .target      → second node of the directed edge           │
+  │      ProcessId  → look up process entity by PID              │
+  │      FilePath   → look up file entity by path                │
+  │      NetworkEndpoint → look up network entity by IP          │
+  │                                                              │
+  │  ApiFeatures.injection_sequence_detected                     │
+  │    → adds DetectionSignal("api", "injection chain", +30)     │
+  │      to ProcessInfo.detection_signals                        │
+  │                                                              │
+  │  ApiFeatures.c2_sequence_detected                            │
+  │    → adds DetectionSignal("api", "c2 pattern", +25)          │
+  │      to ProcessInfo.detection_signals                        │
+  └──────────────────────────────────────────────────────────────┘
+
+
+────────────────────────────────────────────────────────────────────────────────
+  EXTENDING THE KNOWLEDGE BASE
+────────────────────────────────────────────────────────────────────────────────
+
+  To add a new API to api_parameters.rs:
+
+    reg!("NewApiName",
+        ApiCategory::RemoteThread,          // semantic bucket
+        EdgeSignal::MemoryInjection,        // graph edge implied
+        &["param0", "param1", "param2"],    // parameter names
+        Some(0),                            // index of "target" parameter
+        0.75,                               // threat weight [0, 1]
+    );
+
+  The extractor picks it up automatically at next engine start.
+  No other code needs to change.
+
+================================================================================

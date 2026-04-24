@@ -26,10 +26,19 @@ function threatColor(level: UnifiedThreat | string): string {
   return '#00ff88';
 }
 
+// One distinct colour per edge relationship type
+const EDGE_COLORS: Record<string, string> = {
+  memory_injection:    '#ff2d55',  // vivid red    — RWX injection          ×1.50
+  network_owner:       '#f97316',  // orange       — process owns C2        ×1.40
+  shared_c2:           '#facc15',  // yellow       — shared C2 server       ×1.30
+  process_opened_file: '#e879f9',  // fuchsia      — process opened file    ×1.20
+  parent_child:        '#00d4ff',  // cyan         — spawned process        ×1.10
+  same_process:        '#a78bfa',  // lavender     — same OS PID            ×1.00
+  shared_file_hash:    '#34d399',  // teal         — same binary hash       ×0.90
+};
+
 function edgeColor(kind: string): string {
-  if (kind === 'memory_injection' || kind === 'network_owner') return '#ff3355';
-  if (kind === 'shared_c2'        || kind === 'process_opened_file') return '#ffb300';
-  return '#00d4ff';
+  return EDGE_COLORS[kind] ?? '#00d4ff';
 }
 
 const EDGE_LABEL: Record<string, string> = {
@@ -159,13 +168,15 @@ export default function ThreatGraph() {
         label: `${c.protocol.toUpperCase()} → ${c.remote_address}`,
         sub_label: c.process_name ?? undefined,
       }));
-      memoryRegions.forEach((r) => allNodes.push({
-        entity_id: `mem:${r.pid}:${r.region_start.toString(16)}`, entity_type: 'memory',
-        threat_level: r.threat_level as UnifiedThreat,
-        combined_score: Math.min(r.threat_score / 40, 1),
-        heuristic_score: r.threat_score,
-        label: `${r.process_name} @0x${r.region_start.toString(16).toUpperCase()}`,
-      }));
+      if (includeMemory) {
+        memoryRegions.forEach((r) => allNodes.push({
+          entity_id: `mem:${r.pid}:${r.region_start.toString(16)}`, entity_type: 'memory',
+          threat_level: r.threat_level as UnifiedThreat,
+          combined_score: Math.min(r.threat_score / 40, 1),
+          heuristic_score: r.threat_score,
+          label: `${r.process_name} @0x${r.region_start.toString(16).toUpperCase()}`,
+        }));
+      }
       scanResults.forEach((f) => allNodes.push({
         entity_id: `file:${f.hash ?? f.path}`, entity_type: 'file',
         threat_level: f.level as UnifiedThreat,
@@ -186,11 +197,13 @@ export default function ThreatGraph() {
         if (c.pid != null && procIds.has(c.pid))
           allEdges.push({ from: `proc:${c.pid}`, to: `net:${c.local_address}:${c.remote_address}`, edge_type: 'network_owner', weight: 1 });
       });
-      // process → its memory regions (by pid)
-      memoryRegions.forEach((r) => {
-        if (procIds.has(r.pid))
-          allEdges.push({ from: `proc:${r.pid}`, to: `mem:${r.pid}:${r.region_start.toString(16)}`, edge_type: 'memory_injection', weight: 1 });
-      });
+      // process → its memory regions (by pid) — only when memory layer is enabled
+      if (includeMemory) {
+        memoryRegions.forEach((r) => {
+          if (procIds.has(r.pid))
+            allEdges.push({ from: `proc:${r.pid}`, to: `mem:${r.pid}:${r.region_start.toString(16)}`, edge_type: 'memory_injection', weight: 1 });
+        });
+      }
       // shared file hash edges
       const byHash = new Map<string, string[]>();
       scanResults.forEach((f) => {
@@ -223,7 +236,7 @@ export default function ThreatGraph() {
     const visEdges = allEdges.filter((e) => ids.has(e.from) && ids.has(e.to));
 
     return { visNodes, visEdges, criticalPath };
-  }, [correlateResult, processes, networkConnections, memoryRegions, scanResults]);
+  }, [correlateResult, processes, networkConnections, memoryRegions, scanResults, includeMemory]);
 
   const { placed, vW, vH } = useMemo(() => computeLayout(visNodes), [visNodes.map((n) => n.entity_id).join(',')]);
   const nodeMap             = useMemo(() => new Map(placed.map((n) => [n.id, n])), [placed]);
@@ -607,14 +620,58 @@ export default function ThreatGraph() {
             </svg>
           )}
 
-          {/* Bottom hint */}
+          {/* ── Bottom edge-type colour map ──────────────────────────────── */}
           {!noData && (
             <div style={{
-              position: 'absolute', bottom: 10, left: 14,
-              fontFamily: 'var(--font-mono)', fontSize: 8, color: 'var(--text-dim)', opacity: 0.4,
+              position: 'absolute', bottom: 0, left: 0, right: 0,
+              display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px 14px',
+              padding: '7px 14px',
+              background: 'rgba(7,11,18,0.90)',
+              backdropFilter: 'blur(10px)',
+              borderTop: '1px solid rgba(255,255,255,0.05)',
             }}>
-              click node to inspect · {visNodes.length} nodes · {visEdges.length} edges
-              {criticalPath && ` · critical path: ${criticalPath.node_ids.length} nodes`}
+              {/* Each edge type */}
+              {(Object.keys(EDGE_COLORS) as string[]).map((type) => {
+                const col = EDGE_COLORS[type];
+                return (
+                  <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <svg width={22} height={7} style={{ flexShrink: 0 }}>
+                      <line x1={0} y1={3.5} x2={22} y2={3.5}
+                        stroke={col} strokeWidth={2} strokeDasharray="5 3" />
+                    </svg>
+                    <span style={{
+                      fontFamily: 'var(--font-mono)', fontSize: 7.5,
+                      color: col, whiteSpace: 'nowrap',
+                    }}>
+                      {EDGE_LABEL[type]}
+                      <span style={{ opacity: 0.55, marginLeft: 3 }}>
+                        ×{(EDGE_MULTIPLIER[type] ?? 1).toFixed(1)}
+                      </span>
+                    </span>
+                  </div>
+                );
+              })}
+              {/* Critical path */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                <svg width={22} height={7} style={{ flexShrink: 0 }}>
+                  <line x1={0} y1={3.5} x2={22} y2={3.5}
+                    stroke={CRITICAL_COLOR} strokeWidth={2.5} strokeDasharray="5 3" />
+                </svg>
+                <span style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 7.5,
+                  color: CRITICAL_COLOR, whiteSpace: 'nowrap',
+                }}>
+                  CRITICAL PATH
+                </span>
+              </div>
+              {/* Node count (right-aligned) */}
+              <span style={{
+                marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 7.5,
+                color: 'var(--text-dim)', opacity: 0.45, whiteSpace: 'nowrap',
+              }}>
+                {visNodes.length} nodes · {visEdges.length} edges
+                {criticalPath && ` · path: ${criticalPath.node_ids.length}`}
+              </span>
             </div>
           )}
         </div>
@@ -662,22 +719,22 @@ function buildActivity(nodeId: string, edges: GraphEdgeData[], nodeMap: Map<stri
 
     type Config = { verb: string; prep: string; color: string; icon: string };
     const OUT: Record<string, Config> = {
-      parent_child:        { verb: 'Spawned',           prep: 'child process',        color: '#00d4ff', icon: '▶' },
-      network_owner:       { verb: 'Connected',         prep: 'to',                   color: '#ffb300', icon: '⇢' },
-      memory_injection:    { verb: 'Injected code',     prep: 'into',                 color: '#ff3355', icon: '⚡' },
-      process_opened_file: { verb: 'Opened file',       prep: '',                     color: '#a78bfa', icon: '📄' },
-      shared_file_hash:    { verb: 'Same binary as',    prep: '',                     color: '#6ee7b7', icon: '=' },
-      shared_c2:           { verb: 'Shares C2 with',    prep: '',                     color: '#ff3355', icon: '⚠' },
-      same_process:        { verb: 'Co-process with',   prep: '',                     color: '#00ff88', icon: '○' },
+      memory_injection:    { verb: 'Injected code',     prep: 'into',                 color: EDGE_COLORS.memory_injection,    icon: '⚡' },
+      network_owner:       { verb: 'Connected',         prep: 'to',                   color: EDGE_COLORS.network_owner,       icon: '⇢' },
+      shared_c2:           { verb: 'Shares C2 with',    prep: '',                     color: EDGE_COLORS.shared_c2,           icon: '⚠' },
+      process_opened_file: { verb: 'Opened file',       prep: '',                     color: EDGE_COLORS.process_opened_file, icon: '📄' },
+      parent_child:        { verb: 'Spawned',           prep: 'child process',        color: EDGE_COLORS.parent_child,        icon: '▶' },
+      same_process:        { verb: 'Co-process with',   prep: '',                     color: EDGE_COLORS.same_process,        icon: '○' },
+      shared_file_hash:    { verb: 'Same binary as',    prep: '',                     color: EDGE_COLORS.shared_file_hash,    icon: '=' },
     };
     const IN: Record<string, Config> = {
-      parent_child:        { verb: 'Spawned by',        prep: 'parent',               color: '#00d4ff', icon: '◀' },
-      network_owner:       { verb: 'Owned by',          prep: 'process',              color: '#ffb300', icon: '⇠' },
-      memory_injection:    { verb: 'Injected by',       prep: '',                     color: '#ff3355', icon: '⚡' },
-      process_opened_file: { verb: 'Accessed by',       prep: 'process',              color: '#a78bfa', icon: '📄' },
-      shared_file_hash:    { verb: 'Same binary as',    prep: '',                     color: '#6ee7b7', icon: '=' },
-      shared_c2:           { verb: 'Shares C2 with',    prep: '',                     color: '#ff3355', icon: '⚠' },
-      same_process:        { verb: 'Co-process with',   prep: '',                     color: '#00ff88', icon: '○' },
+      memory_injection:    { verb: 'Injected by',       prep: '',                     color: EDGE_COLORS.memory_injection,    icon: '⚡' },
+      network_owner:       { verb: 'Owned by',          prep: 'process',              color: EDGE_COLORS.network_owner,       icon: '⇠' },
+      shared_c2:           { verb: 'Shares C2 with',    prep: '',                     color: EDGE_COLORS.shared_c2,           icon: '⚠' },
+      process_opened_file: { verb: 'Accessed by',       prep: 'process',              color: EDGE_COLORS.process_opened_file, icon: '📄' },
+      parent_child:        { verb: 'Spawned by',        prep: 'parent',               color: EDGE_COLORS.parent_child,        icon: '◀' },
+      same_process:        { verb: 'Co-process with',   prep: '',                     color: EDGE_COLORS.same_process,        icon: '○' },
+      shared_file_hash:    { verb: 'Same binary as',    prep: '',                     color: EDGE_COLORS.shared_file_hash,    icon: '=' },
     };
 
     const cfg = (isOut ? OUT : IN)[e.edge_type];
@@ -1019,17 +1076,35 @@ function LegendPanel({ hasBackend, nodeCount, correlateResult, criticalPath }: {
           </div>
         ))}
         <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
-        {[
-          { color: '#ff3355',    label: 'Memory injection / C2 (×1.5/1.4)' },
-          { color: '#ffb300',    label: 'Shared C2 / File open (×1.3/1.2)' },
-          { color: '#00d4ff',    label: 'Same PID / spawned (×1.0/1.1)' },
-          { color: CRITICAL_COLOR, label: 'Critical path edge' },
-        ].map(({ color, label }) => (
-          <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <svg width={24} height={8}><line x1={0} y1={4} x2={24} y2={4} stroke={color} strokeWidth={2} strokeDasharray="5 3" /></svg>
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>{label}</span>
-          </div>
-        ))}
+        {/* One row per edge type */}
+        {(Object.keys(EDGE_COLORS) as string[]).map((type) => {
+          const col = EDGE_COLORS[type];
+          return (
+            <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <svg width={24} height={8} style={{ flexShrink: 0 }}>
+                <line x1={0} y1={4} x2={24} y2={4} stroke={col} strokeWidth={2} strokeDasharray="5 3" />
+              </svg>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8.5, color: col, flex: 1 }}>
+                {EDGE_LABEL[type]}
+              </span>
+              <span style={{ fontFamily: 'var(--font-hud)', fontSize: 8, color: col, opacity: 0.6, flexShrink: 0 }}>
+                ×{(EDGE_MULTIPLIER[type] ?? 1).toFixed(1)}
+              </span>
+            </div>
+          );
+        })}
+        {/* Critical path */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <svg width={24} height={8} style={{ flexShrink: 0 }}>
+            <line x1={0} y1={4} x2={24} y2={4} stroke={CRITICAL_COLOR} strokeWidth={2.5} strokeDasharray="5 3" />
+          </svg>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8.5, color: CRITICAL_COLOR, flex: 1 }}>
+            CRITICAL PATH
+          </span>
+          <span style={{ fontFamily: 'var(--font-hud)', fontSize: 8, color: CRITICAL_COLOR, opacity: 0.6, flexShrink: 0 }}>
+            overlay
+          </span>
+        </div>
         <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
         <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
           Showing {nodeCount} nodes (up to 60)

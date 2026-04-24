@@ -14,6 +14,9 @@ pub mod output;
 pub mod handles;
 pub mod modules;
 pub mod services;
+pub mod api_parameters;
+#[allow(non_snake_case)]
+pub mod API_feature_extractor;
 
 pub use scanner::ProcessScanner;
 pub use output::OutputFormat;
