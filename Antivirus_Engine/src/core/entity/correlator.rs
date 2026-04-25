@@ -18,8 +18,9 @@ use super::types::{EntityNode, EntityType, UnifiedThreatLevel};
 /// The structural reason two or more entities were grouped.
 #[derive(Debug, Clone)]
 pub enum JoinReason {
-    /// All entities share the same OS process ID.
-    /// Groups: Process ↔ NetworkConnection ↔ MemoryRegion.
+    /// All entities share the same OS process ID, or a File entity whose path
+    /// matches the process executable path.
+    /// Groups: Process ↔ File (exe) ↔ NetworkConnection ↔ MemoryRegion.
     SharedPid(u32),
 
     /// A process (child_pid) was spawned by another process (parent_pid).
@@ -154,7 +155,26 @@ impl<'a> EntityCorrelator<'a> {
 
     /// Group entities by pid.  Only emit a cluster when ≥2 entity *types*
     /// are present — a single process node alone is not a cross-scanner signal.
+    ///
+    /// File entities have no PID join key (the file scanner doesn't track which
+    /// process owns a file), but a process's exe_path is stored in its
+    /// join_keys.file_path.  We pull in any File entity whose file_path matches
+    /// a process exe_path in the group so the cluster covers all four domains:
+    /// Process ↔ File (executable) ↔ NetworkConnection ↔ MemoryRegion.
     fn pid_clusters(&self, nodes: &[EntityNode]) -> Vec<CorrelatedCluster> {
+        // Build a lowercase file_path → File entity index.
+        let mut file_by_path: HashMap<String, Vec<EntityNode>> = HashMap::new();
+        for node in nodes {
+            if node.entity_type == EntityType::File {
+                if let Some(ref fp) = node.join_keys.file_path {
+                    file_by_path
+                        .entry(fp.to_lowercase())
+                        .or_default()
+                        .push(node.clone());
+                }
+            }
+        }
+
         let mut by_pid: HashMap<u32, Vec<EntityNode>> = HashMap::new();
         for node in nodes {
             if let Some(pid) = node.join_keys.pid {
@@ -164,6 +184,27 @@ impl<'a> EntityCorrelator<'a> {
 
         by_pid
             .into_iter()
+            .map(|(pid, mut members)| {
+                // For every process in this PID group, pull in File entities
+                // whose path equals the process executable path.
+                let exe_paths: Vec<String> = members
+                    .iter()
+                    .filter(|n| n.entity_type == EntityType::Process)
+                    .filter_map(|n| n.join_keys.file_path.as_deref().map(|p| p.to_lowercase()))
+                    .collect();
+
+                for exe_path in exe_paths {
+                    if let Some(file_nodes) = file_by_path.get(&exe_path) {
+                        for file_node in file_nodes {
+                            if !members.iter().any(|m| m.entity_id == file_node.entity_id) {
+                                members.push(file_node.clone());
+                            }
+                        }
+                    }
+                }
+
+                (pid, members)
+            })
             .filter(|(_, members)| has_multiple_entity_types(members))
             .map(|(pid, members)| {
                 CorrelatedCluster::build(members, JoinReason::SharedPid(pid))

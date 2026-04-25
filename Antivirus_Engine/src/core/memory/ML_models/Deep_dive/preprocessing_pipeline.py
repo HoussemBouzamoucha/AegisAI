@@ -1,307 +1,433 @@
 """
-Malware Memory-Forensics — Model Training & Evaluation
-================================================================================
-Trains 4 models on the preprocessed splits:
-  - Logistic Regression
-  - Random Forest
-  - XGBoost
-  - LightGBM
+Malware Memory-Forensics — Preprocessing Pipeline (Application Use)
+=====================================================================
+Adapts the Colab pipeline.py for use in a production application.
 
-Evaluates on the held-out test set with:
-  - Accuracy, Precision, Recall, F1
-  - ROC-AUC, PR-AUC
-  - Confusion matrix per model
-  - ROC-curve plot (all models overlaid)
-  - SHAP feature importance for the winning model (chosen by val ROC-AUC)
+Usage
+-----
+Training / fitting (run once, save artifacts):
+    from preprocess import fit_and_save
+    fit_and_save("path/to/Obfuscated-MalMem2022.parquet", artifacts_dir="./artifacts")
 
-Prerequisite: run pipeline.py first to produce /content/splits.npz.
+Loading artifacts and transforming new data:
+    from preprocess import MalMemPreprocessor
+    pre = MalMemPreprocessor.load("./artifacts")
+    X = pre.transform(df_raw)          # numpy float32 array, shape (n, 68)
 
-Usage in Colab:
-    !python /content/pipeline.py       # produces splits.npz
-    !python /content/train.py          # produces metrics + plots
+Single-snapshot dict (e.g. from a live Volatility scan):
+    X = pre.transform_dict(volatility_dict)
 """
 
 from __future__ import annotations
 
-import time
-import warnings
+import os
+import json
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, average_precision_score,
-    confusion_matrix, roc_curve,
-)
-import xgboost as xgb
-import lightgbm as lgb
-
-warnings.filterwarnings("ignore", category=UserWarning)
+import joblib
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
 
 # ============================================================================
-# 1. LOAD PRECOMPUTED SPLITS
+# DTYPE SCHEMA  (mirrors pipeline.py exactly)
 # ============================================================================
-def load_splits(npz_path: str):
-    d = np.load(npz_path, allow_pickle=True)
-    return {
-        "X_train": d["X_train"], "y_train": d["y_train"],
-        "X_val":   d["X_val"],   "y_val":   d["y_val"],
-        "X_test":  d["X_test"],  "y_test":  d["y_test"],
-        "feature_names": d["feature_names"].tolist(),
-    }
-
-
-# ============================================================================
-# 2. MODEL FACTORY — sensible defaults, class-balanced where applicable
-# ============================================================================
-def build_models(random_state: int = 42) -> dict:
-    """Return a dict of {name: unfitted_estimator}. Defaults only."""
-    return {
-        "LogisticRegression": LogisticRegression(
-            max_iter=1000,
-            class_weight="balanced",
-            solver="lbfgs",
-            random_state=random_state,
-        ),
-        "RandomForest": RandomForestClassifier(
-            n_estimators=200,
-            class_weight="balanced",
-            n_jobs=-1,
-            random_state=random_state,
-        ),
-        "XGBoost": xgb.XGBClassifier(
-            n_estimators=300,
-            learning_rate=0.1,
-            max_depth=6,
-            tree_method="hist",  # fast histogram-based training
-            eval_metric="logloss",
-            n_jobs=-1,
-            random_state=random_state,
-        ),
-        "LightGBM": lgb.LGBMClassifier(
-            n_estimators=300,
-            learning_rate=0.1,
-            max_depth=-1,
-            num_leaves=31,
-            n_jobs=-1,
-            random_state=random_state,
-            verbose=-1,
-        ),
-    }
+DOWNCAST_DTYPES: dict[str, str] = {
+    "pslist.nproc": "int16", "pslist.nppid": "int8",
+    "pslist.avg_threads": "float32", "pslist.nprocs64bit": "int8",
+    "pslist.avg_handlers": "float32",
+    "dlllist.ndlls": "int16", "dlllist.avg_dlls_per_proc": "float32",
+    "handles.nhandles": "int32", "handles.avg_handles_per_proc": "float32",
+    "handles.nport": "int8", "handles.nfile": "int32",
+    "handles.nevent": "int16", "handles.ndesktop": "int16",
+    "handles.nkey": "int16", "handles.nthread": "int16",
+    "handles.ndirectory": "int16", "handles.nsemaphore": "int16",
+    "handles.ntimer": "int16", "handles.nsection": "int16",
+    "handles.nmutant": "int16",
+    "ldrmodules.not_in_load": "int16", "ldrmodules.not_in_init": "int16",
+    "ldrmodules.not_in_mem": "int16",
+    "ldrmodules.not_in_load_avg": "float32",
+    "ldrmodules.not_in_init_avg": "float32",
+    "ldrmodules.not_in_mem_avg": "float32",
+    "malfind.ninjections": "int16", "malfind.commitCharge": "int32",
+    "malfind.protection": "int16", "malfind.uniqueInjections": "float32",
+    "psxview.not_in_pslist": "int8", "psxview.not_in_eprocess_pool": "int8",
+    "psxview.not_in_ethread_pool": "int16", "psxview.not_in_pspcid_list": "int8",
+    "psxview.not_in_csrss_handles": "int16", "psxview.not_in_session": "int8",
+    "psxview.not_in_deskthrd": "int16",
+    "psxview.not_in_pslist_false_avg": "float32",
+    "psxview.not_in_eprocess_pool_false_avg": "float32",
+    "psxview.not_in_ethread_pool_false_avg": "float32",
+    "psxview.not_in_pspcid_list_false_avg": "float32",
+    "psxview.not_in_csrss_handles_false_avg": "float32",
+    "psxview.not_in_session_false_avg": "float32",
+    "psxview.not_in_deskthrd_false_avg": "float32",
+    "modules.nmodules": "int16",
+    "svcscan.nservices": "int16", "svcscan.kernel_drivers": "int16",
+    "svcscan.fs_drivers": "int8", "svcscan.process_services": "int8",
+    "svcscan.shared_process_services": "int8",
+    "svcscan.interactive_process_services": "int8",
+    "svcscan.nactive": "int16",
+    "callbacks.ncallbacks": "int8", "callbacks.nanonymous": "int8",
+    "callbacks.ngeneric": "int8",
+}
+RAW_FEATURES: list[str] = list(DOWNCAST_DTYPES.keys())   # 55 columns
 
 
 # ============================================================================
-# 3. METRICS
+# WINDOWS PAGE PROTECTION CONSTANTS
 # ============================================================================
-def compute_metrics(y_true, y_pred, y_proba) -> dict:
-    """Six standard binary-classification metrics."""
-    return {
-        "accuracy":   accuracy_score(y_true, y_pred),
-        "precision":  precision_score(y_true, y_pred, zero_division=0),
-        "recall":     recall_score(y_true, y_pred, zero_division=0),
-        "f1":         f1_score(y_true, y_pred, zero_division=0),
-        "roc_auc":    roc_auc_score(y_true, y_proba),
-        "pr_auc":     average_precision_score(y_true, y_proba),
-    }
+PAGE_NOACCESS                           = 0x01
+PAGE_READWRITE, PAGE_WRITECOPY         = 0x04, 0x08
+PAGE_EXECUTE, PAGE_EXECUTE_READ        = 0x10, 0x20
+PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY = 0x40, 0x80
 
+EXEC_MASK  = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+WRITE_MASK = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+COW_MASK   = PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY
 
-# ============================================================================
-# 4. TRAIN + EVALUATE ALL MODELS
-# ============================================================================
-def train_and_evaluate(splits: dict) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
-    """
-    Fit every model on train, evaluate on val and test.
-    Returns: (fitted_models, val_metrics_df, test_metrics_df).
-    """
-    X_train, y_train = splits["X_train"], splits["y_train"]
-    X_val,   y_val   = splits["X_val"],   splits["y_val"]
-    X_test,  y_test  = splits["X_test"],  splits["y_test"]
-
-    models = build_models()
-    fitted = {}
-    val_rows, test_rows = [], []
-
-    for name, model in models.items():
-        print(f"\n=== {name} ===")
-        t0 = time.time()
-        model.fit(X_train, y_train)
-        fit_time = time.time() - t0
-        print(f"  fit: {fit_time:.1f}s")
-
-        # Validation metrics (used for model selection)
-        y_val_pred  = model.predict(X_val)
-        y_val_proba = model.predict_proba(X_val)[:, 1]
-        val_m = compute_metrics(y_val, y_val_pred, y_val_proba)
-        val_m["model"] = name
-        val_m["fit_sec"] = fit_time
-        val_rows.append(val_m)
-
-        # Test metrics (final reporting only)
-        y_test_pred  = model.predict(X_test)
-        y_test_proba = model.predict_proba(X_test)[:, 1]
-        test_m = compute_metrics(y_test, y_test_pred, y_test_proba)
-        test_m["model"] = name
-        test_rows.append(test_m)
-
-        print(f"  val  ROC-AUC: {val_m['roc_auc']:.4f}  |  test ROC-AUC: {test_m['roc_auc']:.4f}")
-        fitted[name] = model
-
-    col_order = ["model", "accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc"]
-    val_df  = pd.DataFrame(val_rows)[col_order + ["fit_sec"]]
-    test_df = pd.DataFrame(test_rows)[col_order]
-    return fitted, val_df, test_df
+PSXVIEW_COUNT_COLS = [
+    "psxview.not_in_pslist", "psxview.not_in_eprocess_pool",
+    "psxview.not_in_ethread_pool", "psxview.not_in_pspcid_list",
+    "psxview.not_in_csrss_handles", "psxview.not_in_session",
+    "psxview.not_in_deskthrd",
+]
+LDRMODULES_COUNT_COLS = [
+    "ldrmodules.not_in_load", "ldrmodules.not_in_init", "ldrmodules.not_in_mem",
+]
 
 
 # ============================================================================
-# 5. PLOTS
+# COLUMN GROUPS FOR THE SKLEARN TRANSFORMER
 # ============================================================================
-def plot_confusion_matrices(fitted: dict, X_test, y_test, out_path: str) -> None:
-    fig, axes = plt.subplots(1, len(fitted), figsize=(4 * len(fitted), 4))
-    if len(fitted) == 1:
-        axes = [axes]
-    for ax, (name, model) in zip(axes, fitted.items()):
-        cm = confusion_matrix(y_test, model.predict(X_test))
-        im = ax.imshow(cm, cmap="Blues")
-        ax.set_title(name)
-        ax.set_xticks([0, 1]); ax.set_xticklabels(["Benign", "Malware"])
-        ax.set_yticks([0, 1]); ax.set_yticklabels(["Benign", "Malware"])
-        ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
-        for (i, j), v in np.ndenumerate(cm):
-            color = "white" if v > cm.max() / 2 else "black"
-            ax.text(j, i, str(v), ha="center", va="center", color=color)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {out_path}")
+LOG_SCALE_COLS: list[str] = [
+    "pslist.nproc", "pslist.nppid", "pslist.avg_threads", "pslist.nprocs64bit",
+    "pslist.avg_handlers",
+    "dlllist.ndlls", "dlllist.avg_dlls_per_proc",
+    "handles.nhandles", "handles.avg_handles_per_proc",
+    "handles.nport", "handles.nfile", "handles.nevent", "handles.ndesktop",
+    "handles.nkey", "handles.nthread", "handles.ndirectory",
+    "handles.nsemaphore", "handles.ntimer", "handles.nsection", "handles.nmutant",
+    "ldrmodules.not_in_load", "ldrmodules.not_in_init", "ldrmodules.not_in_mem",
+    "malfind.ninjections", "malfind.commitCharge", "malfind.uniqueInjections",
+    "psxview.not_in_pslist", "psxview.not_in_eprocess_pool",
+    "psxview.not_in_ethread_pool", "psxview.not_in_pspcid_list",
+    "psxview.not_in_csrss_handles", "psxview.not_in_session",
+    "psxview.not_in_deskthrd",
+    "modules.nmodules",
+    "svcscan.nservices", "svcscan.kernel_drivers", "svcscan.fs_drivers",
+    "svcscan.process_services", "svcscan.shared_process_services",
+    "svcscan.interactive_process_services", "svcscan.nactive",
+    "callbacks.ncallbacks", "callbacks.nanonymous", "callbacks.ngeneric",
+    "psxview_total_hidden", "ldrmodules_total_missing",
+    "handles_per_process", "dlls_per_process",
+    "injection_severity", "avg_commit_per_injection",
+]
 
+SCALE_ONLY_COLS: list[str] = [
+    "ldrmodules.not_in_load_avg", "ldrmodules.not_in_init_avg",
+    "ldrmodules.not_in_mem_avg",
+    "psxview.not_in_pslist_false_avg", "psxview.not_in_eprocess_pool_false_avg",
+    "psxview.not_in_ethread_pool_false_avg", "psxview.not_in_pspcid_list_false_avg",
+    "psxview.not_in_csrss_handles_false_avg", "psxview.not_in_session_false_avg",
+    "psxview.not_in_deskthrd_false_avg",
+    "anonymous_callback_ratio",
+]
 
-def plot_roc_curves(fitted: dict, X_test, y_test, out_path: str) -> None:
-    plt.figure(figsize=(7, 6))
-    for name, model in fitted.items():
-        proba = model.predict_proba(X_test)[:, 1]
-        fpr, tpr, _ = roc_curve(y_test, proba)
-        auc = roc_auc_score(y_test, proba)
-        plt.plot(fpr, tpr, label=f"{name} (AUC={auc:.4f})")
-    plt.plot([0, 1], [0, 1], "k--", alpha=0.3, label="Chance")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("ROC Curves — Test Set")
-    plt.legend(loc="lower right")
-    plt.grid(alpha=0.3)
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close()
-    print(f"Saved {out_path}")
+PASSTHROUGH_COLS: list[str] = [
+    "malfind.protection",
+    "is_executable", "is_writable", "is_rwx", "is_copy_on_write",
+    "is_noaccess", "is_executable_only",
+]
 
-
-# ============================================================================
-# 6. SHAP — explain the winner
-# ============================================================================
-def explain_winner(
-    winner_name: str,
-    winner_model,
-    X_train,
-    X_test,
-    feature_names: list,
-    out_path: str,
-    sample_size: int = 1000,
-) -> None:
-    """SHAP summary for the best model. Uses TreeExplainer for tree models
-    and LinearExplainer for Logistic Regression."""
-    import shap
-
-    # For speed, explain a random subsample of the test set
-    rng = np.random.default_rng(0)
-    idx = rng.choice(len(X_test), size=min(sample_size, len(X_test)), replace=False)
-    X_sample = X_test[idx]
-
-    print(f"\n=== SHAP: explaining {winner_name} ===")
-    if winner_name == "LogisticRegression":
-        explainer = shap.LinearExplainer(winner_model, X_train)
-        shap_values = explainer.shap_values(X_sample)
-    else:
-        explainer = shap.TreeExplainer(winner_model)
-        raw = explainer.shap_values(X_sample)
-        # Some tree explainers return a list (one per class) for binary problems
-        if isinstance(raw, list):
-            shap_values = raw[1]  # positive class (malware)
-        elif raw.ndim == 3:
-            shap_values = raw[:, :, 1]
-        else:
-            shap_values = raw
-
-    plt.figure(figsize=(9, 8))
-    shap.summary_plot(shap_values, X_sample, feature_names=feature_names,
-                      show=False, max_display=20)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close()
-    print(f"Saved {out_path}")
-
-    # Also print the top features by mean |SHAP|
-    importance = np.abs(shap_values).mean(axis=0)
-    top = sorted(zip(feature_names, importance), key=lambda x: -x[1])[:15]
-    print("\nTop 15 features by mean |SHAP value|:")
-    for name, val in top:
-        print(f"  {val:+.4f}  {name}")
+ALL_MODEL_COLS = LOG_SCALE_COLS + SCALE_ONLY_COLS + PASSTHROUGH_COLS  # 68 total
 
 
 # ============================================================================
-# 7. COLAB ENTRY POINT
+# STATELESS FEATURE ENGINEERING
 # ============================================================================
-SPLITS_PATH = "/content/splits.npz"
-OUT_DIR     = "/content"
+def _add_protection_flags(df: pd.DataFrame) -> pd.DataFrame:
+    prot = df["malfind.protection"].astype("int32")
+    df["is_executable"]      = ((prot & EXEC_MASK)  > 0).astype("int8")
+    df["is_writable"]        = ((prot & WRITE_MASK) > 0).astype("int8")
+    df["is_rwx"]             = (df["is_executable"] & df["is_writable"]).astype("int8")
+    df["is_copy_on_write"]   = ((prot & COW_MASK)   > 0).astype("int8")
+    df["is_noaccess"]        = ((prot & PAGE_NOACCESS) > 0).astype("int8")
+    df["is_executable_only"] = (df["is_executable"] & (1 - df["is_writable"])).astype("int8")
+    return df
 
-if __name__ == "__main__":
-    Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 
-    splits = load_splits(SPLITS_PATH)
-    print(f"Train: {splits['X_train'].shape}  Val: {splits['X_val'].shape}  "
-          f"Test: {splits['X_test'].shape}")
+def _add_cross_check_aggregates(df: pd.DataFrame) -> pd.DataFrame:
+    df["psxview_total_hidden"]     = df[PSXVIEW_COUNT_COLS].sum(axis=1).astype("int16")
+    df["ldrmodules_total_missing"] = df[LDRMODULES_COUNT_COLS].sum(axis=1).astype("int16")
+    return df
 
-    fitted, val_df, test_df = train_and_evaluate(splits)
 
-    print("\n" + "=" * 70)
-    print("VALIDATION METRICS (used for model selection)")
-    print("=" * 70)
-    print(val_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+def _add_density_ratios(df: pd.DataFrame) -> pd.DataFrame:
+    nproc = df["pslist.nproc"].astype("float32") + 1.0
+    df["handles_per_process"]      = (df["handles.nhandles"].astype("float32") / nproc).astype("float32")
+    df["dlls_per_process"]         = (df["dlllist.ndlls"].astype("float32") / nproc).astype("float32")
+    df["anonymous_callback_ratio"] = (
+        df["callbacks.nanonymous"].astype("float32")
+        / (df["callbacks.ncallbacks"].astype("float32") + 1.0)
+    ).astype("float32")
+    return df
 
-    # Pick winner by validation ROC-AUC
-    winner_name = val_df.loc[val_df["roc_auc"].idxmax(), "model"]
-    print(f"\n>>> Winner on validation ROC-AUC: {winner_name} <<<")
 
-    print("\n" + "=" * 70)
-    print("TEST METRICS (held-out, final reporting)")
-    print("=" * 70)
-    print(test_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+def _add_injection_features(df: pd.DataFrame) -> pd.DataFrame:
+    df["injection_severity"]       = (
+        df["malfind.ninjections"].astype("float32") * (1.0 + df["is_rwx"].astype("float32"))
+    ).astype("float32")
+    df["avg_commit_per_injection"] = (
+        df["malfind.commitCharge"].astype("float32")
+        / (df["malfind.ninjections"].astype("float32") + 1.0)
+    ).astype("float32")
+    return df
 
-    # Save metrics tables
-    val_df.to_csv(f"{OUT_DIR}/val_metrics.csv", index=False)
-    test_df.to_csv(f"{OUT_DIR}/test_metrics.csv", index=False)
 
-    # Plots
-    plot_confusion_matrices(fitted, splits["X_test"], splits["y_test"],
-                            f"{OUT_DIR}/confusion_matrices.png")
-    plot_roc_curves(fitted, splits["X_test"], splits["y_test"],
-                    f"{OUT_DIR}/roc_curves.png")
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """All stateless feature engineering. Input: raw Volatility DataFrame.
+    Output: same DataFrame with 13 additional columns appended."""
+    df = _add_protection_flags(df)
+    df = _add_cross_check_aggregates(df)
+    df = _add_density_ratios(df)
+    df = _add_injection_features(df)
+    return df
 
-    # SHAP for the winner
-    explain_winner(
-        winner_name=winner_name,
-        winner_model=fitted[winner_name],
-        X_train=splits["X_train"],
-        X_test=splits["X_test"],
-        feature_names=splits["feature_names"],
-        out_path=f"{OUT_DIR}/shap_{winner_name}.png",
+
+def _build_column_transformer() -> ColumnTransformer:
+    log_then_scale = Pipeline([
+        ("log1p", FunctionTransformer(np.log1p, feature_names_out="one-to-one", validate=True)),
+        ("scale", StandardScaler()),
+    ])
+    return ColumnTransformer(
+        transformers=[
+            ("log_scale",   log_then_scale,   LOG_SCALE_COLS),
+            ("scale_only",  StandardScaler(), SCALE_ONLY_COLS),
+            ("passthrough", "passthrough",    PASSTHROUGH_COLS),
+        ],
+        remainder="drop",
+        verbose_feature_names_out=False,
     )
 
-    # Persist the winning model
-    import joblib
-    joblib.dump(fitted[winner_name], f"{OUT_DIR}/winner_{winner_name}.joblib")
-    print(f"\nWrote {OUT_DIR}/winner_{winner_name}.joblib")
-    print("Done.")
+
+# ============================================================================
+# MalMemPreprocessor — the main application class
+# ============================================================================
+class MalMemPreprocessor:
+    """
+    Stateful preprocessor: wraps engineer_features + ColumnTransformer.
+
+    Typical lifecycle
+    -----------------
+    1. Fit once on training data:
+           pre = MalMemPreprocessor()
+           pre.fit(X_train_raw_df)
+           pre.save("./artifacts")
+
+    2. Load in your application and transform:
+           pre = MalMemPreprocessor.load("./artifacts")
+           X = pre.transform(new_df)          # → float32 ndarray (n, 68)
+           X = pre.transform_dict(row_dict)   # → float32 ndarray (1, 68)
+    """
+
+    PREPROCESSOR_FILE  = "preprocessor.joblib"
+    FEATURE_NAMES_FILE = "feature_names.json"
+
+    def __init__(self) -> None:
+        self._ct: ColumnTransformer | None = None
+        self._feature_names: list[str] = []
+        self._fitted = False
+
+    # ------------------------------------------------------------------
+    # Fit
+    # ------------------------------------------------------------------
+    def fit(self, df: pd.DataFrame) -> "MalMemPreprocessor":
+        """Fit on a raw Volatility DataFrame (must contain the 55 RAW_FEATURES)."""
+        df = self._validate_and_cast(df)
+        df = engineer_features(df.copy())
+        self._ct = _build_column_transformer()
+        self._ct.fit(df[ALL_MODEL_COLS])
+        self._feature_names = self._ct.get_feature_names_out().tolist()
+        self._fitted = True
+        return self
+
+    # ------------------------------------------------------------------
+    # Transform
+    # ------------------------------------------------------------------
+    def transform(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Transform a raw Volatility DataFrame.
+        Returns float32 ndarray of shape (n_rows, 68).
+        """
+        self._check_fitted()
+        df = self._validate_and_cast(df.copy())
+        df = engineer_features(df)
+        return self._ct.transform(df[ALL_MODEL_COLS]).astype(np.float32)
+
+    def transform_dict(self, record: dict) -> np.ndarray:
+        """
+        Transform a single Volatility snapshot given as a Python dict.
+        Returns float32 ndarray of shape (1, 68).
+
+        Example
+        -------
+        record = {
+            "pslist.nproc": 42, "pslist.nppid": 38, ...,  # all 55 raw fields
+        }
+        X = pre.transform_dict(record)
+        """
+        df = pd.DataFrame([record])
+        return self.transform(df)
+
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+    def save(self, directory: str) -> None:
+        """Persist the fitted transformer and feature names to disk."""
+        self._check_fitted()
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        joblib.dump(self._ct, os.path.join(directory, self.PREPROCESSOR_FILE))
+        with open(os.path.join(directory, self.FEATURE_NAMES_FILE), "w") as f:
+            json.dump(self._feature_names, f, indent=2)
+        print(f"Saved preprocessor to '{directory}/'")
+
+    @classmethod
+    def load(cls, directory: str) -> "MalMemPreprocessor":
+        """Load a previously saved preprocessor from disk."""
+        pre = cls()
+        ct_path = os.path.join(directory, cls.PREPROCESSOR_FILE)
+        fn_path = os.path.join(directory, cls.FEATURE_NAMES_FILE)
+        if not os.path.exists(ct_path):
+            raise FileNotFoundError(f"Preprocessor not found at '{ct_path}'. Run fit_and_save() first.")
+        pre._ct = joblib.load(ct_path)
+        with open(fn_path) as f:
+            pre._feature_names = json.load(f)
+        pre._fitted = True
+        print(f"Loaded preprocessor from '{directory}/' — {len(pre._feature_names)} features")
+        return pre
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+    @property
+    def feature_names(self) -> list[str]:
+        self._check_fitted()
+        return self._feature_names
+
+    @property
+    def n_features(self) -> int:
+        return len(self._feature_names)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _check_fitted(self) -> None:
+        if not self._fitted:
+            raise RuntimeError("Preprocessor is not fitted yet. Call fit() or load() first.")
+
+    @staticmethod
+    def _validate_and_cast(df: pd.DataFrame) -> pd.DataFrame:
+        missing = [c for c in RAW_FEATURES if c not in df.columns]
+        if missing:
+            raise KeyError(
+                f"Input is missing {len(missing)} required Volatility column(s): {missing[:5]}{'...' if len(missing) > 5 else ''}"
+            )
+        return df.astype({c: t for c, t in DOWNCAST_DTYPES.items() if c in df.columns})
+
+
+# ============================================================================
+# Convenience: fit_and_save (run once from CLI or a setup script)
+# ============================================================================
+def fit_and_save(
+    parquet_path: str,
+    artifacts_dir: str = "./artifacts",
+    test_size: float = 0.15,
+    val_size: float = 0.15,
+    random_state: int = 42,
+) -> dict:
+    """
+    Load the dataset, engineer features, split, fit the preprocessor on train
+    only, save artifacts, and return the processed splits.
+
+    Returns
+    -------
+    dict with keys: X_train, y_train, X_val, y_val, X_test, y_test,
+                    preprocessor (MalMemPreprocessor), feature_names (list)
+    """
+    print(f"Loading dataset from '{parquet_path}' …")
+    df = pd.read_parquet(parquet_path)
+
+    missing = [c for c in RAW_FEATURES + ["Class"] if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing expected columns: {missing}")
+
+    df = df.astype({c: t for c, t in DOWNCAST_DTYPES.items() if c in df.columns})
+    df = df.dropna(subset=RAW_FEATURES + ["Class"]).reset_index(drop=True)
+
+    # Label: 0 = benign, 1 = malware
+    y = (df["Class"].astype(str).str.strip().str.lower() != "benign").astype("int8").to_numpy()
+
+    # Drop metadata columns before engineering
+    X_raw = df.drop(columns=[c for c in ("Category", "Class", "label") if c in df.columns])
+
+    # Stratified split BEFORE fitting any statistics-bearing transformer
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X_raw, y, test_size=test_size, stratify=y, random_state=random_state,
+    )
+    val_relative = val_size / (1.0 - test_size)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval,
+        test_size=val_relative, stratify=y_trainval, random_state=random_state,
+    )
+
+    # Fit on TRAIN ONLY
+    pre = MalMemPreprocessor()
+    pre.fit(X_train)
+    pre.save(artifacts_dir)
+
+    X_train_t = pre.transform(X_train)
+    X_val_t   = pre.transform(X_val)
+    X_test_t  = pre.transform(X_test)
+
+    print(f"Train : {X_train_t.shape}  prevalence={y_train.mean():.4f}")
+    print(f"Val   : {X_val_t.shape}  prevalence={y_val.mean():.4f}")
+    print(f"Test  : {X_test_t.shape}  prevalence={y_test.mean():.4f}")
+
+    # Save numpy splits alongside the preprocessor
+    np.savez_compressed(
+        os.path.join(artifacts_dir, "splits.npz"),
+        X_train=X_train_t, y_train=y_train,
+        X_val=X_val_t,     y_val=y_val,
+        X_test=X_test_t,   y_test=y_test,
+        feature_names=np.array(pre.feature_names),
+    )
+    print(f"Saved splits to '{artifacts_dir}/splits.npz'")
+
+    return {
+        "X_train": X_train_t, "y_train": y_train,
+        "X_val":   X_val_t,   "y_val":   y_val,
+        "X_test":  X_test_t,  "y_test":  y_test,
+        "preprocessor":   pre,
+        "feature_names":  pre.feature_names,
+    }
+
+
+# ============================================================================
+# CLI entry point
+# ============================================================================
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Fit and save MalMem preprocessor.")
+    parser.add_argument("parquet", help="Path to Obfuscated-MalMem2022.parquet")
+    parser.add_argument("--artifacts-dir", default="./artifacts",
+                        help="Directory to save preprocessor artifacts (default: ./artifacts)")
+    args = parser.parse_args()
+
+    fit_and_save(args.parquet, artifacts_dir=args.artifacts_dir)
