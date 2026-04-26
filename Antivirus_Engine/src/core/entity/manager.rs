@@ -92,6 +92,21 @@ impl EntityManager {
         self.nodes.insert(entity_id, node);
     }
 
+    /// Ingest a zero-score structural stub for a process that was seen in
+    /// memory or network signals but was not directly scanned by the process
+    /// heuristics.  The stub carries only name, parent_pid, and exe_path —
+    /// enough for the graph layer to draw ParentChild edges.
+    ///
+    /// No-ops if a process entity for this PID is already present, so calling
+    /// this after a full process scan is always safe.
+    pub fn ingest_process_stub(&self, process: &ProcessInfo) {
+        let entity_id = format!("proc:{}:{}", process.pid, process.name);
+        if self.nodes.contains_key(&entity_id) {
+            return; // full process scan already ingested this PID
+        }
+        self.ingest_process(process);
+    }
+
     /// Ingest a ScanResult produced by the file scanner heuristics.
     pub fn ingest_file(&self, result: &ScanResult) {
         let path_str = result.path.to_string_lossy().to_string();
@@ -418,9 +433,298 @@ impl EntityManager {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+
+    // ── Aggregation ───────────────────────────────────────────────────────────
+
+    /// Aggregate flat EntityNodes into composite entities for the graph layer.
+    ///
+    /// One `AggregatedEntity` is produced per OS process (PID-anchored),
+    /// embedding its owned network connections, memory regions, and executable
+    /// file.  PID-keyed nodes whose process was never ingested (e.g. memory or
+    /// network observed for a PID the process scanner skipped) are merged into a
+    /// process-less `entity:{pid}` node so no signal is silently dropped.
+    /// Network connections with no PID at all and standalone malicious files each
+    /// become their own entity node.
+    pub fn aggregate(&self) -> Vec<super::types::AggregatedEntity> {
+        use std::collections::{HashMap, HashSet};
+        use super::types::{AggregatedEntity, EntityAttributes, EntityType};
+
+        let all = self.get_all();
+
+        let mut procs:     Vec<EntityNode> = Vec::new();
+        let mut nets:      Vec<EntityNode> = Vec::new();
+        let mut mems:      Vec<EntityNode> = Vec::new();
+        let mut files:     Vec<EntityNode> = Vec::new();
+
+        for n in all {
+            match n.entity_type {
+                EntityType::Process           => procs.push(n),
+                EntityType::NetworkConnection => nets.push(n),
+                EntityType::MemoryRegion      => mems.push(n),
+                EntityType::File              => files.push(n),
+            }
+        }
+
+        // Index network and memory nodes by PID
+        let mut net_by_pid: HashMap<u32, Vec<EntityNode>> = HashMap::new();
+        let mut orphan_net: Vec<EntityNode>               = Vec::new();
+        for n in nets {
+            match n.join_keys.pid {
+                Some(pid) => net_by_pid.entry(pid).or_default().push(n),
+                None      => orphan_net.push(n),
+            }
+        }
+        let mut mem_by_pid: HashMap<u32, Vec<EntityNode>> = HashMap::new();
+        for n in mems {
+            if let Some(pid) = n.join_keys.pid {
+                mem_by_pid.entry(pid).or_default().push(n);
+            }
+        }
+
+        // Index files by lowercase exe path (first match wins)
+        let mut file_by_path: HashMap<String, EntityNode> = HashMap::new();
+        for n in &files {
+            if let Some(ref p) = n.join_keys.file_path {
+                file_by_path.entry(p.to_lowercase()).or_insert_with(|| n.clone());
+            }
+        }
+
+        let mut result: Vec<AggregatedEntity> = Vec::new();
+        let mut used_file_ids: HashSet<String> = HashSet::new();
+
+        // ── One entity per process ────────────────────────────────────────────
+        for proc in procs {
+            let Some(pid) = proc.join_keys.pid else { continue };
+            let parent_pid = proc.join_keys.parent_pid;
+
+            let owned_net  = net_by_pid.remove(&pid).unwrap_or_default();
+            let owned_mem  = mem_by_pid.remove(&pid).unwrap_or_default();
+
+            let exe_file = proc.join_keys.file_path.as_ref()
+                .and_then(|p| file_by_path.get(&p.to_lowercase()))
+                .cloned();
+            if let Some(ref f) = exe_file {
+                used_file_ids.insert(f.entity_id.clone());
+            }
+            let owned_files: Vec<EntityNode> = exe_file.into_iter().collect();
+
+            let name = match &proc.attributes {
+                EntityAttributes::Process(p) => strip_exe_suffix(&p.name),
+                _                            => format!("proc:{}", pid),
+            };
+
+            result.push(assemble_entity(
+                format!("entity:{}", pid),
+                name,
+                Some(proc),
+                owned_net,
+                owned_mem,
+                owned_files,
+                Some(pid),
+                parent_pid,
+            ));
+        }
+
+        // ── PID-keyed nodes whose process was never ingested ─────────────────
+        // net_by_pid and mem_by_pid may still contain entries for PIDs that
+        // had no matching process entity (e.g. the process scanner skipped them
+        // or memory/network ran independently).  Merge by PID so no signal is lost.
+        {
+            let mut leftover_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            leftover_pids.extend(net_by_pid.keys().copied());
+            leftover_pids.extend(mem_by_pid.keys().copied());
+
+            for pid in leftover_pids {
+                let nets = net_by_pid.remove(&pid).unwrap_or_default();
+                let mems = mem_by_pid.remove(&pid).unwrap_or_default();
+
+                // Derive the best available process name from memory or network attributes.
+                let name = mems.first()
+                    .and_then(|m| {
+                        if let EntityAttributes::Memory(ref ma) = m.attributes {
+                            Some(format!("{} (pid:{})", strip_exe_suffix(&ma.process_name), pid))
+                        } else { None }
+                    })
+                    .or_else(|| nets.first().and_then(|n| {
+                        if let EntityAttributes::Network(ref na) = n.attributes {
+                            na.process_name.as_ref()
+                                .map(|pn| format!("{} (pid:{})", strip_exe_suffix(pn), pid))
+                        } else { None }
+                    }))
+                    .unwrap_or_else(|| format!("pid:{}", pid));
+
+                result.push(assemble_entity(
+                    format!("entity:{}", pid),
+                    name,
+                    None,
+                    nets,
+                    mems,
+                    vec![],
+                    Some(pid),
+                    None,
+                ));
+            }
+        }
+
+        // ── Orphan network connections (no PID at all) ────────────────────────
+        for n in orphan_net {
+            let name = match &n.attributes {
+                EntityAttributes::Network(net) =>
+                    format!("{} → {}", net.protocol.to_uppercase(), net.remote_address),
+                _ => n.entity_id.clone(),
+            };
+            let eid = format!("entity-net:{}", &n.entity_id);
+            result.push(assemble_entity(eid, name, None, vec![n], vec![], vec![], None, None));
+        }
+
+        // ── Standalone files (not matched to any running process) ─────────────
+        for f in files {
+            if used_file_ids.contains(&f.entity_id) { continue; }
+            let name = f.join_keys.file_path.as_ref()
+                .and_then(|p| std::path::Path::new(p.as_str()).file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| f.entity_id.clone());
+            let eid = format!("entity-file:{}", &f.entity_id);
+            result.push(assemble_entity(eid, name, None, vec![], vec![], vec![f], None, None));
+        }
+
+        result
+    }
+}
+
+// ─── Aggregation helper ───────────────────────────────────────────────────────
+
+fn assemble_entity(
+    entity_id:  String,
+    name:       String,
+    process:    Option<EntityNode>,
+    network:    Vec<EntityNode>,
+    memory:     Vec<EntityNode>,
+    files:      Vec<EntityNode>,
+    pid:        Option<u32>,
+    parent_pid: Option<u32>,
+) -> super::types::AggregatedEntity {
+    use super::types::{AggregatedEntity, UnifiedThreatLevel};
+    use crate::core::types::DetectionSignal;
+
+    const LOOPBACK: &[&str] = &["127.", "::1", "0.0.0.0", "::", "*"];
+
+    // ── Per-domain scores ────────────────────────────────────────────────────
+    let process_score = process.as_ref()
+        .map(|p| (p.heuristic_score as f32 / 30.0).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+
+    let network_score = network.iter()
+        .map(|n| (n.heuristic_score as f32 / 40.0).clamp(0.0, 1.0))
+        .fold(0.0_f32, f32::max);
+
+    let memory_score = memory.iter()
+        .map(|n| (n.heuristic_score as f32 / 40.0).clamp(0.0, 1.0))
+        .fold(0.0_f32, f32::max);
+
+    let file_score = files.iter()
+        .map(|n| n.combined_score())
+        .fold(0.0_f32, f32::max);
+
+    // ── ML score: max across owned network sub-entities ──────────────────────
+    let ml_score: Option<f32> = network.iter()
+        .filter_map(|n| n.ml_score)
+        .reduce(f32::max);
+
+    // ── Combined score ────────────────────────────────────────────────────────
+    let heuristic_max = process_score.max(network_score).max(memory_score).max(file_score);
+    let combined_score = match ml_score {
+        Some(ml) => (heuristic_max * 0.4 + ml.clamp(0.0, 1.0) * 0.6).clamp(0.0, 1.0),
+        None     => heuristic_max,
+    };
+
+    // ── Worst threat level across all sub-entities ────────────────────────────
+    fn max_level(a: UnifiedThreatLevel, b: &UnifiedThreatLevel) -> UnifiedThreatLevel {
+        if b > &a { b.clone() } else { a }
+    }
+
+    let mut threat_level = process.as_ref()
+        .map(|p| p.threat_level.clone())
+        .unwrap_or(UnifiedThreatLevel::Clean);
+    for n in network.iter().chain(memory.iter()).chain(files.iter()) {
+        threat_level = max_level(threat_level, &n.threat_level);
+    }
+
+    // ── Intra-entity threat flags ─────────────────────────────────────────────
+    let has_malicious_network = network.iter().any(|n| n.is_threat());
+    let has_malicious_memory  = memory.iter().any(|n| n.is_threat());
+    let has_malicious_file    = files.iter().any(|n| n.is_threat());
+
+    // ── Remote IPs (non-loopback) ────────────────────────────────────────────
+    let mut seen_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let remote_ips: Vec<String> = network.iter()
+        .filter_map(|n| n.join_keys.remote_ip.clone())
+        .filter(|ip| !LOOPBACK.iter().any(|pfx| ip.starts_with(pfx)))
+        .filter(|ip| seen_ips.insert(ip.clone()))
+        .collect();
+
+    // ── File hashes ──────────────────────────────────────────────────────────
+    let mut seen_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let file_hashes: Vec<String> = files.iter()
+        .filter_map(|n| n.join_keys.file_hash.clone())
+        .filter(|h| seen_hashes.insert(h.clone()))
+        .collect();
+
+    // ── Merge detection signals ───────────────────────────────────────────────
+    let detection_signals: Vec<DetectionSignal> = process.iter()
+        .flat_map(|p| p.detection_signals.iter().cloned())
+        .chain(network.iter().flat_map(|n| n.detection_signals.iter().cloned()))
+        .chain(memory.iter().flat_map(|m| m.detection_signals.iter().cloned()))
+        .chain(files.iter().flat_map(|f| f.detection_signals.iter().cloned()))
+        .collect();
+
+    // ── Sub-label: exe path for processes ────────────────────────────────────
+    let sub_label = process.as_ref().and_then(|p| {
+        if let super::types::EntityAttributes::Process(ref pa) = p.attributes {
+            pa.exe_path.clone()
+        } else { None }
+    });
+    let _ = sub_label; // sub_label is stored in the GraphNode, not AggregatedEntity
+
+    AggregatedEntity {
+        entity_id,
+        name,
+        threat_level,
+        combined_score,
+        process_score,
+        network_score,
+        memory_score,
+        file_score,
+        has_malicious_network,
+        has_malicious_memory,
+        has_malicious_file,
+        process,
+        network,
+        memory,
+        files,
+        detection_signals,
+        pid,
+        parent_pid,
+        remote_ips,
+        file_hashes,
+        ml_score,
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Strip the Windows executable extension from a process name for display.
+///
+/// The raw name (e.g. "notepad.exe") is kept intact in entity_id so lookups
+/// are unaffected; only the human-readable label is cleaned up.
+fn strip_exe_suffix(name: &str) -> String {
+    for ext in &[".exe", ".EXE", ".dll", ".DLL", ".sys", ".SYS"] {
+        if let Some(stem) = name.strip_suffix(ext) {
+            if !stem.is_empty() { return stem.to_string(); }
+        }
+    }
+    name.to_string()
+}
 
 /// Split "192.168.1.1:4444" or "[::1]:8080" into (Some(ip), Some(port)).
 /// Returns (None, None) for wildcard addresses ("*", "0.0.0.0:*", etc.).

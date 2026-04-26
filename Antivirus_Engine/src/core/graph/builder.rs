@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::core::entity::{EntityManager, EntityNode, EntityType};
+use crate::core::entity::{AggregatedEntity, EntityManager, EntityNode, EntityType};
 use crate::core::entity::types::EntityAttributes;
 
 use super::types::{EdgeType, GraphEdge, GraphNode, ThreatGraph};
@@ -173,7 +173,154 @@ impl<'a> GraphBuilder<'a> {
     }
 }
 
+// ─── Aggregated-entity graph builder ─────────────────────────────────────────
+
+/// Build a `ThreatGraph` from a slice of composite `AggregatedEntity` nodes.
+///
+/// Each node represents a full OS process (or orphan network/file entity)
+/// with all domain evidence embedded.  Edges are drawn only *between*
+/// entities:
+///   `ParentChild`    — entity A's pid matches entity B's parent_pid
+///   `SharedC2`       — two entities share the same non-loopback remote IP
+///   `SharedFileHash` — two entities share a file SHA-256 hash
+///
+/// This keeps the graph readable (O(processes) nodes instead of
+/// O(processes + connections + regions + files) nodes) and ensures every
+/// node is a semantically complete "actor".
+pub fn build_from_aggregated(entities: &[AggregatedEntity]) -> ThreatGraph {
+    let mut graph = ThreatGraph::new();
+    if entities.is_empty() { return graph; }
+
+    // ── Add nodes ─────────────────────────────────────────────────────────────
+    for e in entities {
+        graph.add_node(aggregate_to_graph_node(e));
+    }
+
+    let scores: HashMap<&str, f32> = entities.iter()
+        .map(|e| (e.entity_id.as_str(), e.combined_score))
+        .collect();
+
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+
+    // ── ParentChild edges ─────────────────────────────────────────────────────
+    let pid_to_entity: HashMap<u32, &str> = entities.iter()
+        .filter_map(|e| e.pid.map(|pid| (pid, e.entity_id.as_str())))
+        .collect();
+
+    for e in entities {
+        if let Some(ppid) = e.parent_pid {
+            if let Some(&parent_id) = pid_to_entity.get(&ppid) {
+                let child_id = e.entity_id.as_str();
+                if parent_id == child_id { continue; }
+                if !seen.insert(canonical_pair(parent_id, child_id)) { continue; }
+                let w = max_score(
+                    *scores.get(parent_id).unwrap_or(&0.0),
+                    *scores.get(child_id).unwrap_or(&0.0),
+                );
+                graph.add_edge(GraphEdge {
+                    from: parent_id.to_string(), to: child_id.to_string(),
+                    edge_type: EdgeType::ParentChild, weight: w,
+                });
+            }
+        }
+    }
+
+    // ── SharedC2 edges (≥2 distinct entities share the same remote IP) ────────
+    let mut ip_to_entities: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in entities {
+        for ip in &e.remote_ips {
+            ip_to_entities.entry(ip.as_str()).or_default().push(e.entity_id.as_str());
+        }
+    }
+    for (_, ids) in &ip_to_entities {
+        if ids.len() < 2 { continue; }
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let a = ids[i]; let b = ids[j];
+                if !seen.insert(canonical_pair(a, b)) { continue; }
+                let w = max_score(*scores.get(a).unwrap_or(&0.0), *scores.get(b).unwrap_or(&0.0));
+                graph.add_edge(GraphEdge {
+                    from: a.to_string(), to: b.to_string(),
+                    edge_type: EdgeType::SharedC2, weight: w,
+                });
+            }
+        }
+    }
+
+    // ── SharedFileHash edges (≥2 distinct entities share the same hash) ───────
+    let mut hash_to_entities: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in entities {
+        for h in &e.file_hashes {
+            hash_to_entities.entry(h.as_str()).or_default().push(e.entity_id.as_str());
+        }
+    }
+    for (_, ids) in &hash_to_entities {
+        if ids.len() < 2 { continue; }
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let a = ids[i]; let b = ids[j];
+                if !seen.insert(canonical_pair(a, b)) { continue; }
+                let w = max_score(*scores.get(a).unwrap_or(&0.0), *scores.get(b).unwrap_or(&0.0));
+                graph.add_edge(GraphEdge {
+                    from: a.to_string(), to: b.to_string(),
+                    edge_type: EdgeType::SharedFileHash, weight: w,
+                });
+            }
+        }
+    }
+
+    graph
+}
+
+/// Convert an `AggregatedEntity` into a `GraphNode`.
+pub fn aggregate_to_graph_node(e: &AggregatedEntity) -> GraphNode {
+    // sub_label: exe path for process-anchored entities
+    let sub_label = e.process.as_ref().and_then(|p| {
+        if let EntityAttributes::Process(ref pa) = p.attributes { pa.exe_path.clone() } else { None }
+    });
+
+    let heuristic_score = e.process.as_ref()
+        .map(|p| p.heuristic_score)
+        .unwrap_or_else(|| {
+            e.network.iter().chain(e.memory.iter()).chain(e.files.iter())
+                .map(|n| n.heuristic_score)
+                .max()
+                .unwrap_or(0)
+        });
+
+    GraphNode {
+        entity_id:             e.entity_id.clone(),
+        entity_type:           "entity".to_string(),
+        threat_level:          e.threat_level.as_str().to_string(),
+        combined_score:        e.combined_score,
+        heuristic_score,
+        ml_score:              e.ml_score,
+        label:                 e.name.clone(),
+        sub_label,
+        process_score:         e.process_score,
+        network_score:         e.network_score,
+        memory_score:          e.memory_score,
+        file_score:            e.file_score,
+        has_malicious_network: e.has_malicious_network,
+        has_malicious_memory:  e.has_malicious_memory,
+        has_malicious_file:    e.has_malicious_file,
+        pid:                   e.pid,
+        parent_pid:            e.parent_pid,
+    }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Strip Windows executable extension for display labels only.
+/// Entity IDs keep the raw name so all lookups remain stable.
+fn strip_exe_suffix(name: &str) -> String {
+    for ext in &[".exe", ".EXE", ".dll", ".DLL", ".sys", ".SYS"] {
+        if let Some(stem) = name.strip_suffix(ext) {
+            if !stem.is_empty() { return stem.to_string(); }
+        }
+    }
+    name.to_string()
+}
 
 /// Canonical (min, max) pair so A→B and B→A map to the same key.
 fn canonical_pair(a: &str, b: &str) -> (String, String) {
@@ -193,18 +340,29 @@ fn pid_edge_type(a: EntityType, b: EntityType) -> EdgeType {
     }
 }
 
-/// Convert an EntityNode into the leaner GraphNode for the graph layer.
+/// Convert a flat EntityNode into a GraphNode (legacy / backward-compat path).
+/// Sub-score fields default to zero; use `aggregate_to_graph_node` for the
+/// aggregated-entity graph.
 pub fn entity_to_graph_node(entity: &EntityNode) -> GraphNode {
     let (label, sub_label) = derive_labels(entity);
     GraphNode {
-        entity_id:       entity.entity_id.clone(),
-        entity_type:     entity.entity_type.as_str().to_string(),
-        threat_level:    entity.threat_level.as_str().to_string(),
-        combined_score:  entity.combined_score(),
-        heuristic_score: entity.heuristic_score,
-        ml_score:        entity.ml_score,
+        entity_id:             entity.entity_id.clone(),
+        entity_type:           entity.entity_type.as_str().to_string(),
+        threat_level:          entity.threat_level.as_str().to_string(),
+        combined_score:        entity.combined_score(),
+        heuristic_score:       entity.heuristic_score,
+        ml_score:              entity.ml_score,
         label,
         sub_label,
+        process_score:         0.0,
+        network_score:         0.0,
+        memory_score:          0.0,
+        file_score:            0.0,
+        has_malicious_network: false,
+        has_malicious_memory:  false,
+        has_malicious_file:    false,
+        pid:                   entity.join_keys.pid,
+        parent_pid:            entity.join_keys.parent_pid,
     }
 }
 
@@ -212,7 +370,7 @@ pub fn entity_to_graph_node(entity: &EntityNode) -> GraphNode {
 pub fn derive_labels(entity: &EntityNode) -> (String, Option<String>) {
     match &entity.attributes {
         EntityAttributes::Process(p) => (
-            p.name.clone(),
+            strip_exe_suffix(&p.name),
             p.exe_path.clone(),
         ),
         EntityAttributes::File(f) => {

@@ -1,6 +1,7 @@
 // src/store/index.ts
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { buildCorrelateResultFromStore } from '../lib/entityUtils';
 import type {
   View, ScanResult, ScanOutput, DirectoryScanResult,
   ProcessInfo, ProcessScanResult, ScanHistoryEntry,
@@ -52,7 +53,9 @@ interface AppState {
   correlateResult:  CorrelateResult | null;
   correlateError:   string | null;
   correlateEntities: (includeMemory?: boolean) => Promise<void>;
+  correlateFromStore: () => void;
   clearCorrelate:   () => void;
+  abortCorrelate:   () => void;
 
   history: ScanHistoryEntry[];
   addHistory: (entry: ScanHistoryEntry) => void;
@@ -136,6 +139,12 @@ function normalizeMemoryRegion(region: any): MemoryRegion {
     detection_signals:  region.detection_signals ?? [],
   };
 }
+// ─── Correlate abort token ────────────────────────────────────────────────────
+// Incremented every time a new correlate starts or the user cancels.
+// Each correlate invocation captures its own snapshot; on completion it checks
+// the current token before touching state — stale results are silently dropped.
+let correlateToken = 0;
+
 // ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useStore = create<AppState>((set, get) => ({
@@ -309,20 +318,58 @@ export const useStore = create<AppState>((set, get) => ({
   correlateError:  null,
 
   correlateEntities: async (includeMemory = false) => {
+    const myToken = ++correlateToken;
     set({ correlating: true, correlateError: null });
     try {
-      const args: Record<string, unknown> = { includeMemory };
-      const result = await invoke<CorrelateResult>('correlate_entities', args);
+      const TIMEOUT_MS = 360_000; // 6 minutes (Rust-side timeout is 5 min; extra buffer)
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(
+            'Correlation timed out after 6 minutes. ' +
+            'The engine may still be running in the background — try again shortly.'
+          )),
+          TIMEOUT_MS,
+        )
+      );
+
+      const result = await Promise.race([
+        invoke<CorrelateResult>('correlate_entities', { includeMemory }),
+        timeout,
+      ]);
+
+      if (correlateToken !== myToken) return; // cancelled while in flight
       if (!result.success) throw new Error(result.error ?? 'Correlation failed');
       set({ correlateResult: result });
     } catch (e: any) {
+      if (correlateToken !== myToken) return;
       set({ correlateError: String(e) });
     } finally {
-      set({ correlating: false });
+      if (correlateToken === myToken) set({ correlating: false });
+    }
+  },
+
+  correlateFromStore: () => {
+    const { processes, networkConnections, memoryRegions, scanResults, mlIdsResult } = get();
+    const mlFlows = mlIdsResult?.flows ?? [];
+    try {
+      const result = buildCorrelateResultFromStore(
+        processes, networkConnections, memoryRegions, scanResults, mlFlows,
+      );
+      set({ correlateResult: result, correlateError: null });
+    } catch (e: any) {
+      set({ correlateError: String(e) });
     }
   },
 
   clearCorrelate: () => set({ correlateResult: null, correlateError: null }),
+
+  // Immediately resets the loading state without waiting for the invoke.
+  // The daemon call may still complete in the background; when it does the
+  // token mismatch ensures the stale result is silently discarded.
+  abortCorrelate: () => {
+    correlateToken++; // invalidate the in-flight invocation
+    set({ correlating: false, correlateError: null });
+  },
 
   history: [],
   addHistory: (entry) =>

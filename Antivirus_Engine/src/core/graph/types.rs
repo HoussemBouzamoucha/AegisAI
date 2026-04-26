@@ -58,20 +58,39 @@ pub struct GraphEdge {
 
 // ─── Graph node ───────────────────────────────────────────────────────────────
 
-/// Lightweight projection of EntityNode for the graph layer.
+/// Lightweight projection of an entity for the graph layer.
+///
+/// For aggregated entity graphs `entity_type` is always `"entity"` and the
+/// per-domain sub-scores + threat flags are populated.  Legacy flat-node graphs
+/// (backward compat) still set `entity_type` to the domain name and leave
+/// sub-scores at their zero defaults.
 #[derive(Debug, Clone)]
 pub struct GraphNode {
     pub entity_id:       String,
-    /// "process" | "file" | "network" | "memory"
+    /// "entity" (aggregated) | "process" | "file" | "network" | "memory" (legacy flat)
     pub entity_type:     String,
     /// "Clean" | "Suspicious" | "Malicious" | "Critical"
     pub threat_level:    String,
     pub combined_score:  f32,
     pub heuristic_score: i32,
     pub ml_score:        Option<f32>,
-    /// Primary display string (process name, filename, "PROTO → IP:PORT", …).
+    /// Primary display string (process name, filename, "NET → IP:PORT", …).
     pub label:           String,
     pub sub_label:       Option<String>,
+
+    // ── Aggregated-entity fields (zero/false for legacy flat nodes) ───────────
+    pub process_score:         f32,
+    pub network_score:         f32,
+    pub memory_score:          f32,
+    pub file_score:            f32,
+    /// True when the entity has at least one malicious-flagged network connection.
+    pub has_malicious_network: bool,
+    /// True when the entity has at least one malicious-flagged memory region.
+    pub has_malicious_memory:  bool,
+    /// True when the entity has at least one malicious-flagged file.
+    pub has_malicious_file:    bool,
+    pub pid:                   Option<u32>,
+    pub parent_pid:            Option<u32>,
 }
 
 // ─── Attack pattern ───────────────────────────────────────────────────────────

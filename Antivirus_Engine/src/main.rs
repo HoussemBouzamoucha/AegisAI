@@ -14,7 +14,7 @@ use core::types::ThreatLevel;
 use core::entity::{
     EntityManager, EntityCorrelator, CorrelatedCluster, JoinReason, EntityNode,
 };
-use core::graph::{GraphBuilder, GraphAnalyzer, GraphNode, GraphEdge, AttackChain, CriticalPath};
+use core::graph::{GraphAnalyzer, GraphNode, GraphEdge, AttackChain, CriticalPath, build_from_aggregated};
 
 use std::path::Path;
 use std::env;
@@ -568,14 +568,23 @@ fn serialize_cluster(cluster: &CorrelatedCluster) -> serde_json::Value {
 
 fn serialize_graph_node(node: &GraphNode) -> serde_json::Value {
     json!({
-        "entity_id":       node.entity_id,
-        "entity_type":     node.entity_type,
-        "threat_level":    node.threat_level,
-        "combined_score":  node.combined_score,
-        "heuristic_score": node.heuristic_score,
-        "ml_score":        node.ml_score,
-        "label":           node.label,
-        "sub_label":       node.sub_label,
+        "entity_id":             node.entity_id,
+        "entity_type":           node.entity_type,
+        "threat_level":          node.threat_level,
+        "combined_score":        node.combined_score,
+        "heuristic_score":       node.heuristic_score,
+        "ml_score":              node.ml_score,
+        "label":                 node.label,
+        "sub_label":             node.sub_label,
+        "process_score":         node.process_score,
+        "network_score":         node.network_score,
+        "memory_score":          node.memory_score,
+        "file_score":            node.file_score,
+        "has_malicious_network": node.has_malicious_network,
+        "has_malicious_memory":  node.has_malicious_memory,
+        "has_malicious_file":    node.has_malicious_file,
+        "pid":                   node.pid,
+        "parent_pid":            node.parent_pid,
     })
 }
 
@@ -708,29 +717,47 @@ fn daemon_correlate(
     let mut net_count    = 0usize;
     let mut mem_count    = 0usize;
 
+    eprintln!("CORRELATE: starting process scan...");
+    let t_proc = std::time::Instant::now();
     match process_scanner.scan_all_processes() {
         Ok(processes) => {
             proc_count = processes.len();
+            eprintln!("CORRELATE: process scan done in {}ms — {} processes", t_proc.elapsed().as_millis(), proc_count);
+
             for p in &processes {
                 manager.ingest_process(p);
-                // Fix #4: scan exe file for threat-level processes so the graph
-                // can draw ProcessOpenedFile edges (malicious file → process).
-                if p.is_threat {
-                    if let Some(ref exe) = p.exe_path {
-                        if let Ok(result) = file_scanner.scan_file(Path::new(exe)) {
-                            manager.ingest_file(&result);
-                        }
-                    }
+            }
+
+            // Only YARA-scan the exe of *confirmed malicious/critical* processes,
+            // capped at 5 to avoid spending minutes on false-positive Suspicious ones.
+            // Suspicious processes are too noisy (many legit system processes score
+            // there) and each file scan is a full YARA + SHA-256 + heuristics pass.
+            use core::process::types::ThreatLevel as ProcThreat;
+            let exe_scan_candidates: Vec<_> = processes.iter()
+                .filter(|p| matches!(p.threat_level, ProcThreat::Malicious | ProcThreat::Critical))
+                .filter_map(|p| p.exe_path.as_ref().map(|e| (p, e.clone())))
+                .take(5)
+                .collect();
+
+            eprintln!("CORRELATE: scanning {} confirmed-malicious exe files...", exe_scan_candidates.len());
+            let t_exe = std::time::Instant::now();
+            for (_, exe) in &exe_scan_candidates {
+                if let Ok(result) = file_scanner.scan_file(Path::new(exe.as_str())) {
+                    manager.ingest_file(&result);
                 }
             }
+            eprintln!("CORRELATE: exe file scans done in {}ms", t_exe.elapsed().as_millis());
         }
         Err(e) => eprintln!("CORRELATE: process scan error: {}", e),
     }
 
     // ── Ingest: Network scanner ───────────────────────────────────────────────
+    eprintln!("CORRELATE: starting network scan...");
+    let t_net = std::time::Instant::now();
     match network_scanner.scan() {
         Ok((connections, _)) => {
             net_count = connections.len();
+            eprintln!("CORRELATE: network scan done in {}ms — {} connections", t_net.elapsed().as_millis(), net_count);
             for conn in &connections { manager.ingest_network(conn, None); }
         }
         Err(e) => eprintln!("CORRELATE: network scan error: {}", e),
@@ -738,32 +765,72 @@ fn daemon_correlate(
 
     // Fix #1: Run the ML pipeline on the OnePace.csv written by the network
     // scanner above and patch ml_score into each matching network entity.
+    eprintln!("CORRELATE: running ML pipeline...");
+    let t_ml = std::time::Instant::now();
     run_ml_and_patch_scores(&manager);
+    eprintln!("CORRELATE: ML pipeline done in {}ms", t_ml.elapsed().as_millis());
 
     // Fix #3: Boost child-process scores when their parent is a threat.
     manager.apply_parent_context_boost();
 
     // ── Ingest: Memory scanner (optional) ────────────────────────────────────
     if include_memory {
+        eprintln!("CORRELATE: starting memory scan...");
+        let t_mem = std::time::Instant::now();
         match memory_scanner.scan_processes(None) {
             Ok((regions, _)) => {
                 // ingest_memory already filters to is_threat == true
                 for region in &regions { manager.ingest_memory(region); }
                 mem_count = manager.len().saturating_sub(proc_count + net_count);
+                eprintln!("CORRELATE: memory scan done in {}ms — {} threat regions", t_mem.elapsed().as_millis(), mem_count);
             }
             Err(e) => eprintln!("CORRELATE: memory scan error: {}", e),
         }
     }
 
-    // ── Build graph ───────────────────────────────────────────────────────────
-    let builder = GraphBuilder::new(&manager);
-    let mut graph = builder.build();
+    // ── Backfill structural stubs for untracked PIDs ──────────────────────────
+    // Memory and network signals may reference PIDs that the process scanner
+    // never ingested (e.g. the process died between scans, or the process
+    // scanner errored).  For each such PID, do a cheap sysinfo lookup to get
+    // name + parent_pid + exe_path so the graph can draw ParentChild edges.
+    {
+        use std::collections::HashSet;
+        use core::entity::types::EntityType;
+        use core::process::types::fetch_process_metadata;
 
-    let attack_chains = GraphAnalyzer::find_attack_chains(&graph);
+        let all_nodes = manager.get_all();
+
+        let process_pids: HashSet<u32> = all_nodes.iter()
+            .filter(|n| n.entity_type == EntityType::Process)
+            .filter_map(|n| n.join_keys.pid)
+            .collect();
+
+        let orphan_pids: HashSet<u32> = all_nodes.iter()
+            .filter(|n| n.entity_type != EntityType::Process)
+            .filter_map(|n| n.join_keys.pid)
+            .filter(|pid| !process_pids.contains(pid))
+            .collect();
+
+        for pid in orphan_pids {
+            if let Some(meta) = fetch_process_metadata(pid) {
+                manager.ingest_process_stub(&meta);
+            }
+        }
+    }
+
+    // ── Build aggregated entity graph ─────────────────────────────────────────
+    eprintln!("CORRELATE: building entity graph...");
+    let t_graph = std::time::Instant::now();
+    let aggregated = manager.aggregate();
+    let mut graph  = build_from_aggregated(&aggregated);
+
+    let attack_chains = GraphAnalyzer::find_attack_chains_aggregated(&graph);
     graph.attack_chains = attack_chains;
 
     let critical_path = GraphAnalyzer::find_critical_path(&graph);
     graph.critical_path = critical_path;
+    eprintln!("CORRELATE: graph done in {}ms — {} nodes, {} edges, {} chains",
+        t_graph.elapsed().as_millis(), graph.nodes.len(), graph.edges.len(), graph.attack_chains.len());
 
     // ── Build correlator clusters ─────────────────────────────────────────────
     let correlator = EntityCorrelator::new(&manager);

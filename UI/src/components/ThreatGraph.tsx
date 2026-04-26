@@ -1,13 +1,13 @@
 // File: UI/src/components/ThreatGraph.tsx
-// Static radial graph — top 5 threat nodes, fixed positions, animated edges.
-// Critical path (max-weight Dijkstra-like path from backend) is overlaid in gold.
+// Threat graph — one node per entity (process + its network/memory/file evidence).
+// Critical path (max-weight path from backend) is overlaid in gold.
 
 import { useState, useMemo } from 'react';
 import {
-  Cpu, Wifi, HardDrive, FolderOpen,
-  GitMerge, ShieldAlert, ShieldCheck, Loader, Network,
-  TrendingUp,
+  Shield, GitMerge, ShieldAlert, ShieldCheck, Loader, Network,
+  TrendingUp, Cpu, Wifi, HardDrive, FolderOpen,
 } from 'lucide-react';
+import { buildProcessEntities, buildProcessEdges, orphanConnections, orphanFiles } from '../lib/entityUtils';
 import { useStore } from '../store';
 import type { GraphNodeData, GraphEdgeData, UnifiedThreat, CriticalPath } from '../types';
 
@@ -26,15 +26,16 @@ function threatColor(level: UnifiedThreat | string): string {
   return '#00ff88';
 }
 
-// One distinct colour per edge relationship type
+// Inter-entity edge colours (aggregated graph)
 const EDGE_COLORS: Record<string, string> = {
-  memory_injection:    '#ff2d55',  // vivid red    — RWX injection          ×1.50
-  network_owner:       '#f97316',  // orange       — process owns C2        ×1.40
-  shared_c2:           '#facc15',  // yellow       — shared C2 server       ×1.30
-  process_opened_file: '#e879f9',  // fuchsia      — process opened file    ×1.20
-  parent_child:        '#00d4ff',  // cyan         — spawned process        ×1.10
-  same_process:        '#a78bfa',  // lavender     — same OS PID            ×1.00
-  shared_file_hash:    '#34d399',  // teal         — same binary hash       ×0.90
+  shared_c2:           '#facc15',  // yellow    — entities share C2 infra    ×1.50
+  parent_child:        '#00d4ff',  // cyan      — spawned process             ×1.20
+  shared_file_hash:    '#34d399',  // teal      — same binary hash            ×0.90
+  // Legacy flat-node edges (kept so old correlate results still render)
+  memory_injection:    '#ff2d55',
+  network_owner:       '#f97316',
+  process_opened_file: '#e879f9',
+  same_process:        '#a78bfa',
 };
 
 function edgeColor(kind: string): string {
@@ -42,24 +43,26 @@ function edgeColor(kind: string): string {
 }
 
 const EDGE_LABEL: Record<string, string> = {
-  same_process:        'SAME PID',
-  parent_child:        'SPAWNED',
-  process_opened_file: 'OPENED FILE',
-  shared_file_hash:    'SAME HASH',
   shared_c2:           'SHARED C2',
-  network_owner:       'OWNS CONN',
+  parent_child:        'SPAWNED',
+  shared_file_hash:    'SAME HASH',
+  // Legacy
   memory_injection:    'INJECTION',
+  network_owner:       'OWNS CONN',
+  process_opened_file: 'OPENED FILE',
+  same_process:        'SAME PID',
 };
 
-// Edge weight multipliers (mirrors backend logic — used for display only)
+// Edge weight multipliers (mirrors backend — display only)
 const EDGE_MULTIPLIER: Record<string, number> = {
-  memory_injection:    1.50,
-  network_owner:       1.40,
-  shared_c2:           1.30,
-  process_opened_file: 1.20,
-  parent_child:        1.10,
-  same_process:        1.00,
+  shared_c2:           1.50,
+  parent_child:        1.20,
   shared_file_hash:    0.90,
+  // Legacy
+  memory_injection:    1.35,
+  network_owner:       1.25,
+  process_opened_file: 1.10,
+  same_process:        1.00,
 };
 
 interface PlacedNode {
@@ -142,8 +145,8 @@ export default function ThreatGraph() {
 
   // ── Build all visible nodes + edges + critical path ───────────────────────
   const { visNodes, visEdges, criticalPath } = useMemo(() => {
-    let allNodes: GraphNodeData[] = [];
-    let allEdges: GraphEdgeData[] = [];
+    let allNodes: GraphNodeData[]    = [];
+    let allEdges: GraphEdgeData[]    = [];
     let criticalPath: CriticalPath | null = null;
 
     if (correlateResult?.graph?.nodes?.length) {
@@ -152,70 +155,68 @@ export default function ThreatGraph() {
       allEdges     = correlateResult.graph.edges ?? [];
       criticalPath = correlateResult.graph.critical_path ?? null;
     } else {
-      // ── Fallback: build from raw scanner data ──────────────────────────────
-      // Use consistent entity_id scheme: proc:{pid}, net:{local}:{remote}, mem:{pid}:{hex}, file:{hash|path}
-      processes.forEach((p) => allNodes.push({
-        entity_id: `proc:${p.pid}`, entity_type: 'process',
-        threat_level: (p.threat_level === 'Safe' ? 'Clean' : p.threat_level) as UnifiedThreat,
-        combined_score: Math.min(p.threat_score / 30, 1),
-        heuristic_score: p.threat_score, label: p.name, sub_label: p.exe_path ?? undefined,
-      }));
-      networkConnections.forEach((c) => allNodes.push({
-        entity_id: `net:${c.local_address}:${c.remote_address}`, entity_type: 'network',
-        threat_level: c.threat_level as UnifiedThreat,
-        combined_score: Math.min(c.threat_score / 40, 1),
-        heuristic_score: c.threat_score,
-        label: `${c.protocol.toUpperCase()} → ${c.remote_address}`,
-        sub_label: c.process_name ?? undefined,
-      }));
-      if (includeMemory) {
-        memoryRegions.forEach((r) => allNodes.push({
-          entity_id: `mem:${r.pid}:${r.region_start.toString(16)}`, entity_type: 'memory',
-          threat_level: r.threat_level as UnifiedThreat,
-          combined_score: Math.min(r.threat_score / 40, 1),
-          heuristic_score: r.threat_score,
-          label: `${r.process_name} @0x${r.region_start.toString(16).toUpperCase()}`,
-        }));
-      }
-      scanResults.forEach((f) => allNodes.push({
-        entity_id: `file:${f.hash ?? f.path}`, entity_type: 'file',
-        threat_level: f.level as UnifiedThreat,
-        combined_score: f.confidence_score,
-        heuristic_score: Math.round(f.confidence_score * 20),
-        label: f.path.split(/[/\\]/).pop() ?? f.path, sub_label: f.path,
+      // ── Fallback: build aggregated entity nodes from raw scanner data ────────
+      // Uses the same buildProcessEntities aggregation as EntityManager view so
+      // the graph shows "entity" nodes matching what the backend will produce.
+      const memForFallback = includeMemory ? memoryRegions : [];
+      const entities = buildProcessEntities(processes, networkConnections, memForFallback, scanResults, []);
+
+      entities.forEach((e) => allNodes.push({
+        entity_id:             e.entity_id,
+        entity_type:           'entity',
+        threat_level:          e.threat_level,
+        combined_score:        e.combined_score,
+        heuristic_score:       Math.round(e.combined_score * 30),
+        ml_score:              e.ml_score,
+        label:                 e.name,
+        sub_label:             e.exe_path ?? undefined,
+        process_score:         e.process_score,
+        network_score:         e.network_score,
+        memory_score:          e.memory_score,
+        file_score:            e.file_score,
+        has_malicious_network: e.network.some((c) => c.is_threat),
+        has_malicious_memory:  e.memory.some((r) => r.is_threat),
+        has_malicious_file:    e.files.some((f) => f.is_threat),
+        pid:                   e.pid,
+        parent_pid:            e.parent_pid ?? undefined,
       }));
 
-      // Build synthetic edges from known relationships
-      const procIds = new Set(processes.map((p) => p.pid));
-      // parent → child
-      processes.forEach((p) => {
-        if (p.parent_pid != null && procIds.has(p.parent_pid))
-          allEdges.push({ from: `proc:${p.parent_pid}`, to: `proc:${p.pid}`, edge_type: 'parent_child', weight: 1 });
-      });
-      // process → its network connections (by pid)
-      networkConnections.forEach((c) => {
-        if (c.pid != null && procIds.has(c.pid))
-          allEdges.push({ from: `proc:${c.pid}`, to: `net:${c.local_address}:${c.remote_address}`, edge_type: 'network_owner', weight: 1 });
-      });
-      // process → its memory regions (by pid) — only when memory layer is enabled
-      if (includeMemory) {
-        memoryRegions.forEach((r) => {
-          if (procIds.has(r.pid))
-            allEdges.push({ from: `proc:${r.pid}`, to: `mem:${r.pid}:${r.region_start.toString(16)}`, edge_type: 'memory_injection', weight: 1 });
-        });
-      }
-      // shared file hash edges
-      const byHash = new Map<string, string[]>();
-      scanResults.forEach((f) => {
-        if (f.hash) {
-          const id = `file:${f.hash}`;
-          byHash.set(f.hash, [...(byHash.get(f.hash) ?? []), id]);
-        }
-      });
-      byHash.forEach((ids) => {
-        for (let i = 0; i < ids.length - 1; i++)
-          allEdges.push({ from: ids[i], to: ids[i + 1], edge_type: 'shared_file_hash', weight: 1 });
-      });
+      // Orphan network connections (no owning process)
+      orphanConnections(networkConnections, processes)
+        .filter((c) => c.is_threat)
+        .forEach((c) => allNodes.push({
+          entity_id:    `entity-net:net:${c.protocol}:${c.local_address}:${c.remote_address}`,
+          entity_type:  'entity',
+          threat_level: c.threat_level as UnifiedThreat,
+          combined_score: Math.min(c.threat_score / 40, 1),
+          heuristic_score: c.threat_score,
+          label: `${c.protocol.toUpperCase()} → ${c.remote_address}`,
+          has_malicious_network: c.is_threat,
+          has_malicious_memory:  false,
+          has_malicious_file:    false,
+          process_score: 0, network_score: Math.min(c.threat_score / 40, 1),
+          memory_score: 0, file_score: 0,
+        }));
+
+      // Standalone malicious files
+      orphanFiles(scanResults, processes)
+        .forEach((f) => allNodes.push({
+          entity_id:    `entity-file:file:${f.hash ?? f.path}`,
+          entity_type:  'entity',
+          threat_level: f.level as UnifiedThreat,
+          combined_score: f.confidence_score,
+          heuristic_score: Math.round(f.confidence_score * 40),
+          label: f.path.split(/[/\\]/).pop() ?? f.path,
+          sub_label: f.path,
+          has_malicious_network: false,
+          has_malicious_memory:  false,
+          has_malicious_file:    f.level !== 'Clean',
+          process_score: 0, network_score: 0,
+          memory_score: 0, file_score: f.confidence_score,
+        }));
+
+      // Inter-entity edges only (no intra-entity edges in aggregated view)
+      allEdges = buildProcessEdges(entities);
     }
 
     const order: Record<string, number> = { Critical: 4, Malicious: 3, Suspicious: 2, Clean: 1 };
@@ -580,7 +581,7 @@ export default function ThreatGraph() {
                     <text y={8} textAnchor="middle"
                       fontFamily="'IBM Plex Mono', monospace" fontSize={8}
                       fill={`${isOnPath ? CRITICAL_COLOR : col}99`} style={{ pointerEvents: 'none' }}>
-                      {node.data.entity_type.slice(0, 4).toUpperCase()}
+                      {node.data.entity_type === 'entity' ? 'ENTY' : node.data.entity_type.slice(0, 4).toUpperCase()}
                     </text>
 
                     {/* Name label */}
@@ -630,8 +631,8 @@ export default function ThreatGraph() {
               backdropFilter: 'blur(10px)',
               borderTop: '1px solid rgba(255,255,255,0.05)',
             }}>
-              {/* Each edge type */}
-              {(Object.keys(EDGE_COLORS) as string[]).map((type) => {
+              {/* Active inter-entity edge types only */}
+              {(['shared_c2', 'parent_child', 'shared_file_hash'] as const).map((type) => {
                 const col = EDGE_COLORS[type];
                 return (
                   <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
@@ -818,7 +819,7 @@ function DetailPanel({ node, edges, nodeMap, onClose, criticalPath }: {
             background: `${accent}18`, border: `1px solid ${accent}40`,
             display: 'flex', alignItems: 'center', justifyContent: 'center',
           }}>
-            <NodeIcon type={node.data.entity_type} color={accent} size={16} />
+            <NodeIcon type={node.data.entity_type} color={accent} size={16} node={node.data} />
           </div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: accent, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={node.data.label}>
@@ -832,7 +833,7 @@ function DetailPanel({ node, edges, nodeMap, onClose, criticalPath }: {
           <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', cursor: 'pointer', fontSize: 14, flexShrink: 0 }}>✕</button>
         </div>
 
-        {/* Scores */}
+        {/* Primary scores */}
         <div style={{ display: 'flex', gap: 8 }}>
           <Chip label="COMBINED"  value={`${(node.data.combined_score * 100).toFixed(1)}%`} color={accent} />
           <Chip label="HEURISTIC" value={String(node.data.heuristic_score)} color="var(--cyan)" />
@@ -840,6 +841,24 @@ function DetailPanel({ node, edges, nodeMap, onClose, criticalPath }: {
             <Chip label="ML" value={`${(node.data.ml_score * 100).toFixed(1)}%`} color="#a78bfa" />
           )}
         </div>
+
+        {/* Per-domain sub-scores (aggregated entity nodes only) */}
+        {node.data.entity_type === 'entity' && (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {(node.data.process_score ?? 0) > 0 && (
+              <SubChip label="PROC" value={node.data.process_score!} color="var(--cyan)" />
+            )}
+            {(node.data.network_score ?? 0) > 0 && (
+              <SubChip label="NET"  value={node.data.network_score!} color={node.data.has_malicious_network ? '#f97316' : 'var(--text-dim)'} />
+            )}
+            {(node.data.memory_score ?? 0) > 0 && (
+              <SubChip label="MEM"  value={node.data.memory_score!}  color={node.data.has_malicious_memory  ? '#ff2d55' : 'var(--text-dim)'} />
+            )}
+            {(node.data.file_score ?? 0) > 0 && (
+              <SubChip label="FILE" value={node.data.file_score!}     color={node.data.has_malicious_file   ? '#e879f9' : 'var(--text-dim)'} />
+            )}
+          </div>
+        )}
 
         {/* Threat badge */}
         <div style={{
@@ -1076,8 +1095,8 @@ function LegendPanel({ hasBackend, nodeCount, correlateResult, criticalPath }: {
           </div>
         ))}
         <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
-        {/* One row per edge type */}
-        {(Object.keys(EDGE_COLORS) as string[]).map((type) => {
+        {/* Inter-entity edge types (aggregated graph) */}
+        {(['shared_c2', 'parent_child', 'shared_file_hash'] as const).map((type) => {
           const col = EDGE_COLORS[type];
           return (
             <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -1142,8 +1161,38 @@ function Chip({ label, value, color }: { label: string; value: string; color: st
   );
 }
 
-function NodeIcon({ type, color, size = 14 }: { type: string; color: string; size?: number }) {
+function SubChip({ label, value, color }: { label: string; value: number; color: string }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 4,
+      padding: '3px 7px', borderRadius: 4,
+      background: `${color}10`, border: `1px solid ${color}25`,
+    }}>
+      <span style={{ fontFamily: 'var(--font-hud)', fontSize: 7, color: 'var(--text-dim)', letterSpacing: '0.08em' }}>{label}</span>
+      <span style={{ fontFamily: 'var(--font-hud)', fontSize: 10, fontWeight: 700, color }}>{(value * 100).toFixed(0)}%</span>
+    </div>
+  );
+}
+
+function NodeIcon({ type, color, size = 14, node }: {
+  type: string; color: string; size?: number; node?: GraphNodeData;
+}) {
   const t = (type ?? '').toLowerCase();
+  // Aggregated entity — pick icon based on which domain has the highest score
+  if (t === 'entity' || t === '') {
+    if (node) {
+      const ps = node.process_score ?? 0;
+      const ns = node.network_score ?? 0;
+      const ms = node.memory_score  ?? 0;
+      const fs = node.file_score    ?? 0;
+      const max = Math.max(ps, ns, ms, fs);
+      if (max === ns && ns > 0) return <Wifi      size={size} color={color} />;
+      if (max === ms && ms > 0) return <HardDrive size={size} color={color} />;
+      if (max === fs && fs > 0) return <FolderOpen size={size} color={color} />;
+    }
+    return <Shield size={size} color={color} />;
+  }
+  // Legacy flat node types
   if (t === 'process') return <Cpu       size={size} color={color} />;
   if (t === 'network') return <Wifi      size={size} color={color} />;
   if (t === 'memory')  return <HardDrive size={size} color={color} />;

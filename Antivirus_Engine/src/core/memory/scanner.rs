@@ -219,7 +219,7 @@ impl MemoryScanner {
                 let is_executable = mem_is_executable(info.Protect);
                 let is_private    = info.Type == MEM_PRIVATE;
 
-                let (threat_score, detection_signals) = score_region(
+                let (mut threat_score, mut detection_signals) = score_region(
                     is_executable,
                     is_writable,
                     is_private,
@@ -227,8 +227,24 @@ impl MemoryScanner {
                     &protection,
                 );
 
+                // For regions that already have a base score, read a content
+                // sample and run payload-indicator analysis on the raw bytes.
+                // This upgrades scores for PE-in-anonymous-memory and NOP sleds
+                // without reading memory for every normal region.
+                let content_sample = if threat_score > 0 && is_readable {
+                    let raw = read_memory_bytes(handle, region_start as *const c_void, region_size);
+                    if let Some(ref bytes) = raw {
+                        let (bonus, mut bonus_sigs) =
+                            analyze_content(bytes, is_executable, is_private);
+                        threat_score += bonus;
+                        detection_signals.append(&mut bonus_sigs);
+                    }
+                    raw.map(|b| bytes_to_hex(&b))
+                } else {
+                    None
+                };
+
                 // Only keep regions that are actually suspicious or malicious.
-                // This avoids reporting every normal executable page loaded by the OS.
                 if threat_score >= 20 {
                     let threat_level = if threat_score >= 40 {
                         "Malicious"
@@ -236,13 +252,6 @@ impl MemoryScanner {
                         "Suspicious"
                     }
                     .to_string();
-
-                    // Only read memory for regions we're actually going to report.
-                    let content_sample = if is_readable {
-                        read_memory_sample(handle, region_start as *const c_void, region_size)
-                    } else {
-                        None
-                    };
 
                     threat_regions.push(MemoryRegion {
                         pid,
@@ -322,13 +331,14 @@ fn mem_is_executable(protect: PAGE_PROTECTION_FLAGS) -> bool {
 
 // ─── Memory reading ───────────────────────────────────────────────────────────
 
+/// Read up to `sample_len` raw bytes from the target process memory.
 #[cfg(windows)]
-fn read_memory_sample(handle: HANDLE, address: *const c_void, region_size: u64) -> Option<String> {
-    let sample_len = std::cmp::min(region_size as usize, 64);
+fn read_memory_bytes(handle: HANDLE, address: *const c_void, region_size: u64) -> Option<Vec<u8>> {
+    let sample_len = std::cmp::min(region_size as usize, 128);
     let mut buffer = vec![0u8; sample_len];
     let mut bytes_read = 0usize;
 
-    let success = unsafe {
+    let ok = unsafe {
         ReadProcessMemory(
             handle,
             address,
@@ -339,64 +349,146 @@ fn read_memory_sample(handle: HANDLE, address: *const c_void, region_size: u64) 
         .is_ok()
     };
 
-    if !success || bytes_read == 0 {
+    if !ok || bytes_read == 0 {
         return None;
     }
 
-    let sample = &buffer[..bytes_read];
-    Some(
-        sample
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    buffer.truncate(bytes_read);
+    Some(buffer)
+}
+
+/// Format raw bytes as a space-separated hex string for display.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
 
+/// Primary heuristic: score a memory region based on its protection flags and size.
+///
+/// Design rationale — what NOT to flag:
+///   • Writable-private (heap, stack, data sections): normal for every process.
+///   • Non-executable private: covers virtually all heap allocations.
+///   • Small executable regions: JIT trampolines, CLR/V8 stubs are ubiquitous.
+///
+/// What to flag:
+///   • RWX (Tier 1 / Malicious): hallmark of shellcode and process injection;
+///     simultaneous write + execute is almost never legitimate (T1055).
+///   • Large anonymous executable pages (Tier 2 / Suspicious): MEM_PRIVATE +
+///     executable = no image backing. Fine for < 2 MB (JIT stubs). Flag at ≥ 2 MB
+///     with a stronger signal at ≥ 8 MB.
 #[cfg(windows)]
 fn score_region(
     is_executable: bool,
     is_writable:   bool,
     is_private:    bool,
     region_size:   u64,
-    protection:    &str,
+    _protection:   &str,
 ) -> (i32, Vec<DetectionSignal>) {
     let mut score   = 0i32;
     let mut signals = Vec::new();
 
+    // ── Tier 1: RWX ───────────────────────────────────────────────────────────
+    // Execute + Write simultaneously. Canonical shellcode / reflective-DLL
+    // injection signature. Score 40 = Malicious immediately.
     if is_executable && is_writable {
         score += 40;
-        signals.push(DetectionSignal::new("memory", "Executable writable memory region", 40));
-    } else if is_executable && is_private && region_size >= 1024 * 1024 {
-        score += 20;
-        signals.push(DetectionSignal::new("memory", "Large private executable memory region", 20));
+        signals.push(DetectionSignal::new(
+            "memory",
+            "Executable + writable region (RWX) — shellcode / injection indicator",
+            40,
+        ));
+        return (score, signals); // already at Malicious threshold
     }
 
-    if is_writable && is_private {
-        score += 10;
-        signals.push(DetectionSignal::new("memory", "Writable private memory region", 10));
-    }
-
-    if is_writable && !is_executable {
-        score += 5;
-        signals.push(DetectionSignal::new("memory", "Writable region", 5));
-    }
-
-    if is_private && !is_executable {
-        score += 2;
-        signals.push(DetectionSignal::new("memory", "Private memory type", 2));
-    }
-
-    if region_size >= 50 * 1024 * 1024 {
-        score += 10;
-        signals.push(DetectionSignal::new("memory", "Large memory region", 10));
-    }
-
-    if protection.contains("NOACCESS") {
-        signals.push(DetectionSignal::new("memory", "No access region", 1));
+    // ── Tier 2: anonymous executable pages ────────────────────────────────────
+    // MEM_PRIVATE + executable = no image file backing (not MEM_IMAGE).
+    // Small regions (< 2 MB) are produced constantly by JIT engines and CLR/V8;
+    // do not score them. Larger allocations without an image backing are unusual.
+    if is_executable && is_private {
+        if region_size >= 8 * 1024 * 1024 {
+            // ≥ 8 MB: strong indicator — uncommon outside injection payloads
+            score += 25;
+            signals.push(DetectionSignal::new(
+                "memory",
+                "Large anonymous executable region (≥ 8 MB, no image backing)",
+                25,
+            ));
+        } else if region_size >= 2 * 1024 * 1024 {
+            // 2 – 8 MB: moderate indicator — could be JIT, but worth noting
+            score += 12;
+            signals.push(DetectionSignal::new(
+                "memory",
+                "Anonymous executable region (2 – 8 MB, no image backing)",
+                12,
+            ));
+        }
+        // < 2 MB: JIT stubs / trampolines — too prevalent to be a useful signal
     }
 
     (score, signals)
+}
+
+/// Content-based payload analysis for regions that already have a base score.
+///
+/// Only called on regions where `score_region` returned score > 0, so the
+/// overhead is paid only for genuinely suspicious candidates.
+fn analyze_content(
+    bytes:         &[u8],
+    is_executable: bool,
+    is_private:    bool,
+) -> (i32, Vec<DetectionSignal>) {
+    let mut bonus   = 0i32;
+    let mut signals = Vec::new();
+
+    if bytes.len() < 4 {
+        return (bonus, signals);
+    }
+
+    // ── PE header in anonymous executable memory ──────────────────────────────
+    // "MZ" at offset 0 inside a MEM_PRIVATE executable region = PE file loaded
+    // without going through the normal image loader (reflective DLL injection).
+    if is_executable && is_private && bytes[0] == 0x4D && bytes[1] == 0x5A {
+        bonus += 20;
+        signals.push(DetectionSignal::new(
+            "memory",
+            "PE header (MZ) in anonymous executable memory — reflective injection",
+            20,
+        ));
+    }
+
+    // ── NOP sled ─────────────────────────────────────────────────────────────
+    // > 40 % of the sample being 0x90 (NOP) suggests a shellcode landing pad.
+    if is_executable {
+        let nop_count = bytes.iter().filter(|&&b| b == 0x90).count();
+        if nop_count * 100 / bytes.len() > 40 {
+            bonus += 10;
+            signals.push(DetectionSignal::new(
+                "memory",
+                "NOP sled detected (> 40 % of sample) — shellcode staging pattern",
+                10,
+            ));
+        }
+    }
+
+    // ── INT3 / breakpoint flood ────────────────────────────────────────────────
+    // > 40 % 0xCC bytes is unusual in legitimate code and can indicate injected
+    // hook / patching sleds.
+    if is_executable {
+        let int3_count = bytes.iter().filter(|&&b| b == 0xCC).count();
+        if int3_count * 100 / bytes.len() > 40 {
+            bonus += 8;
+            signals.push(DetectionSignal::new(
+                "memory",
+                "INT3 sled detected (> 40 % of sample) — possible hook / patch region",
+                8,
+            ));
+        }
+    }
+
+    (bonus, signals)
 }

@@ -6,7 +6,7 @@
 
 export type ThreatLevel = 'Clean' | 'Suspicious' | 'Malicious';
 export type ProcessThreat = 'Safe' | 'Suspicious' | 'Malicious' | 'Critical';
-export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history' | 'entities' | 'graph';
+export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history' | 'entities' | 'graph' | 'verdict';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // File Classification
@@ -263,10 +263,13 @@ export interface MlIdsResult {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type UnifiedThreat = 'Clean' | 'Suspicious' | 'Malicious' | 'Critical';
-export type EntityKind    = 'process' | 'file' | 'network' | 'memory';
+/** "entity" = aggregated composite node; legacy flat values kept for backward compat */
+export type EntityKind    = 'entity' | 'process' | 'file' | 'network' | 'memory';
+/** Inter-entity edges (aggregated graph): parent_child | shared_c2 | shared_file_hash.
+ *  Legacy intra-entity edges still accepted for backward compat. */
 export type EdgeKind =
-  | 'same_process' | 'parent_child' | 'process_opened_file'
-  | 'shared_file_hash' | 'shared_c2' | 'network_owner' | 'memory_injection'
+  | 'parent_child' | 'shared_c2' | 'shared_file_hash'
+  | 'same_process' | 'process_opened_file' | 'network_owner' | 'memory_injection'
   | 'cross_injection';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -350,6 +353,7 @@ export interface CorrelateCluster {
 
 export interface GraphNodeData {
   entity_id:       string;
+  /** "entity" for aggregated nodes; legacy: "process" | "network" | "memory" | "file" */
   entity_type:     EntityKind;
   threat_level:    UnifiedThreat;
   combined_score:  number;
@@ -357,6 +361,17 @@ export interface GraphNodeData {
   ml_score?:       number;
   label:           string;
   sub_label?:      string;
+  // Sub-scores (present for aggregated "entity" nodes, 0 for legacy flat nodes)
+  process_score?:         number;
+  network_score?:         number;
+  memory_score?:          number;
+  file_score?:            number;
+  // Intra-entity threat flags (present for aggregated nodes)
+  has_malicious_network?: boolean;
+  has_malicious_memory?:  boolean;
+  has_malicious_file?:    boolean;
+  pid?:                   number;
+  parent_pid?:            number;
 }
 
 export interface GraphEdgeData {

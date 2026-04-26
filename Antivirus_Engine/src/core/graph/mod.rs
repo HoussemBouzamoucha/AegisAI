@@ -11,7 +11,7 @@ pub mod builder;
 pub mod types;
 
 pub use analyzer::GraphAnalyzer;
-pub use builder::GraphBuilder;
+pub use builder::{GraphBuilder, build_from_aggregated};
 pub use types::{
     AttackChain, AttackPattern, CriticalPath, EdgeType, GraphEdge, GraphNode, ThreatGraph,
 };

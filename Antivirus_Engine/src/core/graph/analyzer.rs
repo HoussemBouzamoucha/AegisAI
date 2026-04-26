@@ -19,6 +19,131 @@ use super::types::{AttackChain, AttackPattern, CriticalPath, EdgeType, GraphEdge
 pub struct GraphAnalyzer;
 
 impl GraphAnalyzer {
+    /// Detect attack chains on a graph built from **aggregated** entities.
+    ///
+    /// Patterns 1–3 (ProcessInjection, C2Communication, MalwareExecution) are
+    /// detected from intra-entity flags on each node (no edge required).
+    /// Patterns 4–6 use inter-entity edges (ParentChild, SharedC2, …).
+    pub fn find_attack_chains_aggregated(graph: &ThreatGraph) -> Vec<AttackChain> {
+        let mut counter: u32 = 0;
+        let mut chains = Vec::new();
+
+        chains.extend(Self::detect_process_injection_agg(graph, &mut counter));
+        chains.extend(Self::detect_c2_communication_agg(graph, &mut counter));
+        chains.extend(Self::detect_malware_execution_agg(graph, &mut counter));
+        chains.extend(Self::detect_lateral_movement_agg(graph, &mut counter));
+        chains.extend(Self::detect_suspicious_spawn_agg(graph, &mut counter));
+        chains.extend(Self::detect_multi_stage(graph, &mut counter));
+
+        chains.sort_by(|a, b| b.chain_score.partial_cmp(&a.chain_score)
+            .unwrap_or(std::cmp::Ordering::Equal));
+        deduplicate_chains(chains)
+    }
+
+    fn detect_process_injection_agg(graph: &ThreatGraph, counter: &mut u32) -> Vec<AttackChain> {
+        graph.nodes.values()
+            .filter(|n| n.has_malicious_memory)
+            .map(|n| {
+                *counter += 1;
+                AttackChain {
+                    chain_id:     format!("chain-{counter}"),
+                    pattern:      AttackPattern::ProcessInjection,
+                    node_ids:     vec![n.entity_id.clone()],
+                    chain_score:  n.combined_score,
+                    severity:     n.threat_level.clone(),
+                    description:  format!("'{}': {}", n.label, AttackPattern::ProcessInjection.description()),
+                    mitre_tactic: AttackPattern::ProcessInjection.mitre_tactic().to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn detect_c2_communication_agg(graph: &ThreatGraph, counter: &mut u32) -> Vec<AttackChain> {
+        graph.nodes.values()
+            .filter(|n| n.has_malicious_network)
+            .map(|n| {
+                *counter += 1;
+                AttackChain {
+                    chain_id:     format!("chain-{counter}"),
+                    pattern:      AttackPattern::C2Communication,
+                    node_ids:     vec![n.entity_id.clone()],
+                    chain_score:  n.combined_score,
+                    severity:     n.threat_level.clone(),
+                    description:  format!("'{}': {}", n.label, AttackPattern::C2Communication.description()),
+                    mitre_tactic: AttackPattern::C2Communication.mitre_tactic().to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn detect_malware_execution_agg(graph: &ThreatGraph, counter: &mut u32) -> Vec<AttackChain> {
+        graph.nodes.values()
+            .filter(|n| n.has_malicious_file)
+            .map(|n| {
+                *counter += 1;
+                AttackChain {
+                    chain_id:     format!("chain-{counter}"),
+                    pattern:      AttackPattern::MalwareExecution,
+                    node_ids:     vec![n.entity_id.clone()],
+                    chain_score:  n.combined_score,
+                    severity:     n.threat_level.clone(),
+                    description:  format!("'{}': {}", n.label, AttackPattern::MalwareExecution.description()),
+                    mitre_tactic: AttackPattern::MalwareExecution.mitre_tactic().to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn detect_lateral_movement_agg(graph: &ThreatGraph, counter: &mut u32) -> Vec<AttackChain> {
+        let mut result = Vec::new();
+        for edge in graph.edges.iter().filter(|e| e.edge_type == EdgeType::ParentChild) {
+            let child  = unwrap_or_continue!(graph.nodes.get(&edge.to));
+            if !child.has_malicious_network { continue; }
+            let parent = unwrap_or_continue!(graph.nodes.get(&edge.from));
+            let score    = max_score(parent.combined_score, child.combined_score);
+            let severity = worst_level(&parent.threat_level, &child.threat_level);
+            *counter += 1;
+            result.push(AttackChain {
+                chain_id:     format!("chain-{counter}"),
+                pattern:      AttackPattern::LateralMovement,
+                node_ids:     vec![edge.from.clone(), edge.to.clone()],
+                chain_score:  score,
+                severity,
+                description:  format!(
+                    "'{}' spawned '{}' which has malicious network activity: {}",
+                    parent.label, child.label, AttackPattern::LateralMovement.description(),
+                ),
+                mitre_tactic: AttackPattern::LateralMovement.mitre_tactic().to_string(),
+            });
+        }
+        result
+    }
+
+    fn detect_suspicious_spawn_agg(graph: &ThreatGraph, counter: &mut u32) -> Vec<AttackChain> {
+        let mut result = Vec::new();
+        for edge in graph.edges.iter().filter(|e| e.edge_type == EdgeType::ParentChild) {
+            let parent = unwrap_or_continue!(graph.nodes.get(&edge.from));
+            let child  = unwrap_or_continue!(graph.nodes.get(&edge.to));
+            if is_clean(&parent.threat_level) || is_clean(&child.threat_level) { continue; }
+            let score    = max_score(parent.combined_score, child.combined_score);
+            let severity = worst_level(&parent.threat_level, &child.threat_level);
+            *counter += 1;
+            result.push(AttackChain {
+                chain_id:     format!("chain-{counter}"),
+                pattern:      AttackPattern::SuspiciousSpawn,
+                node_ids:     vec![edge.from.clone(), edge.to.clone()],
+                chain_score:  score,
+                severity,
+                description:  format!(
+                    "'{}' → '{}': {}",
+                    parent.label, child.label, AttackPattern::SuspiciousSpawn.description(),
+                ),
+                mitre_tactic: AttackPattern::SuspiciousSpawn.mitre_tactic().to_string(),
+            });
+        }
+        result
+    }
+
     /// Detect all attack chains in `graph` and return them sorted by score.
     pub fn find_attack_chains(graph: &ThreatGraph) -> Vec<AttackChain> {
         let mut counter: u32 = 0;
@@ -557,13 +682,16 @@ fn hop_verb(edge_type: &str, from_type: &str, _to_type: &str) -> &'static str {
 fn edge_weight(score_a: f32, score_b: f32, edge_type: &EdgeType) -> f32 {
     let avg = (score_a + score_b) / 2.0;
     let multiplier = match edge_type {
-        EdgeType::MemoryInjection   => 1.50,
-        EdgeType::NetworkOwner      => 1.40,
-        EdgeType::SharedC2          => 1.30,
-        EdgeType::ProcessOpenedFile => 1.20,
-        EdgeType::ParentChild       => 1.10,
+        // Aggregated-entity inter-entity edges
+        EdgeType::SharedC2          => 1.50,  // multiple entities sharing C2 infra
+        EdgeType::ParentChild       => 1.20,  // process lineage (spawning chain)
+        EdgeType::SharedFileHash    => 0.90,  // same binary at different paths
+
+        // Legacy flat-node edge types (kept for backward compat)
+        EdgeType::MemoryInjection   => 1.35,
+        EdgeType::NetworkOwner      => 1.25,
+        EdgeType::ProcessOpenedFile => 1.10,
         EdgeType::SameProcess       => 1.00,
-        EdgeType::SharedFileHash    => 0.90,
     };
     avg * multiplier
 }

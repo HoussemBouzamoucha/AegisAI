@@ -184,6 +184,51 @@ impl ScanStatistics {
     }
 }
 
+// ─── Lightweight metadata fetch ──────────────────────────────────────────────
+
+/// Look up one PID in the already-warmed sysinfo System and return a zero-score
+/// ProcessInfo containing only structural fields (name, parent_pid, exe_path).
+///
+/// Returns None if:
+///   • the process scanner has never run (WARM_SYSTEM not yet initialised)
+///   • the process is no longer running
+///   • the mutex is poisoned
+///
+/// This is cheap — it does not refresh sysinfo and runs no heuristics.
+/// Its only purpose is to give the entity layer a parent_pid so the graph can
+/// draw ParentChild edges for entities whose process was not directly ingested.
+pub fn fetch_process_metadata(pid: u32) -> Option<ProcessInfo> {
+    let sys = WARM_SYSTEM.get()?.lock().ok()?;
+    let proc = sys.process(sysinfo::Pid::from(pid as usize))?;
+
+    let exe_path = proc.exe()
+        .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
+        .map(|p| p.to_string_lossy().to_string());
+
+    Some(ProcessInfo {
+        pid,
+        name:           proc.name().to_string_lossy().to_string(),
+        parent_pid:     proc.parent().map(|p| p.as_u32()),
+        exe_path,
+        command_line:   None,
+        status:         "Unknown".to_string(),
+        start_time:     None,
+        user:           None,
+        cpu_usage:      0.0,
+        memory_mb:      0.0,
+        memory_bytes:   0,
+        virtual_memory: 0,
+        thread_count:   0,
+        handle_count:   None,
+        module_count:   None,
+        threat_level:      ThreatLevel::Safe,
+        threat_score:      0,
+        is_threat:         false,
+        detection_signals: Vec::new(),
+        anomaly_flags:     Vec::new(),
+    })
+}
+
 // ─── Process enumeration ──────────────────────────────────────────────────────
 
 /// Global warm System instance.  Initialised once (with its mandatory 200 ms

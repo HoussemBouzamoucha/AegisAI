@@ -14,6 +14,6 @@ pub mod types;
 pub use correlator::{CorrelatedCluster, EntityCorrelator, JoinReason};
 pub use manager::EntityManager;
 pub use types::{
-    EntityAttributes, EntityNode, EntityType, FileAttributes, JoinKeys,
+    AggregatedEntity, EntityAttributes, EntityNode, EntityType, FileAttributes, JoinKeys,
     MemoryAttributes, NetworkAttributes, ProcessAttributes, UnifiedThreatLevel,
 };

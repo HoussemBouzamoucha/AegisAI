@@ -153,6 +153,57 @@ pub struct MemoryAttributes {
     pub is_writable:    bool,
 }
 
+// ─── Aggregated entity ───────────────────────────────────────────────────────
+// One composite entity per OS "actor" — a process plus all of its owned
+// network connections, memory regions, and executable file evidence bundled
+// together.  Orphan network connections (no owning process) and standalone
+// malicious files each become their own entity.
+//
+// This is the unit the ThreatGraph operates on.  Intra-entity relationships
+// (process ↔ its own network/memory/file) are embedded as sub-scores and
+// threat flags; graph edges are only ever drawn *between* entities.
+
+#[derive(Debug, Clone)]
+pub struct AggregatedEntity {
+    /// Stable ID: "entity:{pid}" | "entity-net:{net_id}" | "entity-file:{file_id}"
+    pub entity_id:      String,
+    /// Human-readable name (process name, "NET→ip:port", or filename).
+    pub name:           String,
+    pub threat_level:   UnifiedThreatLevel,
+    /// Blended score across all domains (0.0–1.0).
+    pub combined_score: f32,
+
+    // Per-domain sub-scores [0, 1]
+    pub process_score:  f32,
+    pub network_score:  f32,
+    pub memory_score:   f32,
+    pub file_score:     f32,
+
+    // Intra-entity threat flags (used by pattern detection without needing edges)
+    pub has_malicious_network: bool,
+    pub has_malicious_memory:  bool,
+    pub has_malicious_file:    bool,
+
+    // Embedded scanner evidence
+    pub process:  Option<EntityNode>,
+    pub network:  Vec<EntityNode>,
+    pub memory:   Vec<EntityNode>,
+    pub files:    Vec<EntityNode>,
+
+    /// Merged detection signals from all sub-entities.
+    pub detection_signals: Vec<DetectionSignal>,
+
+    // Join keys used to draw inter-entity graph edges
+    pub pid:         Option<u32>,
+    pub parent_pid:  Option<u32>,
+    /// Unique non-loopback remote IPs across all owned network sub-entities.
+    pub remote_ips:  Vec<String>,
+    /// Unique SHA-256 hashes across all owned file sub-entities.
+    pub file_hashes: Vec<String>,
+    /// Max ML score from any owned network sub-entity.
+    pub ml_score:    Option<f32>,
+}
+
 // ─── Entity node ──────────────────────────────────────────────────────────────
 // The single unit that flows into the entity layer from every scanner.
 //

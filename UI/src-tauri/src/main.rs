@@ -556,11 +556,12 @@ async fn correlate_entities(
         "cmd":            "correlate",
         "include_memory": include_memory.unwrap_or(false),
     });
-    // Memory scan can take up to 120 s; add 60 s overhead for process + network.
+    // Process+network correlate can take 120-180 s on a loaded Windows system
+    // (200+ processes × handle/module enumeration). Memory adds another ~120 s.
     let timeout = if include_memory.unwrap_or(false) {
-        Duration::from_secs(180)
+        Duration::from_secs(480)  // 8 min with memory
     } else {
-        Duration::from_secs(60)
+        Duration::from_secs(300)  // 5 min without memory
     };
     let json = daemon_request(&state, request, timeout)?;
     if let Some(err) = json["error"].as_str() {
