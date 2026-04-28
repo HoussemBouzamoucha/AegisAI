@@ -255,12 +255,23 @@ impl EntityNode {
 
     /// Normalised 0.0–1.0 score suitable for graph path weighting.
     ///
-    /// When an ML score is present (network entities only) it gets 60 % weight
-    /// because the ML model operates on richer statistical features than the
-    /// heuristic rules alone.  Heuristic score is capped at 40 (the highest
-    /// single-rule contribution across all scanners).
+    /// Each domain has its own theoretical maximum derived from summing every
+    /// rule that can simultaneously fire:
+    ///   Process  → 110  (mutex 20 + handles 15 + cross-process 25 + 5 modules×10)
+    ///   Memory   →  63  (RWX 25 + PE-header 20 + NOP sled 10 + INT3 sled 8)
+    ///   Network  →  40  (largest single rule; stacked rules are clamped to 1.0)
+    ///   File     →  40  (heuristic_score = confidence_score × 40, always in range)
+    ///
+    /// When an ML score is present it gets 60 % weight because the ML model
+    /// operates on richer statistical features than the heuristic rules alone.
     pub fn combined_score(&self) -> f32 {
-        let h = (self.heuristic_score as f32 / 40.0).clamp(0.0, 1.0);
+        let domain_max = match self.entity_type {
+            EntityType::Process           => 110.0,
+            EntityType::MemoryRegion      =>  63.0,
+            EntityType::NetworkConnection =>  40.0,
+            EntityType::File              =>  40.0,
+        };
+        let h = (self.heuristic_score as f32 / domain_max).clamp(0.0, 1.0);
         match self.ml_score {
             Some(ml) => h * 0.4 + ml.clamp(0.0, 1.0) * 0.6,
             None     => h,

@@ -14,7 +14,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::types::{AttackChain, AttackPattern, CriticalPath, EdgeType, GraphEdge, ThreatGraph};
+use super::types::{AttackChain, AttackPattern, CriticalPath, EdgeType, GraphEdge, GraphNode, ThreatGraph};
+// GraphEdge::weight_for() is the canonical edge-weight formula shared with builder.rs.
 
 pub struct GraphAnalyzer;
 
@@ -33,6 +34,9 @@ impl GraphAnalyzer {
         chains.extend(Self::detect_malware_execution_agg(graph, &mut counter));
         chains.extend(Self::detect_lateral_movement_agg(graph, &mut counter));
         chains.extend(Self::detect_suspicious_spawn_agg(graph, &mut counter));
+        // Must run before MultiStage so its node pairs are in `specific_nodes`
+        // for deduplication purposes.
+        chains.extend(Self::detect_exploited_trusted_process_agg(graph, &mut counter));
         chains.extend(Self::detect_multi_stage(graph, &mut counter));
 
         chains.sort_by(|a, b| b.chain_score.partial_cmp(&a.chain_score)
@@ -144,6 +148,50 @@ impl GraphAnalyzer {
         result
     }
 
+    // ── Pattern 7: ExploitedTrustedProcess ───────────────────────────────────
+    // A clean (trusted) process spawns a child that is Malicious — the most
+    // common real-world attack delivery: phishing doc → Word.exe (clean) spawns
+    // cmd.exe / powershell.exe (clean) which finally spawns the malicious payload.
+    //
+    // Intentionally stricter than SuspiciousSpawn:
+    //   • Parent must be Clean — if the parent is already flagged, SuspiciousSpawn
+    //     already covers it.
+    //   • Child must be Malicious (not merely Suspicious) to avoid false positives
+    //     from normal software chains (e.g. svchost spawning a suspicious helper).
+    //
+    // MITRE: T1059 (Command and Scripting Interpreter), T1204 (User Execution)
+
+    fn detect_exploited_trusted_process_agg(
+        graph: &ThreatGraph,
+        counter: &mut u32,
+    ) -> Vec<AttackChain> {
+        let mut result = Vec::new();
+        for edge in graph.edges.iter().filter(|e| e.edge_type == EdgeType::ParentChild) {
+            let parent = unwrap_or_continue!(graph.nodes.get(&edge.from));
+            let child  = unwrap_or_continue!(graph.nodes.get(&edge.to));
+
+            // Parent must be clean; child must be confirmed Malicious.
+            if !is_clean(&parent.threat_level) { continue; }
+            if child.threat_level != "Malicious" { continue; }
+
+            *counter += 1;
+            result.push(AttackChain {
+                chain_id:     format!("chain-{counter}"),
+                pattern:      AttackPattern::ExploitedTrustedProcess,
+                node_ids:     vec![edge.from.clone(), edge.to.clone()],
+                chain_score:  child.combined_score,
+                severity:     child.threat_level.clone(),
+                description:  format!(
+                    "Trusted process '{}' spawned malicious child '{}' — \
+                     possible exploitation or living-off-the-land delivery (T1059/T1204)",
+                    parent.label, child.label,
+                ),
+                mitre_tactic: AttackPattern::ExploitedTrustedProcess.mitre_tactic().to_string(),
+            });
+        }
+        result
+    }
+
     /// Detect all attack chains in `graph` and return them sorted by score.
     pub fn find_attack_chains(graph: &ThreatGraph) -> Vec<AttackChain> {
         let mut counter: u32 = 0;
@@ -164,17 +212,28 @@ impl GraphAnalyzer {
         deduplicate_chains(chains)
     }
 
-    // ── Critical path (Dijkstra-like max-weight path) ─────────────────────────
+    // ── Critical path (max-weight path with clean-ancestry tracing) ──────────
     //
     // Strategy:
-    //  1. Build a threat sub-graph: only nodes with threat_level != Clean, plus
-    //     edges where at least one endpoint is a threat node.
-    //  2. Edge weight = avg(combined_score_a, combined_score_b) × type_multiplier.
-    //     combined_score already incorporates ML for network entities (H×0.4+ML×0.6).
-    //  3. Depth-bounded DFS (max depth 6) with a per-path visited set prevents
-    //     cycles.  Starting only from threat nodes keeps the search space small
-    //     (typically < 20 nodes, < 50 edges → microseconds of wall-clock time).
-    //  4. The path with the highest cumulative edge-weight sum is returned.
+    //  1. Collect threat nodes (non-Clean).
+    //  2. Trace backwards through ParentChild edges from every threat node to
+    //     find clean ancestor processes (the "delivery chain").  Real attacks
+    //     almost always start clean: explorer → cmd → powershell → malware.
+    //     Without this step the critical path would begin at the first malicious
+    //     node and miss the full lineage.
+    //  3. Build adjacency over (threat nodes ∪ clean ancestors).  Non-ancestry
+    //     clean↔clean edges are still excluded to keep the search space bounded.
+    //  4. Seed DFS from process-tree roots (nodes with no parent in scope) AND
+    //     from every threat node (catches threat clusters not connected to a
+    //     ParentChild chain).
+    //  5. Edge weight = avg(score_a, score_b) × type_multiplier.  Clean nodes
+    //     contribute 0 to the average, so ancestry hops add little weight by
+    //     themselves; the max-path still gravitates toward the malicious tail,
+    //     but the full lineage is preserved in the result.
+    //  6. Depth limit raised to 10 to accommodate clean ancestors before the
+    //     malicious tail (previously 6, which was fine when only threat nodes
+    //     were in the graph, but too shallow once clean roots are included).
+    //  7. Guard: winning path must contain at least one threat node.
 
     pub fn find_critical_path(graph: &ThreatGraph) -> Option<CriticalPath> {
         // ── Collect threat node IDs ────────────────────────────────────────────
@@ -187,34 +246,88 @@ impl GraphAnalyzer {
             return None;
         }
 
-        // ── Build bidirectional weighted adjacency (threat-anchored edges) ─────
-        // We include any edge where at least one endpoint is a threat node so that
-        // a clean pivot (e.g. a shared process) can still connect threat entities.
+        // ── Build parent_of map for ancestry traversal ─────────────────────────
+        // child_id → parent_id, restricted to ParentChild edges.
+        let parent_of: HashMap<&str, &str> = graph.edges.iter()
+            .filter(|e| e.edge_type == EdgeType::ParentChild)
+            .map(|e| (e.to.as_str(), e.from.as_str()))
+            .collect();
+
+        // ── Trace clean ancestors of every threat node ─────────────────────────
+        // Walk ParentChild edges backwards until we hit a node that either has no
+        // parent or is already a threat node.  Depth-limited to avoid traversing
+        // very deep but entirely-clean process trees (e.g. system service chains).
+        const MAX_ANCESTRY_DEPTH: usize = 8;
+
+        let mut ancestry: HashSet<&str> = HashSet::new();
+        let mut chain_roots: HashSet<&str> = HashSet::new();
+
+        for &tid in &threat_ids {
+            let mut cursor = tid;
+            let mut depth  = 0usize;
+            loop {
+                if depth >= MAX_ANCESTRY_DEPTH { break; }
+                match parent_of.get(cursor) {
+                    Some(&parent) => {
+                        ancestry.insert(parent);
+                        cursor = parent;
+                        depth += 1;
+                    }
+                    None => {
+                        // cursor is the root of this process tree branch.
+                        chain_roots.insert(cursor);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ── Build adjacency ────────────────────────────────────────────────────
+        // Include:
+        //   • Any edge where at least one endpoint is a *threat* node  (original rule).
+        //   • ParentChild edges where both endpoints are in ancestry scope — these
+        //     form the clean delivery chain that must be traversable.
+        let ancestry_scope: HashSet<&str> = threat_ids.iter().copied()
+            .chain(ancestry.iter().copied())
+            .collect();
+
         let mut adj: HashMap<&str, Vec<(&str, f32, &str)>> = HashMap::new();
 
         for edge in &graph.edges {
             let from = edge.from.as_str();
             let to   = edge.to.as_str();
 
-            if !threat_ids.contains(from) && !threat_ids.contains(to) {
-                continue; // skip clean↔clean edges
+            let threat_anchored = threat_ids.contains(from) || threat_ids.contains(to);
+            let ancestry_edge   = edge.edge_type == EdgeType::ParentChild
+                                  && ancestry_scope.contains(from)
+                                  && ancestry_scope.contains(to);
+
+            if !threat_anchored && !ancestry_edge {
+                continue;
             }
 
             let from_score = graph.nodes.get(from).map_or(0.0, |n| n.combined_score);
             let to_score   = graph.nodes.get(to  ).map_or(0.0, |n| n.combined_score);
-            let weight     = edge_weight(from_score, to_score, &edge.edge_type);
+            let weight     = GraphEdge::weight_for(from_score, to_score, &edge.edge_type);
 
             adj.entry(from).or_default().push((to,   weight, edge.edge_type.as_str()));
             adj.entry(to  ).or_default().push((from, weight, edge.edge_type.as_str()));
         }
 
-        // ── DFS from every threat node ─────────────────────────────────────────
+        // ── DFS from chain roots + all threat nodes ────────────────────────────
+        // Chain roots are the clean process-tree ancestors; starting there lets
+        // the DFS discover the full delivery chain leading into the malicious tail.
+        // Threat nodes are always included so isolated threat clusters are covered.
+        let start_ids: HashSet<&str> = chain_roots.iter().copied()
+            .chain(threat_ids.iter().copied())
+            .collect();
+
         let mut best: Option<CriticalPath> = None;
 
-        for &start in &threat_ids {
+        for &start in &start_ids {
             let mut visited: HashSet<&str>  = HashSet::new();
             let mut path_nodes: Vec<String> = vec![start.to_string()];
-            let mut path_hops: Vec<(String, f32)> = Vec::new(); // (edge_type, weight)
+            let mut path_hops: Vec<(String, f32)> = Vec::new();
             visited.insert(start);
 
             dfs_max_path(
@@ -225,8 +338,16 @@ impl GraphAnalyzer {
                 &mut path_nodes,
                 &mut path_hops,
                 &mut best,
-                6, // max depth (7 nodes)
+                10, // increased from 6: clean ancestors add hops before the malicious tail
             );
+        }
+
+        // Guard: discard any winning path that contains no threat node.
+        // This prevents returning a purely clean path when the DFS seeds from roots.
+        if best.as_ref().map_or(false, |p| {
+            !p.node_ids.iter().any(|id| threat_ids.contains(id.as_str()))
+        }) {
+            best = None;
         }
 
         if let Some(ref mut path) = best {
@@ -522,7 +643,144 @@ impl GraphAnalyzer {
     }
 }
 
+// ─── Graph feedback pass ─────────────────────────────────────────────────────
+
+impl GraphAnalyzer {
+    /// Push graph-layer findings back into node scores so that downstream
+    /// consumers (serializer, UI) see scores that reflect structural importance,
+    /// not just per-domain heuristics.
+    ///
+    /// Three refinements run in sequence, each capped to prevent runaway inflation:
+    ///
+    /// 1. **Critical-path boost** (max +0.15 per node) — nodes on the highest-weight
+    ///    path are boosted proportionally to their edge-weight contribution.
+    ///    High-weight hops → bigger boosts.
+    ///
+    /// 2. **Centrality boost** (max +0.10 per threat node) — nodes with many
+    ///    cross-entity edges are structurally pivotal; their score is raised
+    ///    proportional to degree / max_degree.
+    ///
+    /// 3. **Vector flag** (clean parent of Malicious child, +0.08) — a clean
+    ///    trusted process that directly spawned a Malicious/Critical child is
+    ///    marked `is_vector = true`.  Its score is raised to surface it in path
+    ///    analysis even though its own heuristic score is low.
+    ///
+    /// After each boost the threat level is re-evaluated and escalated (never
+    /// downgraded) if the new combined_score crosses the Suspicious (≥0.55) or
+    /// Malicious (≥0.80) threshold.  Vectors always stay at their original level
+    /// (usually Clean) so as not to generate false alarms.
+    pub fn apply_graph_feedback(graph: &mut ThreatGraph) {
+        // ── 1. Critical-path boost ────────────────────────────────────────────
+        // Clone the path data first to avoid simultaneous mutable + immutable
+        // borrows of `graph`.
+        let cp_data: Option<(Vec<String>, Vec<f32>, f32)> = graph.critical_path
+            .as_ref()
+            .map(|cp| (cp.node_ids.clone(), cp.edge_weights.clone(), cp.total_score));
+
+        if let Some((node_ids, edge_weights, total_score)) = cp_data {
+            if total_score > 0.0 {
+                let n = node_ids.len();
+                for (i, node_id) in node_ids.iter().enumerate() {
+                    // Each node's path contribution = avg of the edge weights it touches.
+                    let contribution = if n == 1 {
+                        total_score
+                    } else if i == 0 {
+                        edge_weights[0]
+                    } else if i == n - 1 {
+                        edge_weights[n - 2]
+                    } else {
+                        (edge_weights[i - 1] + edge_weights[i]) * 0.5
+                    };
+
+                    let path_importance = (contribution / total_score).clamp(0.0, 1.0);
+                    let boost = 0.15 * path_importance;
+
+                    if let Some(node) = graph.nodes.get_mut(node_id) {
+                        node.graph_boost  += boost;
+                        node.combined_score = (node.combined_score + boost).clamp(0.0, 1.0);
+                        escalate_threat_level(node);
+                    }
+                }
+            }
+        }
+
+        // ── 2. Centrality boost ───────────────────────────────────────────────
+        // Compute undirected degree (in + out) for every node.
+        let mut degree: HashMap<String, usize> = HashMap::new();
+        for edge in &graph.edges {
+            *degree.entry(edge.from.clone()).or_insert(0) += 1;
+            *degree.entry(edge.to.clone()).or_insert(0) += 1;
+        }
+
+        let max_degree = degree.values().copied().max().unwrap_or(1).max(1);
+
+        let centrality_boosts: Vec<(String, f32)> = degree
+            .iter()
+            .filter(|(id, &deg)| {
+                deg >= 2 && graph.nodes.get(*id)
+                    .map_or(false, |n| !is_clean(&n.threat_level))
+            })
+            .map(|(id, &deg)| {
+                let boost = 0.10 * (deg as f32 / max_degree as f32);
+                (id.clone(), boost)
+            })
+            .collect();
+
+        for (id, boost) in centrality_boosts {
+            if let Some(node) = graph.nodes.get_mut(&id) {
+                node.graph_boost    += boost;
+                node.combined_score  = (node.combined_score + boost).clamp(0.0, 1.0);
+                escalate_threat_level(node);
+            }
+        }
+
+        // ── 3. Vector flag ────────────────────────────────────────────────────
+        // Collect qualifying (from, to) pairs before mutating the node map.
+        let vector_parents: Vec<String> = graph.edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::ParentChild)
+            .filter(|e| {
+                let parent_clean = graph.nodes.get(&e.from)
+                    .map_or(false, |n| n.threat_level == "Clean");
+                let child_malicious = graph.nodes.get(&e.to)
+                    .map_or(false, |n| matches!(n.threat_level.as_str(), "Malicious" | "Critical"));
+                parent_clean && child_malicious
+            })
+            .map(|e| e.from.clone())
+            .collect();
+
+        for parent_id in vector_parents {
+            if let Some(node) = graph.nodes.get_mut(&parent_id) {
+                node.is_vector       = true;
+                node.graph_boost    += 0.08;
+                node.combined_score  = (node.combined_score + 0.08).clamp(0.0, 1.0);
+                // Intentionally do NOT escalate threat level — a vector stays
+                // Clean; its elevated score is a positional indicator only.
+            }
+        }
+    }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Escalate a node's threat_level if the new combined_score crosses a threshold.
+/// Never downgrades an existing level.
+fn escalate_threat_level(node: &mut GraphNode) {
+    let new_level = if node.combined_score >= 0.80 {
+        "Malicious"
+    } else if node.combined_score >= 0.55 {
+        "Suspicious"
+    } else {
+        return;
+    };
+
+    fn rank(s: &str) -> u8 {
+        match s { "Critical" => 3, "Malicious" => 2, "Suspicious" => 1, _ => 0 }
+    }
+    if rank(new_level) > rank(&node.threat_level) {
+        node.threat_level = new_level.to_string();
+    }
+}
 
 /// true when threat_level is "Clean" or "Safe".
 fn is_clean(level: &str) -> bool {
@@ -663,38 +921,9 @@ fn hop_verb(edge_type: &str, from_type: &str, _to_type: &str) -> &'static str {
 }
 
 // ─── Critical-path helpers ────────────────────────────────────────────────────
-
-/// Edge weight for the critical-path search.
-///
-/// Formula:  avg(combined_score_a, combined_score_b) × type_multiplier
-///
-/// combined_score already encodes the ML signal for network entities
-/// (H×0.4 + ML×0.6 when an ML score is present), so no extra term is needed.
-///
-/// Type multipliers reflect the relative severity of each relationship:
-///   MemoryInjection   1.50  — in-memory code injection is a critical IOC
-///   NetworkOwner      1.40  — process owning a C2 connection is high-severity
-///   SharedC2          1.30  — shared command-and-control infrastructure
-///   ProcessOpenedFile 1.20  — file-to-process execution chain
-///   ParentChild       1.10  — process lineage is a meaningful escalation signal
-///   SameProcess       1.00  — same-PID grouping (structural, less directional)
-///   SharedFileHash    0.90  — same binary at different paths (lower severity alone)
-fn edge_weight(score_a: f32, score_b: f32, edge_type: &EdgeType) -> f32 {
-    let avg = (score_a + score_b) / 2.0;
-    let multiplier = match edge_type {
-        // Aggregated-entity inter-entity edges
-        EdgeType::SharedC2          => 1.50,  // multiple entities sharing C2 infra
-        EdgeType::ParentChild       => 1.20,  // process lineage (spawning chain)
-        EdgeType::SharedFileHash    => 0.90,  // same binary at different paths
-
-        // Legacy flat-node edge types (kept for backward compat)
-        EdgeType::MemoryInjection   => 1.35,
-        EdgeType::NetworkOwner      => 1.25,
-        EdgeType::ProcessOpenedFile => 1.10,
-        EdgeType::SameProcess       => 1.00,
-    };
-    avg * multiplier
-}
+// Edge weights in the DFS use `GraphEdge::weight_for()` — the same canonical
+// formula used by the graph builder — so stored GraphEdge.weight values and
+// DFS path weights are always computed identically.
 
 /// Recursive depth-bounded DFS for the maximum-weight simple path.
 ///

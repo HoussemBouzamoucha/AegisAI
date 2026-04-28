@@ -585,6 +585,8 @@ fn serialize_graph_node(node: &GraphNode) -> serde_json::Value {
         "has_malicious_file":    node.has_malicious_file,
         "pid":                   node.pid,
         "parent_pid":            node.parent_pid,
+        "graph_boost":           node.graph_boost,
+        "is_vector":             node.is_vector,
     })
 }
 
@@ -829,6 +831,15 @@ fn daemon_correlate(
 
     let critical_path = GraphAnalyzer::find_critical_path(&graph);
     graph.critical_path = critical_path;
+
+    // Refinement pass: push graph findings (critical-path position, centrality,
+    // vector proximity) back into node scores and flags.
+    GraphAnalyzer::apply_graph_feedback(&mut graph);
+
+    // Recompute stored GraphEdge weights from the updated node scores so that
+    // the serialized edge.weight values reflect the post-feedback combined_scores.
+    graph.refresh_edge_weights();
+
     eprintln!("CORRELATE: graph done in {}ms — {} nodes, {} edges, {} chains",
         t_graph.elapsed().as_millis(), graph.nodes.len(), graph.edges.len(), graph.attack_chains.len());
 

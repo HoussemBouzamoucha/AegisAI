@@ -219,12 +219,17 @@ impl MemoryScanner {
                 let is_executable = mem_is_executable(info.Protect);
                 let is_private    = info.Type == MEM_PRIVATE;
 
+                let trusted_jit = is_trusted_jit(&process_name, process_path.as_deref());
+                let system_proc = is_system_process(process_path.as_deref());
+
                 let (mut threat_score, mut detection_signals) = score_region(
                     is_executable,
                     is_writable,
                     is_private,
                     region_size,
                     &protection,
+                    trusted_jit,
+                    system_proc,
                 );
 
                 // For regions that already have a base score, read a content
@@ -366,21 +371,98 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
+// ─── Process trust classification ────────────────────────────────────────────
+
+/// Processes that use JIT compilation and legitimately produce RWX / large
+/// anonymous-executable regions as part of normal operation.
+const KNOWN_JIT_PROCESSES: &[&str] = &[
+    // .NET CLR / PowerShell
+    "powershell.exe",
+    "pwsh.exe",
+    "dotnet.exe",
+    // Node.js / Deno  (V8)
+    "node.exe",
+    "deno.exe",
+    // Chromium / CEF-based apps  (V8 embedded)
+    "chrome.exe",
+    "msedge.exe",
+    "opera.exe",
+    "brave.exe",
+    "firefox.exe",
+    "overwolfbrowser.exe",
+    "overwolf.exe",
+    "overwolfbrowserhost.exe",
+    // Java JVM
+    "java.exe",
+    "javaw.exe",
+    // Electron  (V8)
+    "code.exe",       // VS Code
+    "discord.exe",
+    "slack.exe",
+    "teams.exe",
+    "ms-teams.exe",
+];
+
+/// Returns true when the process is a known JIT runtime running from a
+/// legitimate (non-temporary) path.  JIT engines routinely allocate RWX /
+/// large anonymous-exec regions; penalising them creates massive false-positive
+/// noise without catching real threats.
+///
+/// Safety guard: if the binary is located inside a temp directory, we do NOT
+/// trust it — a JIT process spawned from %TEMP% is itself a red flag.
+#[cfg(windows)]
+fn is_trusted_jit(name: &str, path: Option<&str>) -> bool {
+    let name_lc = name.to_lowercase();
+    if !KNOWN_JIT_PROCESSES.contains(&name_lc.as_str()) {
+        return false;
+    }
+    match path {
+        Some(p) => {
+            let pl = p.to_lowercase().replace('\\', "/");
+            // Reject if the binary lives in a temp directory.
+            !pl.contains("/temp/")
+                && !pl.contains("/tmp/")
+                && !pl.ends_with("/temp")
+                && !pl.ends_with("/tmp")
+                && !pl.contains("/appdata/local/temp")
+        }
+        // Unknown path → be conservative.
+        None => false,
+    }
+}
+
+/// Returns true when the process executable lives in a Windows system
+/// directory.  OS components (svchost, lsass, services, etc.) are trusted and
+/// must not be flagged for normal memory layouts.
+#[cfg(windows)]
+fn is_system_process(path: Option<&str>) -> bool {
+    let Some(p) = path else { return false };
+    let pl = p.to_lowercase().replace('\\', "/");
+    pl.starts_with("c:/windows/system32/")
+        || pl.starts_with("c:/windows/syswow64/")
+        || pl.starts_with("c:/windows/winsxs/")
+        || pl.starts_with("c:/windows/servicing/")
+}
+
 // ─── Scoring ──────────────────────────────────────────────────────────────────
 
-/// Primary heuristic: score a memory region based on its protection flags and size.
+/// Primary heuristic: score a memory region based on its protection flags,
+/// size, and process trust level.
 ///
-/// Design rationale — what NOT to flag:
-///   • Writable-private (heap, stack, data sections): normal for every process.
-///   • Non-executable private: covers virtually all heap allocations.
-///   • Small executable regions: JIT trampolines, CLR/V8 stubs are ubiquitous.
+/// Trust tiers
+/// ───────────
+/// • Trusted JIT (known runtime from non-temp path) or system process
+///   → RWX scores 5 (below reporting threshold); only escalated if content
+///     analysis finds actual payload indicators (PE header, NOP sled).
+///   → Large anonymous executable regions score 0 — V8/CLR heap is routine.
 ///
-/// What to flag:
-///   • RWX (Tier 1 / Malicious): hallmark of shellcode and process injection;
-///     simultaneous write + execute is almost never legitimate (T1055).
-///   • Large anonymous executable pages (Tier 2 / Suspicious): MEM_PRIVATE +
-///     executable = no image backing. Fine for < 2 MB (JIT stubs). Flag at ≥ 2 MB
-///     with a stronger signal at ≥ 8 MB.
+/// • Unknown / untrusted process
+///   → RWX scores 25 (Suspicious).  Content analysis can push to Malicious
+///     (PE header +20 → 45, NOP sled +10 → 35).
+///   → Large anonymous exec scored as before.
+///
+/// Note: the RWX branch no longer early-returns so that content analysis
+/// always runs and can escalate — or confirm — the score.
 #[cfg(windows)]
 fn score_region(
     is_executable: bool,
@@ -388,30 +470,45 @@ fn score_region(
     is_private:    bool,
     region_size:   u64,
     _protection:   &str,
+    trusted_jit:   bool,
+    system_proc:   bool,
 ) -> (i32, Vec<DetectionSignal>) {
     let mut score   = 0i32;
     let mut signals = Vec::new();
+    let trusted     = trusted_jit || system_proc;
 
     // ── Tier 1: RWX ───────────────────────────────────────────────────────────
-    // Execute + Write simultaneously. Canonical shellcode / reflective-DLL
-    // injection signature. Score 40 = Malicious immediately.
+    // Execute + Write simultaneously is the canonical shellcode / reflective-DLL
+    // injection signature (T1055).  However, JIT engines (.NET CLR, V8) also
+    // create RWX pages legitimately.
+    //
+    // • Trusted process  → score 5 (silent; content analysis decides).
+    // • Unknown process  → score 25 (Suspicious baseline).
+    //
+    // We no longer early-return here so that content analysis always runs
+    // and can escalate the score when payload indicators are present.
     if is_executable && is_writable {
-        score += 40;
-        signals.push(DetectionSignal::new(
-            "memory",
-            "Executable + writable region (RWX) — shellcode / injection indicator",
-            40,
-        ));
-        return (score, signals); // already at Malicious threshold
+        if trusted {
+            score += 5;
+            // No UI signal added — routine JIT behaviour should not create noise.
+        } else {
+            score += 25;
+            signals.push(DetectionSignal::new(
+                "memory",
+                "Executable + writable region (RWX) — shellcode / injection indicator (T1055)",
+                25,
+            ));
+        }
     }
 
     // ── Tier 2: anonymous executable pages ────────────────────────────────────
-    // MEM_PRIVATE + executable = no image file backing (not MEM_IMAGE).
-    // Small regions (< 2 MB) are produced constantly by JIT engines and CLR/V8;
-    // do not score them. Larger allocations without an image backing are unusual.
-    if is_executable && is_private {
+    // MEM_PRIVATE + executable = no image-file backing (not MEM_IMAGE).
+    // Trusted JIT and system processes skip this check: V8, CLR, and JVM
+    // regularly allocate multi-MB anonymous exec regions for compiled code.
+    // The `!is_writable` guard avoids double-counting with the RWX branch.
+    if is_executable && is_private && !is_writable && !trusted {
         if region_size >= 8 * 1024 * 1024 {
-            // ≥ 8 MB: strong indicator — uncommon outside injection payloads
+            // ≥ 8 MB without image backing: uncommon outside injection payloads.
             score += 25;
             signals.push(DetectionSignal::new(
                 "memory",
@@ -419,7 +516,7 @@ fn score_region(
                 25,
             ));
         } else if region_size >= 2 * 1024 * 1024 {
-            // 2 – 8 MB: moderate indicator — could be JIT, but worth noting
+            // 2 – 8 MB: moderate indicator — could be JIT, but worth noting.
             score += 12;
             signals.push(DetectionSignal::new(
                 "memory",
@@ -427,7 +524,7 @@ fn score_region(
                 12,
             ));
         }
-        // < 2 MB: JIT stubs / trampolines — too prevalent to be a useful signal
+        // < 2 MB: JIT stubs / trampolines — too prevalent to be a useful signal.
     }
 
     (score, signals)

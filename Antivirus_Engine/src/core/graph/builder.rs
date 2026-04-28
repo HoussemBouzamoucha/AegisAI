@@ -91,7 +91,8 @@ impl<'a> GraphBuilder<'a> {
                         entity.entity_type.clone(),
                         types.get(peer).cloned().unwrap_or(EntityType::Process),
                     );
-                    let w = max_score(s, *scores.get(peer).unwrap_or(&0.0));
+                    let peer_s = *scores.get(peer).unwrap_or(&0.0);
+                    let w = GraphEdge::weight_for(s, peer_s, &et);
                     graph.add_edge(GraphEdge {
                         from: id.to_string(), to: peer.to_string(), edge_type: et, weight: w,
                     });
@@ -105,7 +106,8 @@ impl<'a> GraphBuilder<'a> {
                     for &child in by_parent.get(&pid).into_iter().flatten() {
                         if child == id { continue; }
                         if !seen.insert(canonical_pair(id, child)) { continue; }
-                        let w = max_score(s, *scores.get(child).unwrap_or(&0.0));
+                        let child_s = *scores.get(child).unwrap_or(&0.0);
+                        let w = GraphEdge::weight_for(s, child_s, &EdgeType::ParentChild);
                         graph.add_edge(GraphEdge {
                             from:      id.to_string(),
                             to:        child.to_string(),
@@ -121,7 +123,8 @@ impl<'a> GraphBuilder<'a> {
                         if file_id == id { continue; }
                         if types.get(file_id) != Some(&EntityType::File) { continue; }
                         if !seen.insert(canonical_pair(id, file_id)) { continue; }
-                        let w = max_score(s, *scores.get(file_id).unwrap_or(&0.0));
+                        let file_s = *scores.get(file_id).unwrap_or(&0.0);
+                        let w = GraphEdge::weight_for(s, file_s, &EdgeType::ProcessOpenedFile);
                         // Edge direction: file → process (file was executed)
                         graph.add_edge(GraphEdge {
                             from:      file_id.to_string(),
@@ -139,7 +142,8 @@ impl<'a> GraphBuilder<'a> {
                     for &peer in by_file_hash.get(fh.as_str()).into_iter().flatten() {
                         if peer == id { continue; }
                         if !seen.insert(canonical_pair(id, peer)) { continue; }
-                        let w = max_score(s, *scores.get(peer).unwrap_or(&0.0));
+                        let peer_s = *scores.get(peer).unwrap_or(&0.0);
+                        let w = GraphEdge::weight_for(s, peer_s, &EdgeType::SharedFileHash);
                         graph.add_edge(GraphEdge {
                             from:      id.to_string(),
                             to:        peer.to_string(),
@@ -157,7 +161,8 @@ impl<'a> GraphBuilder<'a> {
                         if peer == id { continue; }
                         if types.get(peer) != Some(&EntityType::NetworkConnection) { continue; }
                         if !seen.insert(canonical_pair(id, peer)) { continue; }
-                        let w = max_score(s, *scores.get(peer).unwrap_or(&0.0));
+                        let peer_s = *scores.get(peer).unwrap_or(&0.0);
+                        let w = GraphEdge::weight_for(s, peer_s, &EdgeType::SharedC2);
                         graph.add_edge(GraphEdge {
                             from:      id.to_string(),
                             to:        peer.to_string(),
@@ -213,10 +218,9 @@ pub fn build_from_aggregated(entities: &[AggregatedEntity]) -> ThreatGraph {
                 let child_id = e.entity_id.as_str();
                 if parent_id == child_id { continue; }
                 if !seen.insert(canonical_pair(parent_id, child_id)) { continue; }
-                let w = max_score(
-                    *scores.get(parent_id).unwrap_or(&0.0),
-                    *scores.get(child_id).unwrap_or(&0.0),
-                );
+                let sp = *scores.get(parent_id).unwrap_or(&0.0);
+                let sc = *scores.get(child_id ).unwrap_or(&0.0);
+                let w  = GraphEdge::weight_for(sp, sc, &EdgeType::ParentChild);
                 graph.add_edge(GraphEdge {
                     from: parent_id.to_string(), to: child_id.to_string(),
                     edge_type: EdgeType::ParentChild, weight: w,
@@ -238,7 +242,9 @@ pub fn build_from_aggregated(entities: &[AggregatedEntity]) -> ThreatGraph {
             for j in (i + 1)..ids.len() {
                 let a = ids[i]; let b = ids[j];
                 if !seen.insert(canonical_pair(a, b)) { continue; }
-                let w = max_score(*scores.get(a).unwrap_or(&0.0), *scores.get(b).unwrap_or(&0.0));
+                let sa = *scores.get(a).unwrap_or(&0.0);
+                let sb = *scores.get(b).unwrap_or(&0.0);
+                let w  = GraphEdge::weight_for(sa, sb, &EdgeType::SharedC2);
                 graph.add_edge(GraphEdge {
                     from: a.to_string(), to: b.to_string(),
                     edge_type: EdgeType::SharedC2, weight: w,
@@ -260,7 +266,9 @@ pub fn build_from_aggregated(entities: &[AggregatedEntity]) -> ThreatGraph {
             for j in (i + 1)..ids.len() {
                 let a = ids[i]; let b = ids[j];
                 if !seen.insert(canonical_pair(a, b)) { continue; }
-                let w = max_score(*scores.get(a).unwrap_or(&0.0), *scores.get(b).unwrap_or(&0.0));
+                let sa = *scores.get(a).unwrap_or(&0.0);
+                let sb = *scores.get(b).unwrap_or(&0.0);
+                let w  = GraphEdge::weight_for(sa, sb, &EdgeType::SharedFileHash);
                 graph.add_edge(GraphEdge {
                     from: a.to_string(), to: b.to_string(),
                     edge_type: EdgeType::SharedFileHash, weight: w,
@@ -306,6 +314,8 @@ pub fn aggregate_to_graph_node(e: &AggregatedEntity) -> GraphNode {
         has_malicious_file:    e.has_malicious_file,
         pid:                   e.pid,
         parent_pid:            e.parent_pid,
+        graph_boost:           0.0,
+        is_vector:             false,
     }
 }
 
@@ -363,6 +373,8 @@ pub fn entity_to_graph_node(entity: &EntityNode) -> GraphNode {
         has_malicious_file:    false,
         pid:                   entity.join_keys.pid,
         parent_pid:            entity.join_keys.parent_pid,
+        graph_boost:           0.0,
+        is_vector:             false,
     }
 }
 

@@ -52,8 +52,44 @@ pub struct GraphEdge {
     pub from:      String,
     pub to:        String,
     pub edge_type: EdgeType,
-    /// max(combined_score_from, combined_score_to) — used as path weight.
+    /// avg(combined_score_from, combined_score_to) × edge-type multiplier.
+    /// Both scores must be in [0, 1]; see `GraphEdge::weight_for`.
     pub weight:    f32,
+}
+
+impl GraphEdge {
+    /// Canonical edge-weight formula shared by the graph builder and the
+    /// critical-path DFS.
+    ///
+    /// `avg(score_a, score_b) × type_multiplier`
+    ///
+    /// Multipliers encode the relative severity of each relationship type:
+    ///
+    /// | EdgeType            | ×    | Rationale                              |
+    /// |---------------------|------|----------------------------------------|
+    /// | SharedC2            | 1.50 | shared C2 infra — strongest tie        |
+    /// | MemoryInjection     | 1.35 | in-memory shellcode execution          |
+    /// | NetworkOwner        | 1.25 | process owns a C2 connection           |
+    /// | ParentChild         | 1.20 | process spawning chain                 |
+    /// | ProcessOpenedFile   | 1.10 | file executed → process spawned        |
+    /// | SameProcess         | 1.00 | structural PID grouping                |
+    /// | SharedFileHash      | 0.90 | same binary, different path            |
+    ///
+    /// Both `score_a` and `score_b` must already be in `[0, 1]` (guaranteed
+    /// after the per-domain normalization pass in entity/manager.rs).
+    pub fn weight_for(score_a: f32, score_b: f32, edge_type: &EdgeType) -> f32 {
+        let avg = (score_a + score_b) / 2.0;
+        let multiplier = match edge_type {
+            EdgeType::SharedC2          => 1.50,
+            EdgeType::MemoryInjection   => 1.35,
+            EdgeType::NetworkOwner      => 1.25,
+            EdgeType::ParentChild       => 1.20,
+            EdgeType::ProcessOpenedFile => 1.10,
+            EdgeType::SameProcess       => 1.00,
+            EdgeType::SharedFileHash    => 0.90,
+        };
+        avg * multiplier
+    }
 }
 
 // ─── Graph node ───────────────────────────────────────────────────────────────
@@ -91,6 +127,14 @@ pub struct GraphNode {
     pub has_malicious_file:    bool,
     pub pid:                   Option<u32>,
     pub parent_pid:            Option<u32>,
+
+    // ── Graph-feedback fields (set by GraphAnalyzer::apply_graph_feedback) ───
+    /// Cumulative score added by the graph feedback pass (path boost + centrality
+    /// boost + vector proximity).  Zero until the pass runs.
+    pub graph_boost: f32,
+    /// True when this node is Clean but is a direct parent of a Malicious/Critical
+    /// child — marks it as an exploitation vector (living-off-the-land delivery).
+    pub is_vector:   bool,
 }
 
 // ─── Attack pattern ───────────────────────────────────────────────────────────
@@ -109,28 +153,33 @@ pub enum AttackPattern {
     MultiStageAttack,
     /// A suspicious / malicious process spawned a suspicious / malicious child.
     SuspiciousSpawn,
+    /// A clean (trusted) process spawned a child that is confirmed Malicious —
+    /// classic delivery via living-off-the-land or exploitation of a legitimate binary.
+    ExploitedTrustedProcess,
 }
 
 impl AttackPattern {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::ProcessInjection => "ProcessInjection",
-            Self::C2Communication  => "C2Communication",
-            Self::MalwareExecution => "MalwareExecution",
-            Self::LateralMovement  => "LateralMovement",
-            Self::MultiStageAttack => "MultiStageAttack",
-            Self::SuspiciousSpawn  => "SuspiciousSpawn",
+            Self::ProcessInjection         => "ProcessInjection",
+            Self::C2Communication          => "C2Communication",
+            Self::MalwareExecution         => "MalwareExecution",
+            Self::LateralMovement          => "LateralMovement",
+            Self::MultiStageAttack         => "MultiStageAttack",
+            Self::SuspiciousSpawn          => "SuspiciousSpawn",
+            Self::ExploitedTrustedProcess  => "ExploitedTrustedProcess",
         }
     }
 
     pub fn mitre_tactic(&self) -> &'static str {
         match self {
-            Self::ProcessInjection => "T1055 - Process Injection",
-            Self::C2Communication  => "T1071 - Application Layer Protocol",
-            Self::MalwareExecution => "T1204 - User Execution",
-            Self::LateralMovement  => "T1021 - Remote Services",
-            Self::MultiStageAttack => "TA0002 - Execution",
-            Self::SuspiciousSpawn  => "T1059 - Command and Scripting Interpreter",
+            Self::ProcessInjection         => "T1055 - Process Injection",
+            Self::C2Communication          => "T1071 - Application Layer Protocol",
+            Self::MalwareExecution         => "T1204 - User Execution",
+            Self::LateralMovement          => "T1021 - Remote Services",
+            Self::MultiStageAttack         => "TA0002 - Execution",
+            Self::SuspiciousSpawn          => "T1059 - Command and Scripting Interpreter",
+            Self::ExploitedTrustedProcess  => "T1059/T1204 - Execution via Trusted Process",
         }
     }
 
@@ -154,6 +203,9 @@ impl AttackPattern {
             Self::SuspiciousSpawn =>
                 "A suspicious or malicious process spawned a child process that is also \
                  flagged as suspicious or malicious — possible propagation or privilege-escalation chain",
+            Self::ExploitedTrustedProcess =>
+                "A clean trusted process spawned a child that is confirmed Malicious \
+                 — classic living-off-the-land delivery or exploitation of a legitimate binary",
         }
     }
 }
@@ -238,5 +290,27 @@ impl ThreatGraph {
         self.nodes.values()
             .filter(|n| !matches!(n.threat_level.as_str(), "Clean" | "Safe"))
             .count()
+    }
+
+    /// Recompute every `GraphEdge.weight` from the current `combined_score` of
+    /// the two endpoint nodes.
+    ///
+    /// Call this after any pass that mutates node scores (e.g.
+    /// `GraphAnalyzer::apply_graph_feedback`) so stored edge weights stay
+    /// consistent with the scores the UI and serializer will read.
+    pub fn refresh_edge_weights(&mut self) {
+        // Snapshot scores first to satisfy the borrow checker
+        // (self.nodes and self.edges are separate fields, but Rust doesn't know
+        // that when we borrow self mutably for the edges loop).
+        let scores: HashMap<String, f32> = self.nodes
+            .iter()
+            .map(|(id, n)| (id.clone(), n.combined_score))
+            .collect();
+
+        for edge in &mut self.edges {
+            let sa = scores.get(&edge.from).copied().unwrap_or(0.0);
+            let sb = scores.get(&edge.to  ).copied().unwrap_or(0.0);
+            edge.weight = GraphEdge::weight_for(sa, sb, &edge.edge_type);
+        }
     }
 }

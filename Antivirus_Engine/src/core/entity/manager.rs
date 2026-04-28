@@ -610,16 +610,24 @@ fn assemble_entity(
     const LOOPBACK: &[&str] = &["127.", "::1", "0.0.0.0", "::", "*"];
 
     // ── Per-domain scores ────────────────────────────────────────────────────
+    // Per-domain theoretical maxima (sum of all rules that can fire simultaneously):
+    //   Process  → 110  (mutex 20 + file handles 15 + cross-process 25 + 5 modules×10)
+    //   Memory   →  63  (RWX 25 + PE-header 20 + NOP sled 10 + INT3 sled 8)
+    //   Network  →  40  (largest single rule; stacked rules clamped by .clamp below)
+    const PROC_MAX: f32 =  110.0;
+    const MEM_MAX:  f32 =   63.0;
+    const NET_MAX:  f32 =   40.0;
+
     let process_score = process.as_ref()
-        .map(|p| (p.heuristic_score as f32 / 30.0).clamp(0.0, 1.0))
+        .map(|p| (p.heuristic_score as f32 / PROC_MAX).clamp(0.0, 1.0))
         .unwrap_or(0.0);
 
     let network_score = network.iter()
-        .map(|n| (n.heuristic_score as f32 / 40.0).clamp(0.0, 1.0))
+        .map(|n| (n.heuristic_score as f32 / NET_MAX).clamp(0.0, 1.0))
         .fold(0.0_f32, f32::max);
 
     let memory_score = memory.iter()
-        .map(|n| (n.heuristic_score as f32 / 40.0).clamp(0.0, 1.0))
+        .map(|n| (n.heuristic_score as f32 / MEM_MAX).clamp(0.0, 1.0))
         .fold(0.0_f32, f32::max);
 
     let file_score = files.iter()
