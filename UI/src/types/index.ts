@@ -309,7 +309,8 @@ export interface ProcessEntity {
 
 export type AttackPatternName =
   | 'ProcessInjection' | 'C2Communication' | 'MalwareExecution'
-  | 'LateralMovement'  | 'MultiStageAttack' | 'SuspiciousSpawn';
+  | 'LateralMovement'  | 'MultiStageAttack' | 'SuspiciousSpawn'
+  | 'ExploitedTrustedProcess';
 
 export interface EntityJoinKeys {
   pid?:        number;
@@ -372,6 +373,13 @@ export interface GraphNodeData {
   has_malicious_file?:    boolean;
   pid?:                   number;
   parent_pid?:            number;
+  // Graph-feedback fields (set after apply_graph_feedback pass)
+  /** Score added by graph analysis (path position + centrality + vector proximity). */
+  graph_boost?: number;
+  /** True when this Clean node directly spawned a Malicious/Critical child. */
+  is_vector?:   boolean;
+  /** True when this vector node's label matches a known living-off-the-land binary. */
+  is_lolbin?:   boolean;
 }
 
 export interface GraphEdgeData {
@@ -389,6 +397,10 @@ export interface AttackChain {
   severity:     UnifiedThreat;
   description:  string;
   mitre_tactic: string;
+  /** How convincingly this pattern fired — [0, 1].
+   *  High chain_score + low confidence = threshold barely crossed.
+   *  High chain_score + high confidence = multiple saturated domain signals. */
+  confidence:   number;
 }
 
 export interface CriticalPath {

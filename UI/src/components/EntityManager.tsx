@@ -104,7 +104,8 @@ const PATTERN_META: Record<AttackPatternName, { label: string; color: string; Ic
   MalwareExecution: { label: 'MALWARE EXECUTION',  color: 'var(--red)',   Icon: Zap         },
   LateralMovement:  { label: 'LATERAL MOVEMENT',   color: 'var(--amber)', Icon: Network     },
   MultiStageAttack: { label: 'MULTI-STAGE ATTACK', color: 'var(--red)',   Icon: GitBranch   },
-  SuspiciousSpawn:  { label: 'SUSPICIOUS SPAWN',   color: 'var(--amber)', Icon: GitMerge    },
+  SuspiciousSpawn:         { label: 'SUSPICIOUS SPAWN',          color: 'var(--amber)', Icon: GitMerge  },
+  ExploitedTrustedProcess: { label: 'EXPLOITED TRUSTED PROCESS', color: 'var(--red)',   Icon: GitMerge  },
 };
 
 // ─── Sub-components ───────────────────────────────────────────────────────────

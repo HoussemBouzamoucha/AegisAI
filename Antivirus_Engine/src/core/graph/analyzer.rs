@@ -1,6 +1,46 @@
 // File: src/core/graph/analyzer.rs
 // GraphAnalyzer — detects attack chains by pattern-matching the ThreatGraph.
 //
+// LOLBin detection: when a clean process spawns a confirmed-Malicious child,
+// the parent node is flagged `is_vector = true` by `apply_graph_feedback`.
+// If the parent's label also appears in the LOLBINS list below, `is_lolbin`
+// is set as well so the UI can display a "LOLBin" badge.
+
+// ─── LOLBin static list ───────────────────────────────────────────────────────
+//
+// Common living-off-the-land binaries that attackers abuse to download,
+// execute, or proxy malicious payloads while hiding behind a trusted binary.
+// Source: LOLBAS project (lolbas-project.github.io).
+//
+// Both the bare name and the `.exe` suffix are matched; labels in aggregated
+// nodes may or may not carry the extension depending on how sysinfo reports them.
+const LOLBINS: &[&str] = &[
+    "powershell.exe", "cmd.exe",      "wscript.exe",   "cscript.exe",
+    "mshta.exe",      "regsvr32.exe", "rundll32.exe",  "certutil.exe",
+    "bitsadmin.exe",  "msiexec.exe",  "wmic.exe",      "schtasks.exe",
+    "regasm.exe",     "installutil.exe", "msbuild.exe", "cmstp.exe",
+    "forfiles.exe",   "pcalua.exe",   "syncappvpublishingserver.exe",
+    "appsyncpublishingserver.exe",    "bash.exe",      "explorer.exe",
+    "expand.exe",     "extrac32.exe", "findstr.exe",   "hh.exe",
+    "makecab.exe",    "mavinject.exe","microsoft.workflow.compiler.exe",
+    "msdeploy.exe",   "msdt.exe",     "msiexec.exe",   "odbcconf.exe",
+    "pcwrun.exe",     "presentationhost.exe", "regsvcs.exe",
+    "replace.exe",    "rpcping.exe",  "runscripthelper.exe",
+    "sfc.exe",        "tracker.exe",  "wab.exe",       "xwizard.exe",
+];
+
+/// Return true if `label` (the node's display name) matches a known LOLBin.
+///
+/// Checks both the bare stem (`cmd`) and the full name (`cmd.exe`) so that
+/// labels work regardless of whether sysinfo strips the extension.
+fn is_lolbin_label(label: &str) -> bool {
+    let lower = label.to_lowercase();
+    LOLBINS.iter().any(|&lb| {
+        let stem = lb.trim_end_matches(".exe");
+        lower == lb || lower == stem
+    })
+}
+//
 // Each pattern is a self-contained detection method.  New patterns can be added
 // without modifying existing ones.  Detection order:
 //   1. ProcessInjection  — Process + malicious MemoryRegion (same PID)
@@ -39,8 +79,14 @@ impl GraphAnalyzer {
         chains.extend(Self::detect_exploited_trusted_process_agg(graph, &mut counter));
         chains.extend(Self::detect_multi_stage(graph, &mut counter));
 
-        chains.sort_by(|a, b| b.chain_score.partial_cmp(&a.chain_score)
-            .unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by chain_score × confidence descending so that a chain with
+        // high severity *and* high evidence quality ranks above one that merely
+        // crossed the threshold with a marginal signal.
+        chains.sort_by(|a, b| {
+            let ra = a.chain_score * a.confidence;
+            let rb = b.chain_score * b.confidence;
+            rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+        });
         deduplicate_chains(chains)
     }
 
@@ -49,6 +95,11 @@ impl GraphAnalyzer {
             .filter(|n| n.has_malicious_memory)
             .map(|n| {
                 *counter += 1;
+                // Confidence = how saturated the memory sub-score is.
+                // RWX + PE-header shellcode will push memory_score close to 1.0;
+                // a single suspicious flag will leave it much lower.
+                let ml_corroboration = n.ml_score.unwrap_or(0.0) * 0.15;
+                let confidence = (n.memory_score + ml_corroboration).clamp(0.0, 1.0);
                 AttackChain {
                     chain_id:     format!("chain-{counter}"),
                     pattern:      AttackPattern::ProcessInjection,
@@ -57,6 +108,7 @@ impl GraphAnalyzer {
                     severity:     n.threat_level.clone(),
                     description:  format!("'{}': {}", n.label, AttackPattern::ProcessInjection.description()),
                     mitre_tactic: AttackPattern::ProcessInjection.mitre_tactic().to_string(),
+                    confidence,
                 }
             })
             .collect()
@@ -67,6 +119,11 @@ impl GraphAnalyzer {
             .filter(|n| n.has_malicious_network)
             .map(|n| {
                 *counter += 1;
+                // Confidence = network sub-score + ML corroboration (the IDS
+                // model specifically targets network C2 patterns so its signal
+                // is particularly relevant here).
+                let ml_corroboration = n.ml_score.unwrap_or(0.0) * 0.20;
+                let confidence = (n.network_score + ml_corroboration).clamp(0.0, 1.0);
                 AttackChain {
                     chain_id:     format!("chain-{counter}"),
                     pattern:      AttackPattern::C2Communication,
@@ -75,6 +132,7 @@ impl GraphAnalyzer {
                     severity:     n.threat_level.clone(),
                     description:  format!("'{}': {}", n.label, AttackPattern::C2Communication.description()),
                     mitre_tactic: AttackPattern::C2Communication.mitre_tactic().to_string(),
+                    confidence,
                 }
             })
             .collect()
@@ -85,6 +143,10 @@ impl GraphAnalyzer {
             .filter(|n| n.has_malicious_file)
             .map(|n| {
                 *counter += 1;
+                // Confidence = file sub-score.  A YARA hit on a known-bad hash
+                // will push this close to 1.0; a marginal heuristic match stays
+                // much lower.
+                let confidence = n.file_score.clamp(0.0, 1.0);
                 AttackChain {
                     chain_id:     format!("chain-{counter}"),
                     pattern:      AttackPattern::MalwareExecution,
@@ -93,6 +155,7 @@ impl GraphAnalyzer {
                     severity:     n.threat_level.clone(),
                     description:  format!("'{}': {}", n.label, AttackPattern::MalwareExecution.description()),
                     mitre_tactic: AttackPattern::MalwareExecution.mitre_tactic().to_string(),
+                    confidence,
                 }
             })
             .collect()
@@ -106,6 +169,11 @@ impl GraphAnalyzer {
             let parent = unwrap_or_continue!(graph.nodes.get(&edge.from));
             let score    = max_score(parent.combined_score, child.combined_score);
             let severity = worst_level(&parent.threat_level, &child.threat_level);
+            // Confidence = how convincing both halves of the lateral movement are.
+            // The parent→child relationship is structural; the child's actual
+            // network evidence is the primary discriminator.
+            let avg_score = (parent.combined_score + child.combined_score) / 2.0;
+            let confidence = (avg_score * 0.50 + child.network_score * 0.50).clamp(0.0, 1.0);
             *counter += 1;
             result.push(AttackChain {
                 chain_id:     format!("chain-{counter}"),
@@ -118,6 +186,7 @@ impl GraphAnalyzer {
                     parent.label, child.label, AttackPattern::LateralMovement.description(),
                 ),
                 mitre_tactic: AttackPattern::LateralMovement.mitre_tactic().to_string(),
+                confidence,
             });
         }
         result
@@ -131,6 +200,16 @@ impl GraphAnalyzer {
             if is_clean(&parent.threat_level) || is_clean(&child.threat_level) { continue; }
             let score    = max_score(parent.combined_score, child.combined_score);
             let severity = worst_level(&parent.threat_level, &child.threat_level);
+            // Confidence = the *weaker* side of the pair.  Both nodes must be
+            // convincingly threatening for the propagation chain to be real;
+            // using min() prevents a single strong node from masking a barely-
+            // suspicious partner.  Bonus if both are confirmed Malicious/Critical
+            // — that rules out benign parent processes that happen to be flagged.
+            let base  = f32::min(parent.combined_score, child.combined_score);
+            let both_malicious = !matches!(parent.threat_level.as_str(), "Suspicious")
+                && !matches!(child.threat_level.as_str(), "Suspicious");
+            let bonus = if both_malicious { 0.15 } else { 0.0 };
+            let confidence = (base + bonus).clamp(0.0, 1.0);
             *counter += 1;
             result.push(AttackChain {
                 chain_id:     format!("chain-{counter}"),
@@ -143,6 +222,7 @@ impl GraphAnalyzer {
                     parent.label, child.label, AttackPattern::SuspiciousSpawn.description(),
                 ),
                 mitre_tactic: AttackPattern::SuspiciousSpawn.mitre_tactic().to_string(),
+                confidence,
             });
         }
         result
@@ -174,6 +254,12 @@ impl GraphAnalyzer {
             if !is_clean(&parent.threat_level) { continue; }
             if child.threat_level != "Malicious" { continue; }
 
+            // Confidence = child's combined_score.  The parent is by definition
+            // clean (its own signals are low), so the child's maliciousness is
+            // the sole evidence quality indicator.  Because the child is already
+            // confirmed Malicious (≥ threshold), confidence is always at least
+            // moderate; saturated child scores push it toward 1.0.
+            let confidence = child.combined_score.clamp(0.0, 1.0);
             *counter += 1;
             result.push(AttackChain {
                 chain_id:     format!("chain-{counter}"),
@@ -187,6 +273,7 @@ impl GraphAnalyzer {
                     parent.label, child.label,
                 ),
                 mitre_tactic: AttackPattern::ExploitedTrustedProcess.mitre_tactic().to_string(),
+                confidence,
             });
         }
         result
@@ -205,8 +292,9 @@ impl GraphAnalyzer {
         chains.extend(Self::detect_multi_stage(graph,        &mut counter));
 
         chains.sort_by(|a, b| {
-            b.chain_score.partial_cmp(&a.chain_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let ra = a.chain_score * a.confidence;
+            let rb = b.chain_score * b.confidence;
+            rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
         });
 
         deduplicate_chains(chains)
@@ -392,6 +480,8 @@ impl GraphAnalyzer {
                     AttackPattern::ProcessInjection.description(),
                 ),
                 mitre_tactic: AttackPattern::ProcessInjection.mitre_tactic().to_string(),
+                // Legacy flat graph: use mem node score as confidence proxy.
+                confidence:   mem_node.combined_score.clamp(0.0, 1.0),
             });
         }
         result
@@ -431,6 +521,8 @@ impl GraphAnalyzer {
                     AttackPattern::C2Communication.description(),
                 ),
                 mitre_tactic: AttackPattern::C2Communication.mitre_tactic().to_string(),
+                // Legacy flat graph: use network node score as confidence proxy.
+                confidence:   net_node.combined_score.clamp(0.0, 1.0),
             });
         }
         result
@@ -465,6 +557,8 @@ impl GraphAnalyzer {
                     AttackPattern::MalwareExecution.description(),
                 ),
                 mitre_tactic: AttackPattern::MalwareExecution.mitre_tactic().to_string(),
+                // Legacy flat graph: use file node score as confidence proxy.
+                confidence:   file_node.combined_score.clamp(0.0, 1.0),
             });
         }
         result
@@ -508,6 +602,8 @@ impl GraphAnalyzer {
                     worst_level(&s1, &net_node.threat_level)
                 };
 
+                let avg_score = (parent_node.combined_score + child_node.combined_score
+                    + net_node.combined_score) / 3.0;
                 *counter += 1;
                 result.push(AttackChain {
                     chain_id:     format!("chain-{counter}"),
@@ -523,6 +619,8 @@ impl GraphAnalyzer {
                         AttackPattern::LateralMovement.description(),
                     ),
                     mitre_tactic: AttackPattern::LateralMovement.mitre_tactic().to_string(),
+                    // Legacy flat: avg of three involved nodes' scores.
+                    confidence:   avg_score.clamp(0.0, 1.0),
                 });
             }
         }
@@ -543,6 +641,8 @@ impl GraphAnalyzer {
             let score    = max_score(parent.combined_score, child.combined_score);
             let severity = worst_level(&parent.threat_level, &child.threat_level);
 
+            let legacy_confidence = f32::min(parent.combined_score, child.combined_score)
+                .clamp(0.0, 1.0);
             *counter += 1;
             result.push(AttackChain {
                 chain_id:     format!("chain-{counter}"),
@@ -557,6 +657,7 @@ impl GraphAnalyzer {
                     AttackPattern::SuspiciousSpawn.description(),
                 ),
                 mitre_tactic: AttackPattern::SuspiciousSpawn.mitre_tactic().to_string(),
+                confidence:   legacy_confidence,
             });
         }
         result
@@ -623,6 +724,16 @@ impl GraphAnalyzer {
                 .map(|n| n.entity_type.as_str())
                 .collect();
 
+            // Confidence = avg node score × scanner-type diversity factor.
+            // More distinct scanner domains (memory + network + file + process)
+            // = more independent corroborating evidence → higher confidence.
+            // Cap diversity at 3 unique types (diminishing returns beyond that).
+            let avg_score: f32 = component.iter()
+                .filter_map(|id| graph.nodes.get(*id))
+                .map(|n| n.combined_score)
+                .sum::<f32>() / component.len() as f32;
+            let type_factor = (scanner_types.len() as f32 / 3.0).min(1.0);
+            let confidence = (avg_score * type_factor).clamp(0.0, 1.0);
             *counter += 1;
             result.push(AttackChain {
                 chain_id:     format!("chain-{counter}"),
@@ -637,6 +748,7 @@ impl GraphAnalyzer {
                     AttackPattern::MultiStageAttack.description(),
                 ),
                 mitre_tactic: AttackPattern::MultiStageAttack.mitre_tactic().to_string(),
+                confidence,
             });
         }
         result
@@ -756,6 +868,11 @@ impl GraphAnalyzer {
                 node.combined_score  = (node.combined_score + 0.08).clamp(0.0, 1.0);
                 // Intentionally do NOT escalate threat level — a vector stays
                 // Clean; its elevated score is a positional indicator only.
+
+                // LOLBin detection: if the vector is a known living-off-the-land
+                // binary the UI displays an additional "LOLBin" badge to highlight
+                // the abuse of a trusted Windows tool for payload delivery.
+                node.is_lolbin = is_lolbin_label(&node.label);
             }
         }
     }

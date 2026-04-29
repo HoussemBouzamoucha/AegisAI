@@ -546,6 +546,226 @@ async fn run_ml_ids(csv_path: Option<String>) -> Result<serde_json::Value, Strin
     Err("Python interpreter not found. Ensure Python 3 is installed and available in PATH.".to_string())
 }
 
+// ─── Action Commands ──────────────────────────────────────────────────────────
+//
+// Each command forwards its arguments to the daemon via JSON-RPC and returns
+// the daemon's response verbatim.  No logic lives here — the daemon owns all
+// containment logic so it can be tested independently of Tauri.
+
+/// Move a file into the AegisAI quarantine folder.
+///
+/// The daemon hashes the file, renames it to `{sha256}.quarantined`, and
+/// writes a metadata sidecar.  Returns `{ quarantine_path, sha256 }` on
+/// success.
+#[tauri::command]
+async fn quarantine_file(
+    path:  String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id": next_id(), "cmd": "quarantine-file", "path": path,
+    });
+    let json = daemon_request(&state, request, Duration::from_secs(30))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
+/// Add a Windows Firewall deny rule for `remote_ip`.
+///
+/// `direction` — `"out"` (default) or `"both"`.
+/// Returns `{ rule_name }` on success; save the rule name to call
+/// `remove_block_ip` for rollback.
+#[tauri::command]
+async fn block_ip(
+    remote_ip: String,
+    direction: Option<String>,
+    state:     tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id":        next_id(),
+        "cmd":       "block-ip",
+        "remote_ip": remote_ip,
+        "direction": direction.unwrap_or_else(|| "out".to_string()),
+    });
+    let json = daemon_request(&state, request, Duration::from_secs(15))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
+/// Remove a previously created AegisAI firewall rule by name.
+#[tauri::command]
+async fn remove_block_ip(
+    rule_name: String,
+    state:     tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id": next_id(), "cmd": "remove-block-ip", "rule_name": rule_name,
+    });
+    let json = daemon_request(&state, request, Duration::from_secs(15))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
+/// Write a full memory dump (`MiniDumpWithFullMemory`) of `pid` to disk.
+///
+/// The dump is saved to `%PROGRAMDATA%\AegisAI\dumps\{pid}_{ts}.dmp`.
+/// Returns `{ dump_path }` on success.
+#[tauri::command]
+async fn dump_memory(
+    pid:   u32,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id": next_id(), "cmd": "dump-memory", "pid": pid,
+    });
+    // Dumping a large process can take several seconds.
+    let json = daemon_request(&state, request, Duration::from_secs(120))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
+/// Scan registry run keys, scheduled tasks, and startup folders.
+///
+/// `suspicious_paths` — paths from the current verdict to cross-reference.
+/// Matching entries are flagged `suspicious: true` in the response.
+#[tauri::command]
+async fn check_persistence(
+    suspicious_paths: Option<Vec<String>>,
+    state:            tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id":              next_id(),
+        "cmd":             "check-persistence",
+        "suspicious_paths": suspicious_paths.unwrap_or_default(),
+    });
+    let json = daemon_request(&state, request, Duration::from_secs(60))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
+/// Disable all connected network interfaces to cut off C2 communications.
+///
+/// Returns `{ disabled_interfaces: [...] }`.
+/// Call `restore_network` once the incident is resolved.
+#[tauri::command]
+async fn isolate_network(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id": next_id(), "cmd": "isolate-network",
+    });
+    let json = daemon_request(&state, request, Duration::from_secs(30))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
+/// Re-enable all network interfaces that were disabled by `isolate_network`.
+#[tauri::command]
+async fn restore_network(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id": next_id(), "cmd": "restore-network",
+    });
+    let json = daemon_request(&state, request, Duration::from_secs(30))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
+/// Export a structured incident report to disk.
+///
+/// `correlate_result` — the full JSON object returned by the last
+/// `correlate_entities` call (attack chains, critical path, graph snapshot).
+/// `actions_taken`    — list of `{ action, pid?, path?, rule_name?, at, result }`
+///                      objects logged by the UI during response.
+/// `output_path`      — optional absolute path; defaults to
+///                      `%USERPROFILE%\Documents\AegisAI\incident_{ts}.json`.
+///
+/// Returns `{ report_path }` on success.
+///
+/// Note: this command runs entirely in the Tauri backend — no daemon call
+/// needed because the data is already present in the UI's Zustand store.
+#[tauri::command]
+async fn export_incident_report(
+    correlate_result: serde_json::Value,
+    actions_taken:    Vec<serde_json::Value>,
+    output_path:      Option<String>,
+) -> Result<serde_json::Value, String> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    // Determine output file path.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let report_path: PathBuf = match output_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let docs = std::env::var("USERPROFILE")
+                .map(|u| PathBuf::from(u).join("Documents").join("AegisAI"))
+                .unwrap_or_else(|_| PathBuf::from("C:\\AegisAI"));
+            fs::create_dir_all(&docs)
+                .map_err(|e| format!("Cannot create report directory: {e}"))?;
+            docs.join(format!("incident_{ts}.json"))
+        }
+    };
+
+    // Derive severity from the highest attack chain in the correlate result.
+    let severity = correlate_result["graph"]["attack_chains"]
+        .as_array()
+        .and_then(|chains| chains.first())
+        .and_then(|c| c["severity"].as_str())
+        .unwrap_or("Unknown");
+
+    // Build the structured report.
+    let report = serde_json::json!({
+        "report_id":      uuid_v4_simple(),
+        "generated_at":   ts,
+        "severity":       severity,
+        "attack_chains":  correlate_result["graph"]["attack_chains"],
+        "critical_path":  correlate_result["graph"]["critical_path"],
+        "entities":       correlate_result["entities"],
+        "actions_taken":  actions_taken,
+        "graph_snapshot": {
+            "nodes": correlate_result["graph"]["nodes"],
+            "edges": correlate_result["graph"]["edges"],
+        },
+        "statistics":     correlate_result["statistics"],
+    });
+
+    let json_str = serde_json::to_string_pretty(&report)
+        .map_err(|e| format!("Serialization error: {e}"))?;
+
+    fs::write(&report_path, &json_str)
+        .map_err(|e| format!("Cannot write report: {e}"))?;
+
+    Ok(serde_json::json!({
+        "success":     true,
+        "report_path": report_path.to_string_lossy(),
+    }))
+}
+
+/// Generate a simple UUID v4 without pulling in the `uuid` crate.
+///
+/// Uses `SystemTime` entropy seeded from the lower 128 bits of timestamp +
+/// a counter.  Not cryptographically strong but sufficient for report IDs.
+fn uuid_v4_simple() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        ts,
+        (ts >> 16) & 0xffff,
+        (ts >> 4)  & 0x0fff,
+        ((ts >> 2) & 0x3fff) | 0x8000,
+        ts as u64 * 0xdeadbeef,
+    )
+}
+
 #[tauri::command]
 async fn correlate_entities(
     include_memory: Option<bool>,
@@ -612,18 +832,32 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // ── Scanning ──────────────────────────────────────────────────
             scan_file,
             scan_directory,
             scan_processes,
             scan_network,
             scan_memory,
+            // ── Process control ───────────────────────────────────────────
             kill_process,
+            // ── File dialogs ──────────────────────────────────────────────
             open_file_dialog,
             open_dir_dialog,
+            // ── Engine status / ML ────────────────────────────────────────
             check_engine,
             get_engine_status,
             run_ml_ids,
+            // ── Entity / graph pipeline ───────────────────────────────────
             correlate_entities,
+            // ── Post-verdict containment actions ──────────────────────────
+            quarantine_file,
+            block_ip,
+            remove_block_ip,
+            dump_memory,
+            check_persistence,
+            isolate_network,
+            restore_network,
+            export_incident_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

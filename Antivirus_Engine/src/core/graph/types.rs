@@ -135,6 +135,11 @@ pub struct GraphNode {
     /// True when this node is Clean but is a direct parent of a Malicious/Critical
     /// child — marks it as an exploitation vector (living-off-the-land delivery).
     pub is_vector:   bool,
+    /// True when `is_vector` is set AND this node's label matches the static
+    /// LOLBINS list in `graph/analyzer.rs`.  A LOLBin vector means the attack
+    /// was delivered via a known living-off-the-land binary (e.g. `mshta.exe`,
+    /// `certutil.exe`) rather than a custom dropper.
+    pub is_lolbin:   bool,
 }
 
 // ─── Attack pattern ───────────────────────────────────────────────────────────
@@ -224,6 +229,15 @@ pub struct AttackChain {
     pub severity:     String,
     pub description:  String,
     pub mitre_tactic: String,
+    /// How convincingly the detection pattern fired — [0, 1].
+    ///
+    /// Unlike `chain_score` (which captures *how bad* the worst node is),
+    /// `confidence` measures *how strongly* the specific evidence supports
+    /// this pattern.  A threshold-grazing node yields low confidence; a node
+    /// with saturated domain sub-scores and corroborating ML yields high
+    /// confidence.  Used by the verdict to surface the most reliable chains
+    /// first rather than merely the worst-scored ones.
+    pub confidence:   f32,
 }
 
 // ─── Critical path ────────────────────────────────────────────────────────────

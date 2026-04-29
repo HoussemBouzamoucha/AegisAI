@@ -66,11 +66,30 @@ The daemon reads one JSON line from stdin, writes one JSON line to stdout.
 | `kill-process` | `pid` | |
 | `correlate` | `include_memory: bool` | full entity/graph pipeline |
 | `ping` | — | returns `{status:"pong"}` |
+| `quarantine-file` | `path` | move file to `%PROGRAMDATA%\AegisAI\quarantine\` |
+| `block-ip` | `remote_ip`, `direction` (`"out"` \| `"both"`) | add Windows Firewall deny rule |
+| `remove-block-ip` | `rule_name` | remove AegisAI firewall rule |
+| `dump-memory` | `pid` | write `MiniDumpWithFullMemory` to `%PROGRAMDATA%\AegisAI\dumps\` |
+| `check-persistence` | `suspicious_paths: string[]` | scan registry + scheduled tasks + startup folders |
+| `isolate-network` | — | disable all connected network interfaces |
+| `restore-network` | — | re-enable interfaces saved by `isolate-network` |
 
 **Startup:** daemon prints `{"status":"ready"}` then blocks on stdin.
 
 ### Tauri IPC Commands (UI/src-tauri/src/main.rs)
-`invoke('scan_file', {path})` · `invoke('scan_directory', {path})` · `invoke('scan_processes')` · `invoke('scan_network', {pid?})` · `invoke('scan_memory', {pid?})` · `invoke('kill_process', {pid})` · `invoke('correlate_entities', {includeMemory})` · `invoke('run_ml_ids', {csvPath?})` · `invoke('get_engine_status')`
+**Scanning:** `invoke('scan_file', {path})` · `invoke('scan_directory', {path})` · `invoke('scan_processes')` · `invoke('scan_network', {pid?})` · `invoke('scan_memory', {pid?})`
+
+**Control:** `invoke('kill_process', {pid})` · `invoke('correlate_entities', {includeMemory})` · `invoke('run_ml_ids', {csvPath?})` · `invoke('get_engine_status')`
+
+**Post-verdict containment actions:**
+- `invoke('quarantine_file', {path})` — move malicious file to quarantine
+- `invoke('block_ip', {remote_ip, direction?})` — add outbound firewall deny rule
+- `invoke('remove_block_ip', {rule_name})` — rollback a firewall rule
+- `invoke('dump_memory', {pid})` — write process memory dump to disk
+- `invoke('check_persistence', {suspicious_paths?})` — scan autorun locations
+- `invoke('isolate_network')` — disable all connected network adapters
+- `invoke('restore_network')` — re-enable adapters saved by `isolate_network`
+- `invoke('export_incident_report', {correlate_result, actions_taken, output_path?})` — write structured JSON report
 
 ### Four Scanner Domains (`Antivirus_Engine/src/core/<domain>/`)
 - **file_system/** — YARA-X rules, SHA-256 hash DB, heuristics, ransomware context flags
@@ -87,6 +106,23 @@ The daemon reads one JSON line from stdin, writes one JSON line to stdout.
 5. **`graph/analyzer.rs::find_attack_chains_aggregated()`** — patterns 1–3 (ProcessInjection, C2Communication, MalwareExecution) read intra-entity flags (`has_malicious_memory/network/file`) on each node; patterns 4–6 (LateralMovement, SuspiciousSpawn, MultiStageAttack) use inter-entity edges
 6. **`graph/analyzer.rs::find_critical_path()`** — DFS max-weight path, unchanged
 
+### Post-Verdict Response Actions (`Antivirus_Engine/src/core/action/`)
+
+All containment logic lives in `executor.rs`.  The daemon loop in `main.rs` calls these functions and serialises their typed result structs to JSON.
+
+| Action | Function | Daemon cmd | Runtime data written |
+|--------|----------|-----------|----------------------|
+| File quarantine | `quarantine_file(path)` | `quarantine-file` | `%PROGRAMDATA%\AegisAI\quarantine\{sha256}.quarantined` + `.meta.json` |
+| Firewall block | `block_ip(ip, dir)` | `block-ip` | `%PROGRAMDATA%\AegisAI\firewall_rules.json` |
+| Firewall rollback | `remove_block_ip(rule)` | `remove-block-ip` | removes entry from `firewall_rules.json` |
+| Memory dump | `dump_memory(pid)` | `dump-memory` | `%PROGRAMDATA%\AegisAI\dumps\{pid}_{ts}.dmp` |
+| Persistence check | `check_persistence(paths)` | `check-persistence` | read-only; returns entries |
+| Network isolation | `isolate_network()` | `isolate-network` | `%PROGRAMDATA%\AegisAI\isolated_interfaces.json` |
+| Network restore | `restore_network()` | `restore-network` | removes `isolated_interfaces.json` |
+| Incident report | `export_incident_report(...)` | Tauri-only (no daemon) | `%USERPROFILE%\Documents\AegisAI\incident_{ts}.json` |
+
+**LOLBin detection** (`graph/analyzer.rs`): when `apply_graph_feedback` marks a clean parent as `is_vector = true`, it also checks the node label against a static `LOLBINS` list.  Matches set `is_lolbin = true` on the `GraphNode`.  The list covers ~35 common living-off-the-land binaries (LOLBAS project).
+
 ### Attack Patterns (MITRE mapped)
 | Pattern | MITRE | Detection method |
 |---------|-------|-----------------|
@@ -97,10 +133,21 @@ The daemon reads one JSON line from stdin, writes one JSON line to stdout.
 | SuspiciousSpawn | T1059 | ParentChild edge + both nodes are threats |
 | MultiStageAttack | TA0002 | BFS over threat entities ≥3 nodes |
 
+### Action Result Types (`Antivirus_Engine/src/core/action/executor.rs`)
+
+| Struct | Fields |
+|--------|--------|
+| `QuarantineResult` | `success`, `quarantine_path?`, `sha256?`, `error?` |
+| `BlockIpResult` | `success`, `rule_name?`, `error?` |
+| `DumpResult` | `success`, `dump_path?`, `error?` |
+| `PersistenceEntry` | `kind`, `name`, `path`, `sha256?`, `suspicious` |
+| `PersistenceResult` | `success`, `entries: Vec<PersistenceEntry>`, `error?` |
+| `IsolationResult` | `success`, `disabled_interfaces: Vec<String>`, `error?` |
+
 ### Core Types (`Antivirus_Engine/src/core/`)
 - `types.rs` — `ThreatLevel {Clean,Suspicious,Malicious}`, `ScanResult`, `DetectionSignal`, `FileCategory`, `ContextFlag`
 - `entity/types.rs` — `UnifiedThreatLevel {Clean,Suspicious,Malicious,Critical}`, `EntityNode`, `EntityType`, `JoinKeys`, `EntityAttributes`, **`AggregatedEntity`** (composite entity with embedded sub-entities + per-domain sub-scores + threat flags)
-- `graph/types.rs` — `ThreatGraph`, `GraphNode` (extended with `process/network/memory/file_score`, `has_malicious_*` flags, `pid`, `parent_pid`), `GraphEdge`, `EdgeType`, `AttackChain`, `CriticalPath`
+- `graph/types.rs` — `ThreatGraph`, `GraphNode` (extended with `process/network/memory/file_score`, `has_malicious_*` flags, `pid`, `parent_pid`, `graph_boost`, `is_vector`, **`is_lolbin`**), `GraphEdge`, `EdgeType`, `AttackChain`, `CriticalPath`
 
 ### Entity ID Formats
 **Flat `EntityNode` IDs** (stored in `EntityManager`, used by EntityManager UI view):
@@ -154,9 +201,12 @@ Memory ML: `Deep_dive/` diagnostic + inference pipeline (leakage/overfitting che
 | `Antivirus_Engine/src/core/entity/types.rs` | `EntityNode`, **`AggregatedEntity`** |
 | `Antivirus_Engine/src/core/entity/correlator.rs` | cluster logic (EntityManager UI view only) |
 | `Antivirus_Engine/src/core/graph/builder.rs` | `GraphBuilder` (legacy flat), **`build_from_aggregated()`** |
-| `Antivirus_Engine/src/core/graph/analyzer.rs` | `find_attack_chains_aggregated()` + critical path |
+| `Antivirus_Engine/src/core/graph/analyzer.rs` | `find_attack_chains_aggregated()` + critical path + LOLBin detection |
+| `Antivirus_Engine/src/core/graph/types.rs` | `ThreatGraph`, `GraphNode` (includes `is_lolbin`), `GraphEdge`, `AttackChain` |
 | `Antivirus_Engine/src/core/types.rs` | shared Rust types |
-| `UI/src-tauri/src/main.rs` | Tauri IPC commands, daemon lifecycle |
+| **`Antivirus_Engine/src/core/action/mod.rs`** | **post-verdict action module exports** |
+| **`Antivirus_Engine/src/core/action/executor.rs`** | **quarantine, firewall, dump, persistence, isolation** |
+| `UI/src-tauri/src/main.rs` | Tauri IPC commands, daemon lifecycle, `export_incident_report` |
 | `UI/src/store/index.ts` | Zustand store (all UI state) |
 | `UI/src/types/index.ts` | TypeScript types (source of truth for UI contracts) |
 | `UI/src/lib/entityUtils.ts` | `buildProcessEntities`, `buildProcessEdges`, orphan helpers |
@@ -169,3 +219,6 @@ Memory ML: `Deep_dive/` diagnostic + inference pipeline (leakage/overfitting che
 - Retrain with mixed real-world + UNSW-NB15 data
 - `ai_agent/` — `agent/reasoning.py` and `main.py` are empty stubs (not yet implemented)
 - File domain: YARA + heuristics only, no dedicated ML model yet
+- **UI wiring for new action commands** — `quarantine_file`, `block_ip`, `dump_memory`, `check_persistence`, `isolate_network`, `restore_network`, `export_incident_report` are registered in Tauri but the React components (`GraphVerdict.tsx`, a `Settings.tsx`, a `QuarantineManager.tsx`) that call them are not yet built
+- **`is_lolbin` UI badge** — `GraphNodeData` in `UI/src/types/index.ts` needs `is_lolbin: boolean` added, then `ThreatGraph.tsx` can render the "LOLBin" badge on vector nodes
+- **Autonomous mode** — `autonomousMode` flag in Zustand store + Settings toggle not yet implemented

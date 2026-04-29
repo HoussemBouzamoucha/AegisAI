@@ -316,6 +316,7 @@ pub fn aggregate_to_graph_node(e: &AggregatedEntity) -> GraphNode {
         parent_pid:            e.parent_pid,
         graph_boost:           0.0,
         is_vector:             false,
+        is_lolbin:             false,
     }
 }
 
@@ -375,6 +376,7 @@ pub fn entity_to_graph_node(entity: &EntityNode) -> GraphNode {
         parent_pid:            entity.join_keys.parent_pid,
         graph_boost:           0.0,
         is_vector:             false,
+        is_lolbin:             false,
     }
 }
 

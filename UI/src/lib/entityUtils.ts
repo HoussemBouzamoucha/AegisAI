@@ -341,19 +341,23 @@ function detectAttackChains(
   // ── Patterns 1-3: single-node, detected from node flags ───────────────────
   nodes.forEach((n) => {
     if (n.has_malicious_memory) {
+      const mlCorr = (n.ml_score ?? 0) * 0.15;
       chains.push({
         chain_id: id(), pattern: 'ProcessInjection' as AttackPatternName,
         node_ids: [n.entity_id], chain_score: n.combined_score,
         severity: n.threat_level, mitre_tactic: 'T1055',
         description: `"${n.label}" has malicious memory regions — possible shellcode injection`,
+        confidence: Math.min(1, (n.memory_score ?? 0) + mlCorr),
       });
     }
     if (n.has_malicious_network) {
+      const mlCorr = (n.ml_score ?? 0) * 0.20;
       chains.push({
         chain_id: id(), pattern: 'C2Communication' as AttackPatternName,
         node_ids: [n.entity_id], chain_score: n.combined_score,
         severity: n.threat_level, mitre_tactic: 'T1071',
         description: `"${n.label}" has active connections matching C2 indicators`,
+        confidence: Math.min(1, (n.network_score ?? 0) + mlCorr),
       });
     }
     if (n.has_malicious_file) {
@@ -362,6 +366,7 @@ function detectAttackChains(
         node_ids: [n.entity_id], chain_score: n.combined_score,
         severity: n.threat_level, mitre_tactic: 'T1204',
         description: `"${n.label}" is executing a known malicious file`,
+        confidence: Math.min(1, n.file_score ?? 0),
       });
     }
   });
@@ -370,6 +375,8 @@ function detectAttackChains(
   parentEdges.forEach((e) => {
     const parent = nodeMap[e.from], child = nodeMap[e.to];
     if (!parent || !child || !child.has_malicious_network) return;
+    const avgScore = (parent.combined_score + child.combined_score) / 2;
+    const lateralConf = Math.min(1, avgScore * 0.5 + (child.network_score ?? 0) * 0.5);
     chains.push({
       chain_id: id(), pattern: 'LateralMovement' as AttackPatternName,
       node_ids: [e.from, e.to],
@@ -377,6 +384,7 @@ function detectAttackChains(
       severity: maxThreatLevel([parent.threat_level, child.threat_level]),
       mitre_tactic: 'T1021',
       description: `"${parent.label}" spawned "${child.label}" which opened C2 connections`,
+      confidence: lateralConf,
     });
   });
 
@@ -384,6 +392,9 @@ function detectAttackChains(
   parentEdges.forEach((e) => {
     const parent = nodeMap[e.from], child = nodeMap[e.to];
     if (!parent || !child || !isThreat(parent) || !isThreat(child)) return;
+    const base = Math.min(parent.combined_score, child.combined_score);
+    const bothMalicious = parent.threat_level !== 'Suspicious' && child.threat_level !== 'Suspicious';
+    const spawnConf = Math.min(1, base + (bothMalicious ? 0.15 : 0));
     chains.push({
       chain_id: id(), pattern: 'SuspiciousSpawn' as AttackPatternName,
       node_ids: [e.from, e.to],
@@ -391,6 +402,7 @@ function detectAttackChains(
       severity: maxThreatLevel([parent.threat_level, child.threat_level]),
       mitre_tactic: 'T1059',
       description: `"${parent.label}" (threat) spawned "${child.label}" (threat)`,
+      confidence: spawnConf,
     });
   });
 
@@ -420,12 +432,16 @@ function detectAttackChains(
     if (component.length >= 3) {
       const scores = component.map((id2) => nodeMap[id2]?.combined_score ?? 0);
       const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+      // Count distinct entity types for diversity factor (mirrors Rust backend)
+      const types = new Set(component.map((id2) => nodeMap[id2]?.entity_type ?? '')).size;
+      const typeFactor = Math.min(1, types / 3);
       chains.push({
         chain_id: id(), pattern: 'MultiStageAttack' as AttackPatternName,
         node_ids: component, chain_score: avg,
         severity: maxThreatLevel(component.map((id2) => nodeMap[id2]?.threat_level ?? 'Clean')),
         mitre_tactic: 'TA0002',
         description: `${component.length} threat entities linked in a multi-stage attack`,
+        confidence: Math.min(1, avg * typeFactor),
       });
     }
   });

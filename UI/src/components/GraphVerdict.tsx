@@ -11,11 +11,12 @@
 //   score shown is the heuristic-only value from the backend.  No fake score
 //   is injected — the verdict text calls this out explicitly.
 
-import { useMemo, useState, useEffect, useRef } from 'react';
-import { AlertTriangle, CheckCircle, Zap, GitMerge, ChevronDown, ChevronRight, Info, Clock } from 'lucide-react';
+import { useMemo, useState, useEffect, useRef, useCallback } from 'react';
+import { AlertTriangle, CheckCircle, Zap, GitMerge, ChevronDown, ChevronRight, Info, Clock, ShieldAlert, ShieldOff, Siren, Play, SkipForward } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../store';
 import type {
-  AttackChain, CriticalPath, GraphNodeData, GraphEdgeData, UnifiedThreat,
+  AttackChain, CriticalPath, GraphNodeData, UnifiedThreat,
 } from '../types';
 
 // ─── Colour tokens (mirror ThreatGraph) ──────────────────────────────────────
@@ -27,11 +28,6 @@ function threatColor(level: UnifiedThreat | string): string {
   return '#00ff88';
 }
 
-const EDGE_COLORS: Record<string, string> = {
-  shared_c2:        '#facc15',
-  parent_child:     '#00d4ff',
-  shared_file_hash: '#34d399',
-};
 
 // ─── Verdict generation ───────────────────────────────────────────────────────
 
@@ -79,6 +75,10 @@ function humanizePattern(chain: AttackChain, nodes: Record<string, GraphNodeData
         : `A threat-level process spawned another threat-level child — possible propagation chain.`,
     MultiStageAttack:
       `Three or more threat indicators across different scanners are structurally linked through ${actor}${target ? ` → ${target}` : ''} — consistent with a coordinated, multi-stage attack.`,
+    ExploitedTrustedProcess:
+      target
+        ? `Trusted process "${actor}" spawned confirmed-malicious child "${target}" — classic living-off-the-land delivery or exploitation of a legitimate binary (T1059/T1204).`
+        : `A trusted process spawned a confirmed-malicious child — living-off-the-land delivery or exploitation of a legitimate binary.`,
   };
 
   return {
@@ -86,6 +86,626 @@ function humanizePattern(chain: AttackChain, nodes: Record<string, GraphNodeData
     sentence: sentences[chain.pattern] ?? chain.description,
     mitre: chain.mitre_tactic,
   };
+}
+
+// ─── Post-verdict action engine ───────────────────────────────────────────────
+
+/** A single containment action suggested for a given attack chain. */
+interface SuggestedAction {
+  /** Stable key for React. */
+  id: string;
+  /** Short label shown on the confirm button, e.g. "Kill chrome.exe (PID 1234)". */
+  label: string;
+  /** One-line explanation shown in grey below the label. */
+  description: string;
+  /** Tauri command name, e.g. "kill_process". */
+  cmd: string;
+  /** Arguments object passed to invoke(). */
+  args: Record<string, unknown>;
+  /** Severity tier that gates this action: Suspicious = investigate; Malicious = disrupt; Critical = contain. */
+  tier: 'Investigate' | 'Disrupt' | 'Contain';
+}
+
+type ActionStatus = 'idle' | 'running' | 'done' | 'error' | 'skipped';
+
+/**
+ * Build the list of suggested containment actions for a given attack chain.
+ * Parameters are extracted from the chain's node data (PIDs, paths, IPs).
+ */
+/**
+ * Build the list of suggested containment actions for a given attack chain.
+ * Parameters are extracted from chain node data (PIDs, paths) and the live
+ * network connection list (remote IPs for C2/Lateral patterns).
+ *
+ * @param netConnsByPid  Map of pid → remote_address strings, derived from
+ *                       the NetworkConnection store slice.  Used to look up
+ *                       C2 remote IPs that are not stored on GraphNode itself.
+ */
+function buildActions(
+  chain:        AttackChain,
+  nodeMap:      Record<string, GraphNodeData>,
+  netConnsByPid: Map<number, string[]>,
+): SuggestedAction[] {
+  const nodes  = chain.node_ids.map(id => nodeMap[id]).filter(Boolean) as GraphNodeData[];
+  // first / second by analyzer ordering (attacker → victim)
+  const first  = nodes[0];
+  const second = nodes[1];
+  const actions: SuggestedAction[] = [];
+
+  // Helper: collect remote IPs for a process PID from the live network store
+  const remoteIpsForPid = (pid: number | undefined | null): string[] =>
+    pid != null ? (netConnsByPid.get(pid) ?? []) : [];
+
+  switch (chain.pattern) {
+
+    // ── ProcessInjection ─────────────────────────────────────────────────────
+    // Dump then kill the injected process + check persistence.
+    case 'ProcessInjection': {
+      if (first?.pid != null) {
+        actions.push({
+          id: `dump-${first.pid}`,
+          label: `Dump memory of "${first.label}" (PID ${first.pid})`,
+          description: 'Write a full MiniDump to %PROGRAMDATA%\\AegisAI\\dumps\\ first — preserves shellcode for forensics.',
+          cmd: 'dump_memory', args: { pid: first.pid },
+          tier: 'Investigate',
+        });
+        actions.push({
+          id: `kill-${first.pid}`,
+          label: `Kill "${first.label}" (PID ${first.pid})`,
+          description: 'Terminate the process with a malicious memory region to halt shellcode execution.',
+          cmd: 'kill_process', args: { pid: first.pid },
+          tier: 'Disrupt',
+        });
+      }
+      actions.push({
+        id: `persist-check-${chain.chain_id}`,
+        label: 'Check persistence entries',
+        description: 'Scan registry run keys, scheduled tasks, and startup folders for the injected process.',
+        cmd: 'check_persistence',
+        args: { suspicious_paths: nodes.map(n => n.sub_label ?? n.label).filter(Boolean) },
+        tier: 'Investigate',
+      });
+      break;
+    }
+
+    // ── C2Communication ──────────────────────────────────────────────────────
+    // Kill the beaconing process + firewall-block the remote IPs it is using.
+    // Remote IPs come from the live network connection store (not on GraphNode).
+    case 'C2Communication': {
+      if (first?.pid != null) {
+        actions.push({
+          id: `kill-${first.pid}`,
+          label: `Kill "${first.label}" (PID ${first.pid})`,
+          description: 'Terminate the process that is actively communicating with a C2 server.',
+          cmd: 'kill_process', args: { pid: first.pid },
+          tier: 'Disrupt',
+        });
+      }
+      // Use live network store to find remote IPs for this pid
+      const c2Ips = remoteIpsForPid(first?.pid);
+      if (c2Ips.length > 0) {
+        c2Ips.slice(0, 3).forEach(ip => {          // cap at 3 IPs
+          actions.push({
+            id: `block-out-${ip}`,
+            label: `Block outbound to ${ip}`,
+            description: 'Add a Windows Firewall deny rule blocking outbound traffic to this C2 address.',
+            cmd: 'block_ip', args: { remote_ip: ip, direction: 'out' },
+            tier: 'Disrupt',
+          });
+          actions.push({
+            id: `block-in-${ip}`,
+            label: `Block inbound from ${ip}`,
+            description: 'Prevent the C2 server from re-connecting or pushing further payloads.',
+            cmd: 'block_ip', args: { remote_ip: ip, direction: 'in' },
+            tier: 'Contain',
+          });
+        });
+      } else {
+        // No live IP data — guide the user to the network monitor
+        actions.push({
+          id: `c2-no-ip-hint-${chain.chain_id}`,
+          label: 'Open Network monitor to find C2 IP',
+          description: 'No live network data found for this PID. Run a Network scan, then return here to block the remote address.',
+          cmd: 'check_persistence',    // safe read-only cmd used as placeholder
+          args: { suspicious_paths: [] },
+          tier: 'Investigate',
+        });
+      }
+      break;
+    }
+
+    // ── MalwareExecution ─────────────────────────────────────────────────────
+    // Kill the process + quarantine the malicious executable on disk.
+    case 'MalwareExecution': {
+      if (first?.pid != null) {
+        actions.push({
+          id: `kill-${first.pid}`,
+          label: `Kill "${first.label}" (PID ${first.pid})`,
+          description: 'Terminate the running malware process.',
+          cmd: 'kill_process', args: { pid: first.pid },
+          tier: 'Disrupt',
+        });
+      }
+      // sub_label on a process-anchored entity is the exe_path
+      const exePath = first?.sub_label ?? null;
+      if (exePath) {
+        actions.push({
+          id: `quarantine-${exePath}`,
+          label: `Quarantine "${exePath.split(/[/\\]/).pop()}"`,
+          description: `Move the malicious file to %PROGRAMDATA%\\AegisAI\\quarantine\\: ${exePath}`,
+          cmd: 'quarantine_file', args: { path: exePath },
+          tier: 'Contain',
+        });
+      }
+      actions.push({
+        id: `persist-mal-${chain.chain_id}`,
+        label: 'Check persistence entries',
+        description: 'Scan autorun locations to ensure the malware has not installed a re-launch mechanism.',
+        cmd: 'check_persistence',
+        args: { suspicious_paths: nodes.map(n => n.sub_label ?? n.label).filter(Boolean) },
+        tier: 'Investigate',
+      });
+      break;
+    }
+
+    // ── LateralMovement ──────────────────────────────────────────────────────
+    // Kill child then parent. Block child's outbound remote IPs.
+    case 'LateralMovement': {
+      // second node is the child that opened the network connection
+      if (second?.pid != null) {
+        actions.push({
+          id: `kill-child-${second.pid}`,
+          label: `Kill child "${second.label}" (PID ${second.pid})`,
+          description: 'Terminate the laterally-moving child process first.',
+          cmd: 'kill_process', args: { pid: second.pid },
+          tier: 'Disrupt',
+        });
+      }
+      if (first?.pid != null) {
+        actions.push({
+          id: `kill-parent-${first.pid}`,
+          label: `Kill parent "${first.label}" (PID ${first.pid})`,
+          description: 'Terminate the dropper/parent after the child is stopped.',
+          cmd: 'kill_process', args: { pid: first.pid },
+          tier: 'Disrupt',
+        });
+      }
+      // Block IPs used by the child process
+      const childIps = remoteIpsForPid(second?.pid);
+      if (childIps.length > 0) {
+        childIps.slice(0, 2).forEach(ip => {
+          actions.push({
+            id: `block-lateral-${ip}`,
+            label: `Block child's remote IP ${ip}`,
+            description: 'Firewall-block the lateral-movement destination.',
+            cmd: 'block_ip', args: { remote_ip: ip, direction: 'out' },
+            tier: 'Contain',
+          });
+        });
+      }
+      actions.push({
+        id: `persist-lateral-${chain.chain_id}`,
+        label: 'Check persistence for both processes',
+        description: 'Scan registry and scheduled tasks for the parent and child processes.',
+        cmd: 'check_persistence',
+        args: { suspicious_paths: nodes.map(n => n.sub_label ?? n.label).filter(Boolean) },
+        tier: 'Investigate',
+      });
+      break;
+    }
+
+    // ── SuspiciousSpawn ──────────────────────────────────────────────────────
+    // Kill child first; kill parent too (both are flagged threats).
+    case 'SuspiciousSpawn': {
+      if (second?.pid != null) {
+        actions.push({
+          id: `kill-spawn-child-${second.pid}`,
+          label: `Kill child "${second.label}" (PID ${second.pid})`,
+          description: 'Terminate the spawned threat-level child process first.',
+          cmd: 'kill_process', args: { pid: second.pid },
+          tier: 'Disrupt',
+        });
+      }
+      if (first?.pid != null) {
+        actions.push({
+          id: `kill-spawn-parent-${first.pid}`,
+          label: `Kill parent "${first.label}" (PID ${first.pid})`,
+          description: 'Terminate the threat-level parent that initiated the suspicious spawn.',
+          cmd: 'kill_process', args: { pid: first.pid },
+          tier: 'Disrupt',
+        });
+      }
+      actions.push({
+        id: `persist-spawn-${chain.chain_id}`,
+        label: 'Check persistence for spawn chain',
+        description: 'Scan registry autorun keys and scheduled tasks for both processes.',
+        cmd: 'check_persistence',
+        args: { suspicious_paths: nodes.map(n => n.sub_label ?? n.label).filter(Boolean) },
+        tier: 'Investigate',
+      });
+      break;
+    }
+
+    // ── MultiStageAttack ─────────────────────────────────────────────────────
+    // Kill all + dump all + quarantine files + isolate network.
+    case 'MultiStageAttack': {
+      nodes.forEach(n => {
+        if (n.pid != null) {
+          actions.push({
+            id: `dump-multi-${n.pid}`,
+            label: `Dump memory of "${n.label}" (PID ${n.pid})`,
+            description: 'Capture full process memory before termination — preserves malware artifacts.',
+            cmd: 'dump_memory', args: { pid: n.pid },
+            tier: 'Investigate',
+          });
+        }
+      });
+      nodes.forEach(n => {
+        if (n.pid != null) {
+          actions.push({
+            id: `kill-multi-${n.pid}`,
+            label: `Kill "${n.label}" (PID ${n.pid})`,
+            description: `Terminate stage process "${n.label}".`,
+            cmd: 'kill_process', args: { pid: n.pid },
+            tier: 'Disrupt',
+          });
+        }
+      });
+      const exePaths = nodes.map(n => n.sub_label).filter(Boolean) as string[];
+      exePaths.forEach(p => {
+        actions.push({
+          id: `quarantine-multi-${p}`,
+          label: `Quarantine "${p.split(/[/\\]/).pop()}"`,
+          description: `Move file to quarantine: ${p}`,
+          cmd: 'quarantine_file', args: { path: p },
+          tier: 'Contain',
+        });
+      });
+      actions.push({
+        id: `isolate-${chain.chain_id}`,
+        label: 'Isolate all network adapters',
+        description: 'Disable every connected interface to cut off C2 and stop lateral spread. Run restore_network to re-enable.',
+        cmd: 'isolate_network', args: {},
+        tier: 'Contain',
+      });
+      break;
+    }
+
+    // ── ExploitedTrustedProcess ──────────────────────────────────────────────
+    // Kill child only (NOT the trusted parent). Quarantine child exe + check persistence.
+    case 'ExploitedTrustedProcess': {
+      // first = trusted parent (do NOT kill); second = malicious child
+      if (second?.pid != null) {
+        actions.push({
+          id: `kill-exploited-child-${second.pid}`,
+          label: `Kill malicious child "${second.label}" (PID ${second.pid})`,
+          description: 'Terminate only the malicious child — the trusted parent is intentionally preserved.',
+          cmd: 'kill_process', args: { pid: second.pid },
+          tier: 'Disrupt',
+        });
+      }
+      const childExe = second?.sub_label ?? null;
+      if (childExe) {
+        actions.push({
+          id: `quarantine-exploited-${childExe}`,
+          label: `Quarantine "${childExe.split(/[/\\]/).pop()}"`,
+          description: `Quarantine the LOLBin-delivered payload: ${childExe}`,
+          cmd: 'quarantine_file', args: { path: childExe },
+          tier: 'Contain',
+        });
+      }
+      actions.push({
+        id: `persist-lolbin-${chain.chain_id}`,
+        label: 'Check persistence for LOLBin delivery',
+        description: 'Scan for scheduled tasks or registry entries that re-launch the payload via the trusted binary.',
+        cmd: 'check_persistence',
+        args: { suspicious_paths: [second?.sub_label, second?.label, first?.label].filter(Boolean) },
+        tier: 'Investigate',
+      });
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  // Universal fallback — every pattern always shows at least a persistence check
+  // so the ActionPanel is never empty and `return null` is never hit.
+  if (actions.length === 0) {
+    actions.push({
+      id: `persist-fallback-${chain.chain_id}`,
+      label: `Check persistence for "${nodes[0]?.label ?? chain.pattern}"`,
+      description: 'Scan registry autorun keys, scheduled tasks, and startup folders for any entries related to this detection.',
+      cmd: 'check_persistence',
+      args: { suspicious_paths: nodes.map(n => n.sub_label ?? n.label).filter(Boolean) },
+      tier: 'Investigate',
+    });
+  }
+
+  return actions;
+}
+
+// ─── Tier badge colours ───────────────────────────────────────────────────────
+const TIER_COLOR: Record<SuggestedAction['tier'], string> = {
+  Investigate: '#818cf8',  // indigo
+  Disrupt:     '#ffb300',  // amber
+  Contain:     '#ff3355',  // red
+};
+
+// ─── Single action row ────────────────────────────────────────────────────────
+
+function ActionRow({
+  action,
+  status,
+  result,
+  onConfirm,
+  onSkip,
+}: {
+  action:    SuggestedAction;
+  status:    ActionStatus;
+  result:    string | null;
+  onConfirm: () => void;
+  onSkip:    () => void;
+}) {
+  const tierColor = TIER_COLOR[action.tier];
+  const isDone    = status === 'done' || status === 'skipped';
+
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', gap: 5,
+      padding: '9px 12px',
+      background: status === 'done'    ? 'rgba(0,255,136,0.05)'
+                : status === 'error'   ? 'rgba(255,51,85,0.06)'
+                : status === 'skipped' ? 'rgba(100,100,100,0.04)'
+                : `${tierColor}08`,
+      border: `1px solid ${
+        status === 'done'    ? 'rgba(0,255,136,0.25)'
+        : status === 'error' ? 'rgba(255,51,85,0.25)'
+        : status === 'skipped' ? 'var(--border)'
+        : `${tierColor}35`}`,
+      borderRadius: 6,
+      opacity: status === 'skipped' ? 0.5 : 1,
+      transition: 'opacity 0.2s',
+    }}>
+      {/* Top row: tier badge + label */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: 7, fontWeight: 700,
+          color: tierColor, background: `${tierColor}20`,
+          padding: '1px 5px', borderRadius: 2, flexShrink: 0,
+          letterSpacing: '0.08em',
+        }}>
+          {action.tier.toUpperCase()}
+        </span>
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text)',
+          fontWeight: 600, flex: 1,
+        }}>
+          {action.label}
+        </span>
+        {/* Status indicator */}
+        {status === 'running' && (
+          <span style={{ fontSize: 10, color: '#ffb300', animation: 'pulse 1s infinite' }}>
+            running…
+          </span>
+        )}
+        {status === 'done' && (
+          <CheckCircle size={13} color="#00ff88" />
+        )}
+        {status === 'error' && (
+          <AlertTriangle size={13} color="#ff3355" />
+        )}
+        {status === 'skipped' && (
+          <span style={{ fontSize: 9, color: 'var(--text-dim)' }}>skipped</span>
+        )}
+      </div>
+
+      {/* Description */}
+      <div style={{
+        fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)',
+        lineHeight: 1.5,
+      }}>
+        {action.description}
+      </div>
+
+      {/* Result message */}
+      {result && (
+        <div style={{
+          fontFamily: 'var(--font-mono)', fontSize: 9,
+          color: status === 'error' ? '#ff3355' : '#00ff88',
+          background: status === 'error' ? 'rgba(255,51,85,0.08)' : 'rgba(0,255,136,0.06)',
+          padding: '4px 8px', borderRadius: 3,
+          whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+        }}>
+          {result}
+        </div>
+      )}
+
+      {/* Confirm / Skip buttons — hide once resolved */}
+      {!isDone && status !== 'running' && (
+        <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
+          <button
+            onClick={onConfirm}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 5,
+              padding: '4px 12px',
+              background: tierColor, color: '#000',
+              border: 'none', borderRadius: 4,
+              fontFamily: 'var(--font-mono)', fontSize: 10, fontWeight: 700,
+              cursor: 'pointer',
+            }}>
+            <Play size={9} /> Execute
+          </button>
+          <button
+            onClick={onSkip}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 5,
+              padding: '4px 12px',
+              background: 'transparent', color: 'var(--text-dim)',
+              border: '1px solid var(--border)', borderRadius: 4,
+              fontFamily: 'var(--font-mono)', fontSize: 10,
+              cursor: 'pointer',
+            }}>
+            <SkipForward size={9} /> Skip
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Action panel ─────────────────────────────────────────────────────────────
+
+function ActionPanel({
+  chain,
+  nodeMap,
+}: {
+  chain:   AttackChain;
+  nodeMap: Record<string, GraphNodeData>;
+}) {
+  // Pull live network connections so we can look up C2/lateral remote IPs by PID
+  const { networkConnections } = useStore();
+
+  // Build pid → remote_address[] map from the live network store
+  const netConnsByPid = useMemo(() => {
+    const map = new Map<number, string[]>();
+    for (const conn of networkConnections) {
+      const pid = conn.pid;
+      if (pid == null) continue;
+      const ip = conn.remote_address?.split(':')?.[0];   // strip port
+      if (!ip || ip === '0.0.0.0' || ip === '127.0.0.1' || ip === '::1') continue;
+      const existing = map.get(pid) ?? [];
+      if (!existing.includes(ip)) existing.push(ip);
+      map.set(pid, existing);
+    }
+    return map;
+  }, [networkConnections]);
+
+  const actions = useMemo(
+    () => buildActions(chain, nodeMap, netConnsByPid),
+    [chain, nodeMap, netConnsByPid],
+  );
+  const [statuses, setStatuses] = useState<Record<string, ActionStatus>>({});
+  const [results,  setResults]  = useState<Record<string, string | null>>({});
+  // Default open so actions are immediately visible when the chain card expands
+  const [panelOpen, setPanelOpen] = useState(true);
+
+  const getStatus = (id: string): ActionStatus => statuses[id] ?? 'idle';
+
+  const handleConfirm = useCallback(async (action: SuggestedAction) => {
+    setStatuses(s => ({ ...s, [action.id]: 'running' }));
+    setResults(r  => ({ ...r, [action.id]: null }));
+
+    try {
+      const res = await invoke(action.cmd, action.args);
+      // Stringify the result for display (most results are JSON objects)
+      const text = typeof res === 'string'
+        ? res
+        : JSON.stringify(res, null, 2);
+      setResults(r  => ({ ...r, [action.id]: text }));
+      setStatuses(s => ({ ...s, [action.id]: 'done' }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setResults(r  => ({ ...r, [action.id]: msg }));
+      setStatuses(s => ({ ...s, [action.id]: 'error' }));
+    }
+  }, []);
+
+  const handleSkip = useCallback((id: string) => {
+    setStatuses(s => ({ ...s, [id]: 'skipped' }));
+  }, []);
+
+  if (actions.length === 0) return null;
+
+  // Determine the highest tier present so the panel header can show it
+  const tiers = actions.map(a => a.tier);
+  const topTier: SuggestedAction['tier'] =
+    tiers.includes('Contain')     ? 'Contain'
+    : tiers.includes('Disrupt')   ? 'Disrupt'
+    : 'Investigate';
+  const topColor = TIER_COLOR[topTier];
+
+  const totalActions  = actions.length;
+  const doneActions   = actions.filter(a => ['done', 'skipped'].includes(getStatus(a.id))).length;
+  const allResolved   = doneActions === totalActions;
+
+  return (
+    <div style={{
+      marginTop: 10,
+      border: `1px solid ${topColor}30`,
+      borderRadius: 7,
+      overflow: 'hidden',
+    }}>
+      {/* Panel toggle header */}
+      <button
+        onClick={() => setPanelOpen(v => !v)}
+        style={{
+          width: '100%', display: 'flex', alignItems: 'center', gap: 8,
+          padding: '8px 12px',
+          background: `${topColor}10`,
+          border: 'none', cursor: 'pointer', textAlign: 'left',
+        }}>
+        {topTier === 'Contain'
+          ? <ShieldOff size={13} color={topColor} />
+          : topTier === 'Disrupt'
+            ? <ShieldAlert size={13} color={topColor} />
+            : <Siren size={13} color={topColor} />}
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: 9, fontWeight: 700,
+          color: topColor, letterSpacing: '0.1em', flex: 1,
+        }}>
+          SUGGESTED ACTIONS ({doneActions}/{totalActions} resolved)
+        </span>
+        {allResolved && <CheckCircle size={11} color="#00ff88" />}
+        {panelOpen ? <ChevronDown size={11} color="var(--text-dim)" /> : <ChevronRight size={11} color="var(--text-dim)" />}
+      </button>
+
+      {panelOpen && (
+        <div style={{
+          padding: '8px 10px',
+          display: 'flex', flexDirection: 'column', gap: 6,
+          background: 'var(--void)',
+        }}>
+          {/* Tier legend */}
+          <div style={{
+            display: 'flex', gap: 10, fontSize: 8,
+            fontFamily: 'var(--font-mono)', color: 'var(--text-dim)',
+            marginBottom: 2,
+          }}>
+            {(['Investigate', 'Disrupt', 'Contain'] as const).map(t => (
+              <span key={t} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <span style={{
+                  width: 8, height: 8, borderRadius: '50%',
+                  background: TIER_COLOR[t], display: 'inline-block',
+                }} />
+                {t}
+              </span>
+            ))}
+          </div>
+
+          {actions.map(action => (
+            <ActionRow
+              key={action.id}
+              action={action}
+              status={getStatus(action.id)}
+              result={results[action.id] ?? null}
+              onConfirm={() => handleConfirm(action)}
+              onSkip={() => handleSkip(action.id)}
+            />
+          ))}
+
+          {allResolved && (
+            <div style={{
+              marginTop: 4, fontSize: 9, color: '#00ff88',
+              fontFamily: 'var(--font-mono)', textAlign: 'center', opacity: 0.8,
+            }}>
+              All actions resolved. Consider re-running correlation to verify remediation.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function mlCoverage(nodes: GraphNodeData[]): string {
@@ -132,192 +752,227 @@ function overallSummary(
   return base;
 }
 
-// ─── Sub-graph layout ─────────────────────────────────────────────────────────
+// ─── Critical path directed graph ────────────────────────────────────────────
 
-interface PlacedNode { id: string; x: number; y: number; data: GraphNodeData; }
+// ─── Layout constants ─────────────────────────────────────────────────────────
+const CPG_R    = 24;   // node circle radius
+const CPG_STEP = 112;  // horizontal distance between node centres
+const CPG_VH   = 300;  // SVG viewport height
+const CPG_CY   = 150;  // centre-line Y (spine)
+const CPG_VY   = 80;   // vertical offset for upper / lower rows
 
-function layoutSubgraph(nodes: GraphNodeData[], vW: number, vH: number): PlacedNode[] {
-  const n = nodes.length;
-  if (n === 0) return [];
-  const cx = vW / 2, cy = vH / 2;
-  if (n === 1) return [{ id: nodes[0].entity_id, x: cx, y: cy, data: nodes[0] }];
+// Edge colour lookup (edge_type string → hex)
+const EDGE_COLOR_MAP: Record<string, string> = {
+  parent_child:     '#00d4ff',
+  shared_c2:        '#facc15',
+  shared_file_hash: '#34d399',
+};
+function edgeColor(t: string): string { return EDGE_COLOR_MAP[t] ?? '#00d4ff'; }
 
-  // Simple ring layout
-  return nodes.map((node, i) => {
-    const angle = (i / n) * Math.PI * 2 - Math.PI / 2;
-    const r = Math.min(vW, vH) * 0.33;
-    return { id: node.entity_id, x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r, data: node };
-  });
+// All distinct hex colours used by arrows (for <marker> generation)
+const ARROW_COLORS = ['#00d4ff', '#facc15', '#34d399', '#888888'];
+
+// Node Y position:
+//   index 0 and N-1  → spine (centre)
+//   index 1, 3, 5 …  → upper row
+//   index 2, 4, 6 …  → lower row  (i.e. same depth as ref image E→a→b→…→S)
+function nodeY(i: number, N: number): number {
+  if (i === 0 || i === N - 1) return CPG_CY;
+  return i % 2 === 1 ? CPG_CY - CPG_VY : CPG_CY + CPG_VY;
 }
+function nodeX(i: number): number { return 54 + i * CPG_STEP; }
 
-// ─── Sub-graph component ──────────────────────────────────────────────────────
-
-const NODE_R = 30;
-
-function VerdictSubgraph({
-  nodes, edges, criticalNodeIds,
+function CriticalPathGraph({
+  criticalPath,
+  nodeMap,
 }: {
-  nodes: GraphNodeData[];
-  edges: GraphEdgeData[];
-  criticalNodeIds: Set<string>;
+  criticalPath: CriticalPath | null | undefined;
+  nodeMap: Record<string, GraphNodeData>;
 }) {
   const [hovered, setHovered] = useState<string | null>(null);
 
-  const vW = 560, vH = 320;
-  const placed = useMemo(() => layoutSubgraph(nodes, vW, vH), [nodes]);
-  const posMap = useMemo(() =>
-    Object.fromEntries(placed.map(p => [p.id, { x: p.x, y: p.y }])),
-    [placed],
-  );
-
-  if (nodes.length === 0) {
+  if (!criticalPath || criticalPath.node_ids.length === 0) {
     return (
       <div style={{
         display: 'flex', flexDirection: 'column', alignItems: 'center',
-        justifyContent: 'center', height: 220,
-        border: '1px dashed var(--border)', borderRadius: 8,
-        color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', fontSize: 12, gap: 10,
+        justifyContent: 'center', height: '100%', gap: 10,
+        color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', fontSize: 11,
       }}>
-        <Info size={24} style={{ opacity: 0.4 }} />
-        <span>No entities are connected to any detected attack chain.</span>
-        <span style={{ fontSize: 10, opacity: 0.6 }}>
-          Run a correlation scan to populate the entity graph.
-        </span>
+        <Info size={22} style={{ opacity: 0.35 }} />
+        <span>No critical path — run a correlation scan first.</span>
       </div>
     );
   }
 
+  const ids = criticalPath.node_ids;
+  const N   = ids.length;
+  const vW  = Math.max(nodeX(N - 1) + 60, 400);
+
   return (
-    <svg width="100%" viewBox={`0 0 ${vW} ${vH}`} style={{ overflow: 'visible' }}>
-      <defs>
-        <filter id="glow-v">
-          <feGaussianBlur stdDeviation="3" result="blur" />
-          <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
-        </filter>
-      </defs>
+    <div style={{ width: '100%', height: '100%', overflowX: 'auto', overflowY: 'hidden' }}>
+      <svg width={vW} height={CPG_VH} viewBox={`0 0 ${vW} ${CPG_VH}`}
+        style={{ display: 'block' }}>
+        <defs>
+          <filter id="glow-cp">
+            <feGaussianBlur stdDeviation="2.5" result="b"/>
+            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+          {/* One arrowhead per colour */}
+          {ARROW_COLORS.map(c => (
+            <marker key={c} id={`ar-${c.slice(1)}`}
+              markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill={c}/>
+            </marker>
+          ))}
+        </defs>
 
-      {/* Edges */}
-      {edges.map((e, i) => {
-        const a = posMap[e.from], b = posMap[e.to];
-        if (!a || !b) return null;
-        const color = EDGE_COLORS[e.edge_type] ?? '#00d4ff';
-        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const len = Math.sqrt(dx * dx + dy * dy) || 1;
-        const curve = 30;
-        const cpx = mx - (dy / len) * curve, cpy = my + (dx / len) * curve;
-        const d = `M${a.x},${a.y} Q${cpx},${cpy} ${b.x},${b.y}`;
+        {/* ── Edges ──────────────────────────────────────────────────────────── */}
+        {ids.slice(0, -1).map((_, i) => {
+          const ax = nodeX(i),     ay = nodeY(i, N);
+          const bx = nodeX(i + 1), by = nodeY(i + 1, N);
+          const etype = criticalPath.edge_types?.[i]   ?? 'parent_child';
+          const w     = criticalPath.edge_weights?.[i] ?? 0;
+          const col   = edgeColor(etype);
+          const hex   = col.slice(1);
 
-        const label = e.edge_type.replace(/_/g, ' ').toUpperCase();
-        const t = 0.5;
-        const lx = (1-t)*(1-t)*a.x + 2*(1-t)*t*cpx + t*t*b.x;
-        const ly = (1-t)*(1-t)*a.y + 2*(1-t)*t*cpy + t*t*b.y;
+          // Arrow starts / ends at circle boundary
+          const dx = bx - ax, dy = by - ay;
+          const len = Math.sqrt(dx*dx + dy*dy) || 1;
+          const ux = dx/len, uy = dy/len;
+          const x1 = ax + ux * CPG_R, y1 = ay + uy * CPG_R;
+          const x2 = bx - ux * (CPG_R + 9), y2 = by - uy * (CPG_R + 9);
 
-        return (
-          <g key={`${e.from}-${e.to}-${i}`}>
-            <path d={d} fill="none" stroke={color} strokeWidth={1.5} strokeOpacity={0.5} />
-            <text x={lx} y={ly - 6} textAnchor="middle"
-              fill={color} fontSize={8} fontFamily="var(--font-mono)" opacity={0.8}>
-              {label}
-            </text>
-          </g>
-        );
-      })}
+          // Weight label: midpoint + small perpendicular offset (so it sits
+          // beside the line, not on top of it — exactly like the reference image)
+          const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+          // Perpendicular unit vector (rotated 90° CCW)
+          const px = -uy, py = ux;
+          const off = 14;  // px offset away from the line
+          const lx = mx + px * off, ly = my + py * off;
 
-      {/* Nodes */}
-      {placed.map(p => {
-        const isHovered = hovered === p.id;
-        const isCritical = criticalNodeIds.has(p.id);
-        const color = threatColor(p.data.threat_level);
-        const mlAvailable = p.data.ml_score != null;
+          return (
+            <g key={`e${i}`}>
+              <line x1={x1} y1={y1} x2={x2} y2={y2}
+                stroke={col} strokeWidth={1.5} strokeOpacity={0.9}
+                markerEnd={`url(#ar-${hex})`}/>
+              {/* Weight number — plain, like the reference image */}
+              <text x={lx} y={ly} textAnchor="middle" dominantBaseline="middle"
+                fill={col} fontSize={11} fontFamily="var(--font-mono)" fontWeight={700}>
+                {w.toFixed(2)}
+              </text>
+              {/* Edge type — tiny, just below the weight */}
+              <text x={lx} y={ly + 13} textAnchor="middle" dominantBaseline="middle"
+                fill={col} fontSize={7} fontFamily="var(--font-mono)" opacity={0.65}>
+                {etype.replace(/_/g, ' ')}
+              </text>
+            </g>
+          );
+        })}
 
-        return (
-          <g key={p.id} transform={`translate(${p.x},${p.y})`}
-            onMouseEnter={() => setHovered(p.id)}
-            onMouseLeave={() => setHovered(null)}
-            style={{ cursor: 'default' }}>
+        {/* ── Nodes ──────────────────────────────────────────────────────────── */}
+        {ids.map((id, i) => {
+          const x      = nodeX(i), y = nodeY(i, N);
+          const node   = nodeMap[id];
+          const isHov  = hovered === id;
+          const col    = node ? threatColor(node.threat_level) : '#888';
+          const score  = node?.combined_score ?? 0;
+          const ml     = node?.ml_score;
+          // Short label: strip .exe, keep ≤9 chars
+          const raw    = node?.label ?? id.split(':')[1] ?? id;
+          const label  = raw.replace(/\.exe$/i, '');
+          const short  = label.length > 9 ? label.slice(0, 8) + '…' : label;
+          const circ   = 2 * Math.PI * CPG_R;
+          const isFirst = i === 0, isLast = i === N - 1;
 
-            {/* Critical path ring */}
-            {isCritical && (
-              <circle r={NODE_R + 6} fill="none"
-                stroke="#f59e0b" strokeWidth={2} strokeDasharray="4 3" opacity={0.7} />
-            )}
+          // Tooltip flips left for nodes near the right edge
+          const flipTip = i >= N - 2;
+          const tipX    = flipTip ? -(CPG_R + 162) : CPG_R + 8;
 
-            {/* Node circle */}
-            <circle r={NODE_R}
-              fill={`${color}18`}
-              stroke={color}
-              strokeWidth={isHovered ? 2.5 : 1.5}
-              filter={isHovered ? 'url(#glow-v)' : undefined}
-            />
+          return (
+            <g key={id} transform={`translate(${x},${y})`}
+              onMouseEnter={() => setHovered(id)}
+              onMouseLeave={() => setHovered(null)}
+              style={{ cursor: 'default' }}>
 
-            {/* Score arc */}
-            <circle r={NODE_R} fill="none"
-              stroke={color} strokeWidth={3} strokeOpacity={0.35}
-              strokeDasharray={`${p.data.combined_score * 2 * Math.PI * NODE_R} ${2 * Math.PI * NODE_R}`}
-              transform="rotate(-90)"
-            />
+              {/* Origin / endpoint dashed ring — mirrors the reference's E and S */}
+              {isFirst && (
+                <circle r={CPG_R + 7} fill="none"
+                  stroke="#00ff88" strokeWidth={1.5} strokeDasharray="4 3" opacity={0.55}/>
+              )}
+              {isLast && (
+                <circle r={CPG_R + 7} fill="none"
+                  stroke="#ff3355" strokeWidth={1.5} strokeDasharray="4 3" opacity={0.65}/>
+              )}
 
-            {/* Label */}
-            <text textAnchor="middle" dy={-6}
-              fill={color} fontSize={10} fontFamily="var(--font-mono)" fontWeight={700}>
-              {p.data.label.length > 12 ? p.data.label.slice(0, 11) + '…' : p.data.label}
-            </text>
+              {/* Main circle */}
+              <circle r={CPG_R} fill={`${col}1a`} stroke={col}
+                strokeWidth={isHov ? 2.5 : 1.8}
+                filter={isHov ? 'url(#glow-cp)' : undefined}/>
 
-            {/* Score */}
-            <text textAnchor="middle" dy={8}
-              fill="var(--text-dim)" fontSize={8} fontFamily="var(--font-mono)">
-              {(p.data.combined_score * 100).toFixed(0)}%
-            </text>
+              {/* Score arc (thin, clockwise from top) */}
+              <circle r={CPG_R} fill="none"
+                stroke={col} strokeWidth={3.5} strokeOpacity={0.35}
+                strokeDasharray={`${score * circ} ${circ}`}
+                strokeLinecap="round"
+                transform="rotate(-90)"/>
 
-            {/* ML indicator */}
-            <text textAnchor="middle" dy={19}
-              fill={mlAvailable ? '#818cf8' : 'var(--text-dim)'}
-              fontSize={7} fontFamily="var(--font-mono)" opacity={0.8}>
-              {mlAvailable ? `ML:${(p.data.ml_score! * 100).toFixed(0)}%` : 'ML:N/A'}
-            </text>
+              {/* Short process name — centred inside the circle */}
+              <text textAnchor="middle" dominantBaseline="middle" y={0}
+                fill={col} fontSize={8} fontFamily="var(--font-mono)" fontWeight={700}>
+                {short}
+              </text>
 
-            {/* Hover tooltip */}
-            {isHovered && (
-              <g>
-                <rect x={NODE_R + 6} y={-36} width={130} height={72}
-                  rx={4} fill="var(--elevated)" stroke="var(--border)" strokeWidth={1} />
-                <text x={NODE_R + 12} y={-20} fill="var(--text)"
-                  fontSize={9} fontFamily="var(--font-mono)" fontWeight={700}>
-                  {p.data.label}
-                </text>
-                <text x={NODE_R + 12} y={-8} fill={color}
-                  fontSize={8} fontFamily="var(--font-mono)">
-                  {p.data.threat_level} · {(p.data.combined_score * 100).toFixed(0)}%
-                </text>
-                {p.data.process_score !== undefined && (
-                  <text x={NODE_R + 12} y={4} fill="var(--text-dim)"
-                    fontSize={7} fontFamily="var(--font-mono)">
-                    PROC:{(p.data.process_score! * 100).toFixed(0)}
-                    {' '}NET:{(p.data.network_score! * 100).toFixed(0)}
-                    {' '}MEM:{(p.data.memory_score! * 100).toFixed(0)}
-                  </text>
-                )}
-                <text x={NODE_R + 12} y={16} fill="var(--text-dim)"
-                  fontSize={7} fontFamily="var(--font-mono)">
-                  {p.data.sub_label
-                    ? (p.data.sub_label.length > 20
-                        ? '…' + p.data.sub_label.slice(-18)
-                        : p.data.sub_label)
-                    : p.data.entity_id}
-                </text>
-                <text x={NODE_R + 12} y={28} fill="#818cf8"
-                  fontSize={7} fontFamily="var(--font-mono)">
-                  {p.data.ml_score != null
-                    ? `ML score: ${(p.data.ml_score * 100).toFixed(1)}%`
-                    : 'ML score: not available'}
-                </text>
-              </g>
-            )}
-          </g>
-        );
-      })}
-    </svg>
+              {/* ── Labels below the circle ── */}
+              {/* Score % */}
+              <text textAnchor="middle" y={CPG_R + 14}
+                fill="var(--text)" fontSize={10} fontFamily="var(--font-mono)" fontWeight={700}>
+                {(score * 100).toFixed(0)}%
+              </text>
+              {/* Threat level */}
+              <text textAnchor="middle" y={CPG_R + 26}
+                fill={col} fontSize={7} fontFamily="var(--font-mono)" fontWeight={700}>
+                {node?.threat_level ?? ''}
+              </text>
+              {/* ML indicator */}
+              <text textAnchor="middle" y={CPG_R + 37}
+                fill={ml != null ? '#818cf8' : 'var(--text-dim)'}
+                fontSize={7} fontFamily="var(--font-mono)">
+                {ml != null ? `ML ${(ml * 100).toFixed(0)}%` : 'ML N/A'}
+              </text>
+
+              {/* Hover tooltip */}
+              {isHov && node && (
+                <g>
+                  <rect x={tipX} y={-60} width={158} height={130}
+                    rx={4} fill="var(--elevated)" stroke="var(--border)" strokeWidth={1}/>
+                  {[
+                    { t: node.label,                                   dy: -44, c: 'var(--text)', w: 700, s: 9 },
+                    { t: `${node.threat_level} · ${(score*100).toFixed(0)}%`, dy: -31, c: col,           w: 400, s: 8 },
+                    { t: ml != null ? `ML: ${(ml*100).toFixed(1)}%` : 'ML: not available', dy: -19, c: '#818cf8', w: 400, s: 7 },
+                    { t: `PROC ${((node.process_score??0)*100).toFixed(0)}  NET ${((node.network_score??0)*100).toFixed(0)}  MEM ${((node.memory_score??0)*100).toFixed(0)}`, dy: -7, c: 'var(--text-dim)', w: 400, s: 7 },
+                    { t: `FILE ${((node.file_score??0)*100).toFixed(0)}`,       dy:  5, c: 'var(--text-dim)', w: 400, s: 7 },
+                    { t: `type: ${node.entity_type ?? '?'}  pid: ${node.pid ?? '—'}`, dy: 17, c: 'var(--text-dim)', w: 400, s: 7 },
+                    { t: (node.sub_label ?? node.entity_id).slice(-24),           dy: 29, c: 'var(--text-dim)', w: 400, s: 7 },
+                    { t: `step ${i + 1} / ${N}`,                                  dy: 55, c: 'var(--text-dim)', w: 400, s: 7 },
+                  ].map(({ t, dy, c, w, s }) => (
+                    <text key={dy} x={tipX + 8} y={dy}
+                      fill={c} fontSize={s} fontFamily="var(--font-mono)" fontWeight={w}>
+                      {t}
+                    </text>
+                  ))}
+                </g>
+              )}
+            </g>
+          );
+        })}
+
+        {/* Total score — bottom-right corner */}
+        <text x={vW - 8} y={CPG_VH - 8} textAnchor="end"
+          fill="var(--text-dim)" fontSize={8} fontFamily="var(--font-mono)" opacity={0.7}>
+          total path score: {criticalPath.total_score.toFixed(3)}
+        </text>
+      </svg>
+    </div>
   );
 }
 
@@ -326,9 +981,9 @@ function VerdictSubgraph({
 function ChainCard({
   chain, sentence, nodeMap,
 }: {
-  chain: AttackChain;
+  chain:    AttackChain;
   sentence: PatternSentence;
-  nodeMap: Record<string, GraphNodeData>;
+  nodeMap:  Record<string, GraphNodeData>;
 }) {
   const [open, setOpen] = useState(false);
   const color = threatColor(chain.severity);
@@ -362,18 +1017,41 @@ function ChainCard({
         }}>
           {chain.pattern}
         </span>
-        {/* Score bar */}
-        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <div style={{
-            width: 60, height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden',
-          }}>
+        {/* Score + confidence bars */}
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {/* Severity score */}
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
             <div style={{
-              width: `${chain.chain_score * 100}%`, height: '100%',
-              background: color, borderRadius: 2,
-            }} />
-          </div>
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
-            {(chain.chain_score * 100).toFixed(0)}%
+              width: 52, height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden',
+            }}>
+              <div style={{
+                width: `${chain.chain_score * 100}%`, height: '100%',
+                background: color, borderRadius: 2,
+              }} />
+            </div>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
+              {(chain.chain_score * 100).toFixed(0)}%
+            </span>
+          </span>
+          {/* Confidence */}
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{
+              fontFamily: 'var(--font-mono)', fontSize: 7, color: 'var(--text-dim)',
+              letterSpacing: '0.05em',
+            }}>
+              CONF
+            </span>
+            <div style={{
+              width: 36, height: 3, background: 'var(--border)', borderRadius: 2, overflow: 'hidden',
+            }}>
+              <div style={{
+                width: `${(chain.confidence ?? 0) * 100}%`, height: '100%',
+                background: '#818cf8', borderRadius: 2,
+              }} />
+            </div>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: '#818cf8' }}>
+              {((chain.confidence ?? 0) * 100).toFixed(0)}%
+            </span>
           </span>
         </span>
         <span style={{ color: 'var(--text-dim)', marginLeft: 6 }}>
@@ -414,6 +1092,12 @@ function ChainCard({
                   padding: '2px 7px', borderRadius: 3,
                 }}>
                   {node.label}
+                  {node.is_lolbin && (
+                    <span style={{
+                      color: '#ff8c00', marginLeft: 4,
+                      fontSize: 7, fontWeight: 700,
+                    }}>LOLBin</span>
+                  )}
                   {node.ml_score == null && (
                     <span style={{ color: 'var(--text-dim)', marginLeft: 4 }}>[ML:N/A]</span>
                   )}
@@ -421,6 +1105,9 @@ function ChainCard({
               );
             })}
           </div>
+
+          {/* Per-chain action suggestions */}
+          <ActionPanel chain={chain} nodeMap={nodeMap} />
         </div>
       )}
     </div>
@@ -918,64 +1605,81 @@ export default function GraphVerdict() {
         </div>
       </div>
 
-      {/* ── Right panel: sub-graph ──────────────────────────────────────────── */}
+      {/* ── Right panel: critical path directed graph ──────────────────────── */}
       <div style={{
         flex: 1, display: 'flex', flexDirection: 'column',
         overflow: 'hidden', padding: '18px 20px',
       }}>
+        {/* Panel header */}
         <div style={{
           fontSize: 9, letterSpacing: '0.12em', color: 'var(--text-dim)', marginBottom: 14,
+          display: 'flex', alignItems: 'center', gap: 10,
         }}>
-          INVOLVED ENTITIES
-          {verdict.verdictNodes.length > 0 && (
-            <span style={{ marginLeft: 8, color: 'var(--text-dim)', fontWeight: 400 }}>
-              — showing only entities linked to detected attack chains
-            </span>
+          <span>CRITICAL PATH</span>
+          {verdict.criticalPath && verdict.criticalPath.node_ids.length > 0 && (
+            <>
+              <span style={{ color: 'var(--border)' }}>·</span>
+              <span style={{ color: '#f59e0b' }}>
+                {verdict.criticalPath.node_ids.length} node{verdict.criticalPath.node_ids.length !== 1 ? 's' : ''}
+              </span>
+              <span style={{ color: 'var(--border)' }}>·</span>
+              <span>score {verdict.criticalPath.total_score.toFixed(3)}</span>
+            </>
           )}
         </div>
 
-        {/* The sub-graph */}
+        {/* Directed graph canvas */}
         <div style={{
           flex: 1, background: 'var(--base)',
           border: '1px solid var(--border)', borderRadius: 8,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          overflow: 'hidden', position: 'relative', minHeight: 260,
+          overflow: 'hidden', position: 'relative', minHeight: 220,
         }}>
-          <VerdictSubgraph
-            nodes={verdict.verdictNodes}
-            edges={verdict.verdictEdges}
-            criticalNodeIds={verdict.criticalPathIds}
+          <CriticalPathGraph
+            criticalPath={verdict.criticalPath}
+            nodeMap={verdict.nodeMap}
           />
         </div>
 
         {/* Legend */}
-        {verdict.verdictNodes.length > 0 && (
-          <div style={{
-            display: 'flex', gap: 16, marginTop: 12, flexWrap: 'wrap',
-            fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)',
-          }}>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <span style={{ width: 16, height: 2, background: '#f59e0b', display: 'inline-block', borderRadius: 1 }} />
-              Critical path
+        <div style={{
+          display: 'flex', gap: 16, marginTop: 12, flexWrap: 'wrap',
+          fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)',
+        }}>
+          {[
+            { label: 'Parent → child',  color: '#00d4ff' },
+            { label: 'Shared C2',       color: '#facc15' },
+            { label: 'Shared hash',     color: '#34d399' },
+          ].map(({ label, color }) => (
+            <span key={label} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+              <span style={{
+                width: 16, height: 2, background: color,
+                display: 'inline-block', borderRadius: 1,
+              }} />
+              {label}
             </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <span style={{ width: 16, height: 2, background: '#00d4ff', display: 'inline-block', borderRadius: 1 }} />
-              Parent → child
-            </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <span style={{ width: 16, height: 2, background: '#facc15', display: 'inline-block', borderRadius: 1 }} />
-              Shared C2
-            </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <span style={{ width: 16, height: 2, background: '#34d399', display: 'inline-block', borderRadius: 1 }} />
-              Shared hash
-            </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-              <span style={{ color: '#818cf8' }}>ML:N/A</span>
-              = ML model not run for this entity
-            </span>
-          </div>
-        )}
+          ))}
+          <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+            <span style={{
+              width: 10, height: 10, borderRadius: '50%',
+              border: '1.5px dashed #00ff88', display: 'inline-block',
+            }} />
+            origin
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+            <span style={{
+              width: 10, height: 10, borderRadius: '50%',
+              border: '1.5px dashed #ff3355', display: 'inline-block',
+            }} />
+            endpoint
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+            <span style={{ color: '#818cf8' }}>ML N/A</span>
+            = model not run
+          </span>
+          <span style={{ marginLeft: 'auto', color: 'var(--text-dim)', fontStyle: 'italic' }}>
+            w = hop weight · arc = combined score · scroll →
+          </span>
+        </div>
       </div>
     </div>
   );

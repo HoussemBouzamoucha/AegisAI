@@ -10,6 +10,12 @@ use core::process::ProcessScanner;
 use core::process::output::serialize_process;
 use core::types::ThreatLevel;
 
+// Post-verdict containment actions
+use core::action::{
+    block_ip, check_persistence, dump_memory, isolate_network,
+    quarantine_file, remove_block_ip, restore_network,
+};
+
 // Entity + graph layer
 use core::entity::{
     EntityManager, EntityCorrelator, CorrelatedCluster, JoinReason, EntityNode,
@@ -150,7 +156,35 @@ fn run_daemon() {
                 let pid = request["pid"].as_u64().unwrap_or(0) as u32;
                 daemon_kill_process(&process_scanner, pid, &id)
             }
-            "correlate" => daemon_correlate(
+            // ── Post-verdict containment actions ─────────────────────────────
+        "quarantine-file" => {
+            let path = request["path"].as_str().unwrap_or("");
+            daemon_quarantine_file(path, &id)
+        }
+        "block-ip" => {
+            let remote_ip = request["remote_ip"].as_str().unwrap_or("");
+            let direction = request["direction"].as_str().unwrap_or("out");
+            daemon_block_ip(remote_ip, direction, &id)
+        }
+        "remove-block-ip" => {
+            let rule_name = request["rule_name"].as_str().unwrap_or("");
+            daemon_remove_block_ip(rule_name, &id)
+        }
+        "dump-memory" => {
+            let pid = request["pid"].as_u64().unwrap_or(0) as u32;
+            daemon_dump_memory(pid, &id)
+        }
+        "check-persistence" => {
+            let paths: Vec<String> = request["suspicious_paths"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            daemon_check_persistence(&paths, &id)
+        }
+        "isolate-network" => daemon_isolate_network(&id),
+        "restore-network" => daemon_restore_network(&id),
+
+        "correlate" => daemon_correlate(
                 &scanner,
                 &process_scanner,
                 &network_scanner,
@@ -320,6 +354,96 @@ fn daemon_scan_memory(scanner: &MemoryScanner, pid: Option<u32>, id: &str) -> se
             "regions": regions.iter().map(serialize_memory_region).collect::<Vec<_>>(),
         }),
         Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
+    }
+}
+
+// ─── Action daemon handlers ───────────────────────────────────────────────────
+
+/// Move a file into the AegisAI quarantine folder.
+///
+/// Calls `quarantine_file(path)` and wraps the result in a JSON response
+/// suitable for returning directly to the Tauri IPC caller.
+fn daemon_quarantine_file(path: &str, id: &str) -> serde_json::Value {
+    let r = quarantine_file(path);
+    if r.success {
+        json!({
+            "id":              id,
+            "success":         true,
+            "quarantine_path": r.quarantine_path,
+            "sha256":          r.sha256,
+        })
+    } else {
+        json!({ "id": id, "success": false, "error": r.error })
+    }
+}
+
+/// Add a Windows Firewall outbound (or bidirectional) deny rule for `remote_ip`.
+///
+/// Returns the generated rule name so the caller can later call
+/// `remove-block-ip` to roll it back.
+fn daemon_block_ip(remote_ip: &str, direction: &str, id: &str) -> serde_json::Value {
+    let r = block_ip(remote_ip, direction);
+    if r.success {
+        json!({ "id": id, "success": true, "rule_name": r.rule_name })
+    } else {
+        json!({ "id": id, "success": false, "error": r.error })
+    }
+}
+
+/// Remove a previously created AegisAI firewall rule.
+fn daemon_remove_block_ip(rule_name: &str, id: &str) -> serde_json::Value {
+    match remove_block_ip(rule_name) {
+        Ok(())  => json!({ "id": id, "success": true }),
+        Err(e)  => json!({ "id": id, "success": false, "error": e }),
+    }
+}
+
+/// Write a full `MiniDumpWithFullMemory` dump of `pid` to the AegisAI dumps dir.
+///
+/// Returns the absolute path to the `.dmp` file on success.
+fn daemon_dump_memory(pid: u32, id: &str) -> serde_json::Value {
+    let r = dump_memory(pid);
+    if r.success {
+        json!({ "id": id, "success": true, "dump_path": r.dump_path })
+    } else {
+        json!({ "id": id, "success": false, "error": r.error })
+    }
+}
+
+/// Scan registry run keys, scheduled tasks, and startup folders for persistence
+/// mechanisms.  `suspicious_paths` are cross-referenced against each entry.
+fn daemon_check_persistence(suspicious_paths: &[String], id: &str) -> serde_json::Value {
+    let r = check_persistence(suspicious_paths);
+    let entries: Vec<serde_json::Value> = r.entries.iter().map(|e| json!({
+        "kind":       e.kind,
+        "name":       e.name,
+        "path":       e.path,
+        "sha256":     e.sha256,
+        "suspicious": e.suspicious,
+    })).collect();
+
+    json!({ "id": id, "success": r.success, "entries": entries, "error": r.error })
+}
+
+/// Disable all connected network interfaces to cut off C2 communications.
+///
+/// Returns the list of disabled adapter names.  Call `restore-network` to
+/// re-enable them after the incident is resolved.
+fn daemon_isolate_network(id: &str) -> serde_json::Value {
+    let r = isolate_network();
+    json!({
+        "id":                   id,
+        "success":              r.success,
+        "disabled_interfaces":  r.disabled_interfaces,
+        "error":                r.error,
+    })
+}
+
+/// Re-enable all adapters saved by the last `isolate-network` call.
+fn daemon_restore_network(id: &str) -> serde_json::Value {
+    match restore_network() {
+        Ok(())  => json!({ "id": id, "success": true }),
+        Err(e)  => json!({ "id": id, "success": false, "error": e }),
     }
 }
 
@@ -587,6 +711,7 @@ fn serialize_graph_node(node: &GraphNode) -> serde_json::Value {
         "parent_pid":            node.parent_pid,
         "graph_boost":           node.graph_boost,
         "is_vector":             node.is_vector,
+        "is_lolbin":             node.is_lolbin,
     })
 }
 
@@ -618,6 +743,7 @@ fn serialize_attack_chain(chain: &AttackChain) -> serde_json::Value {
         "severity":     chain.severity,
         "description":  chain.description,
         "mitre_tactic": chain.mitre_tactic,
+        "confidence":   chain.confidence,
     })
 }
 

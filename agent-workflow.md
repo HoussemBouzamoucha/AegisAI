@@ -209,3 +209,70 @@ The following must be in place before the reasoning loop is implementable:
 - **Make blocking decisions autonomously** — it produces recommendations;
   termination and quarantine require user confirmation (or an explicit
   autonomous mode the user opts into)
+
+---
+
+## Action prioritization — from 20+ options to a ranked plan
+
+### The problem
+
+The graph pipeline produces rich context: attack patterns (MITRE-mapped), scores,
+LOLBin flags, entity relationships. The 20+ possible containment actions are a
+**menu**, not a plan. The agent's job is to pick 3–5 ordered, justified actions
+from that menu.
+
+### How the agent reasons
+
+The agent receives one structured input — the `correlate` result — and outputs a
+ranked action plan. The reasoning has three layers:
+
+**1. Severity gating** — actions have minimum score thresholds. Network isolation
+should never fire below 0.85. Killing a process might fire at 0.65.
+
+**2. Pattern → action mapping** — each attack chain pattern has a natural response set:
+
+| Pattern | Primary actions | Skip unless critical |
+|---------|----------------|---------------------|
+| `ProcessInjection` | `dump_memory`, `kill_process` | `isolate_network` |
+| `C2Communication` | `block_ip`, `check_persistence` | `isolate_network` |
+| `MalwareExecution` | `quarantine_file`, `kill_process` | `dump_memory` |
+| `LateralMovement` | `isolate_network`, `check_persistence` | — |
+| `MultiStageAttack` | all, sequenced | — |
+
+**3. Risk ranking** — actions ordered by reversibility. Reversible actions
+(`block_ip`) before destructive ones (`kill_process`), which always come before
+disruptive ones (`isolate_network`).
+
+### Architecture
+
+```
+GraphVerdict (attack chains + scores)
+  → AI Agent (Claude API call with structured prompt)
+      input: { chains[], critical_path, top entities, scores }
+      output: { ranked_actions[], rationale, risk_level }
+  → UI shows: "3 recommended actions" + collapsible "19 others considered"
+```
+
+The agent prompt is structured like a security analyst briefing — concise context,
+then the reasoning question. The model returns JSON with the top actions, sequence,
+and a one-line justification for each.
+
+### Example UI output
+
+Instead of showing 20 checkboxes, the UI surfaces:
+
+```
+AI recommends (confidence 91%):
+  1. quarantine_file  — chrome_update.exe (hash match, score 0.94)
+  2. block_ip         — 185.220.101.x outbound (C2 pattern confirmed)
+  3. check_persistence — suspicious_paths from chain
+
+  [See 17 other considered actions ▼]
+```
+
+### What the agent does NOT do in this context
+
+- It does not fire actions automatically unless `autonomousMode` is enabled
+- It does not override the score thresholds — those are hard gates, not suggestions
+- It does not recommend irreversible actions without a `confirm: true` in the
+  response that forces a UI confirmation prompt before execution
