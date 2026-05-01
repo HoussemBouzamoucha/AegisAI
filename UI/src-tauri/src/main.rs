@@ -806,6 +806,72 @@ async fn get_engine_status(
     }))
 }
 
+// ─── Full system scan ─────────────────────────────────────────────────────────
+
+/// Scan the highest-risk locations on the machine without attempting a full
+/// C:\ walk (which the serial daemon engine cannot complete in time).
+///
+/// Roots scanned in order:
+///   1. `%USERPROFILE%`   — Downloads, Desktop, Documents, AppData (persistence + drops)
+///   2. `%SystemRoot%\Temp` — Dropper staging area
+///   3. `%ProgramData%`   — Service abuse, malware persistence
+///   4. `%SystemRoot%\System32` — DLL hijacking, in-place malware drops
+///
+/// Each root is given a 5-minute daemon timeout.  Roots that timeout or fail
+/// are skipped with a warning; results from the remaining roots are merged.
+#[tauri::command]
+async fn scan_all(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<ScanOutput, String> {
+    let sys_root = std::env::var("SystemRoot")
+        .unwrap_or_else(|_| r"C:\Windows".to_string());
+    let profile = std::env::var("USERPROFILE")
+        .unwrap_or_else(|_| r"C:\Users\Public".to_string());
+    let programdata = std::env::var("ProgramData")
+        .unwrap_or_else(|_| r"C:\ProgramData".to_string());
+
+    let roots = vec![
+        profile,
+        format!(r"{}\Temp", sys_root),
+        programdata,
+        format!(r"{}\System32", sys_root),
+    ];
+
+    let mut all_files = Vec::<ScanResult>::new();
+    let mut total = ScanStats {
+        total_files: 0, clean_files: 0, suspicious_files: 0,
+        malicious_files: 0, error_files: 0, total_size_mb: 0.0,
+    };
+
+    for root in &roots {
+        eprintln!("scan_all: scanning '{}'…", root);
+        let request = serde_json::json!({
+            "id": next_id(), "cmd": "scan-dir", "path": root,
+        });
+        match daemon_request(&state, request, Duration::from_secs(300)) {
+            Ok(json) => {
+                if let Some(err) = json["error"].as_str() {
+                    eprintln!("scan_all: '{}' daemon error — {}", root, err);
+                    continue;
+                }
+                if let Some(arr) = json["files"].as_array() {
+                    all_files.extend(arr.iter().map(|f| parse_scan_result(f, "")));
+                }
+                let s = &json["statistics"];
+                total.total_files      += s["total_files"].as_u64().unwrap_or(0);
+                total.clean_files      += s["clean_files"].as_u64().unwrap_or(0);
+                total.suspicious_files += s["suspicious_files"].as_u64().unwrap_or(0);
+                total.malicious_files  += s["malicious_files"].as_u64().unwrap_or(0);
+                total.error_files      += s["error_files"].as_u64().unwrap_or(0);
+                total.total_size_mb    += s["total_size_mb"].as_f64().unwrap_or(0.0);
+            }
+            Err(e) => eprintln!("scan_all: '{}' skipped — {}", root, e),
+        }
+    }
+
+    Ok(ScanOutput { success: true, files: all_files, statistics: total, error: None })
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -835,6 +901,7 @@ fn main() {
             // ── Scanning ──────────────────────────────────────────────────
             scan_file,
             scan_directory,
+            scan_all,
             scan_processes,
             scan_network,
             scan_memory,

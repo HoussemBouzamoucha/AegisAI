@@ -4,7 +4,9 @@
       "Bash(wsl:*)",
       "Bash(cargo check:*)",
       "Bash(cargo build *)",
-      "Bash(npx tsc *)"
+      "Bash(npx tsc *)",
+      "Bash(xargs grep *)",
+      "Bash(cargo test *)"
     ]
   }
 }

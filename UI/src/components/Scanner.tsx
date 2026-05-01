@@ -1,14 +1,35 @@
 // src/components/Scanner.tsx
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../store';
 import {
   FolderOpen, FileSearch, X, AlertTriangle,
   CheckCircle, Loader, ChevronDown, ChevronRight,
-  Shield, Zap, Tag,
+  Shield, Zap, Tag, HardDrive, Clock,
 } from 'lucide-react';
 import type { ScanResult, ContextFlag, DetectionSignal } from '../types';
 import { CONTEXT_FLAG_LABEL, CONTEXT_FLAG_SEVERITY } from '../types';
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Format a millisecond duration as a human-readable string. */
+function formatDuration(ms: number): string {
+  const totalSecs = ms / 1000;
+  if (totalSecs < 60) return `${totalSecs.toFixed(1)}s`;
+  const mins = Math.floor(totalSecs / 60);
+  const secs = Math.floor(totalSecs % 60);
+  if (mins < 60) return `${mins}m ${secs}s`;
+  const hours = Math.floor(mins / 60);
+  return `${hours}h ${mins % 60}m ${secs}s`;
+}
+
+/** Format elapsed whole seconds (for the live timer). */
+function formatElapsed(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}m ${s < 10 ? '0' : ''}${s}s`;
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -296,22 +317,52 @@ function ResultRow({ result, index }: { result: ScanResult; index: number }) {
 export default function Scanner() {
   const {
     scanning, scanResults, scanStats, scanError,
-    scanFile, scanDirectory, clearScan,
+    lastScanDurationMs,
+    scanFile, scanDirectory, scanAll, clearScan,
   } = useStore();
 
   const [tab, setTab] = useState<'threats' | 'all'>('threats');
   const [pathInput, setPathInput] = useState('');
+  // Track which kind of scan is running so the spinner label is accurate.
+  const [scanMode, setScanMode] = useState<'file' | 'directory' | 'all' | null>(null);
+
+  // ── Live elapsed timer ───────────────────────────────────────────────────────
+  const [elapsedSecs, setElapsedSecs] = useState(0);
+  const scanStartRef = useRef<number>(0);
+
+  useEffect(() => {
+    if (!scanning) {
+      setElapsedSecs(0);
+      return;
+    }
+    scanStartRef.current = Date.now();
+    setElapsedSecs(0);
+    const id = setInterval(() => {
+      setElapsedSecs(Math.floor((Date.now() - scanStartRef.current) / 1000));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [scanning]);
+
+  // ── Handlers ─────────────────────────────────────────────────────────────────
 
   const handleScanFile = () => {
     if (!pathInput.trim()) return;
+    setScanMode('file');
     clearScan();
     scanFile(pathInput.trim());
   };
 
   const handleScanDir = () => {
     if (!pathInput.trim()) return;
+    setScanMode('directory');
     clearScan();
     scanDirectory(pathInput.trim());
+  };
+
+  const handleScanAll = () => {
+    setScanMode('all');
+    clearScan();
+    scanAll();
   };
 
   const handleBrowse = async () => {
@@ -342,19 +393,47 @@ export default function Scanner() {
       padding: 32, gap: 24,
     }}>
       {/* ── Header ────────────────────────────────────────────────────────── */}
-      <div>
-        <div style={{
-          fontFamily: 'var(--font-hud)', fontSize: 22, fontWeight: 700,
-          color: 'var(--text-bright)', letterSpacing: '0.05em',
-        }}>
-          FILE SCANNER
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+        <div>
+          <div style={{
+            fontFamily: 'var(--font-hud)', fontSize: 22, fontWeight: 700,
+            color: 'var(--text-bright)', letterSpacing: '0.05em',
+          }}>
+            FILE SCANNER
+          </div>
+          <div style={{
+            fontFamily: 'var(--font-mono)', fontSize: 11,
+            color: 'var(--text-dim)', marginTop: 4,
+          }}>
+            Multi-layer threat analysis — Hash · YARA · Heuristics · Directory Context
+          </div>
         </div>
-        <div style={{
-          fontFamily: 'var(--font-mono)', fontSize: 11,
-          color: 'var(--text-dim)', marginTop: 4,
-        }}>
-          Multi-layer threat analysis — Hash · YARA · Heuristics · Directory Context
-        </div>
+
+        {/* Duration badge — shown after any scan completes */}
+        {lastScanDurationMs !== null && !scanning && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            padding: '6px 12px',
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            flexShrink: 0,
+          }}>
+            <Clock size={12} color="var(--text-dim)" />
+            <span style={{
+              fontFamily: 'var(--font-hud)', fontSize: 10,
+              color: 'var(--text-dim)', letterSpacing: '0.08em',
+            }}>
+              COMPLETED IN
+            </span>
+            <span style={{
+              fontFamily: 'var(--font-mono)', fontSize: 12,
+              color: 'var(--cyan)', fontWeight: 600,
+            }}>
+              {formatDuration(lastScanDurationMs)}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* ── Path input + buttons ───────────────────────────────────────────── */}
@@ -377,7 +456,8 @@ export default function Scanner() {
           />
         </div>
 
-        <div style={{ display: 'flex', gap: 8 }}>
+        {/* ── File / dir buttons row ─────────────────────────────────────── */}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           {[
             { icon: <FileSearch size={15} />, label: 'SCAN FILE',      action: handleScanFile,  primary: true  },
             { icon: <FolderOpen size={15} />, label: 'SCAN DIRECTORY', action: handleScanDir,   primary: false },
@@ -420,6 +500,90 @@ export default function Scanner() {
               {btn.icon} {btn.label}
             </button>
           ))}
+        </div>
+
+        {/* ── SCAN ALL button — separate row, distinct style ─────────────── */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 12,
+          padding: '10px 14px',
+          background: scanning && scanMode === 'all'
+            ? 'rgba(0,200,255,0.05)'
+            : 'var(--surface)',
+          border: `1px solid ${scanning && scanMode === 'all' ? 'var(--cyan)' : 'var(--border)'}`,
+          borderRadius: 6,
+          transition: 'border-color 0.2s, background 0.2s',
+        }}>
+          <button
+            onClick={handleScanAll}
+            disabled={scanning}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '8px 20px',
+              background: 'rgba(0,200,255,0.1)',
+              border: '1px solid var(--cyan)',
+              borderRadius: 6,
+              color: 'var(--cyan)',
+              fontFamily: 'var(--font-hud)', fontSize: 11,
+              letterSpacing: '0.12em', fontWeight: 700,
+              cursor: scanning ? 'not-allowed' : 'pointer',
+              opacity: scanning ? 0.5 : 1,
+              transition: 'all 0.15s',
+            }}
+            onMouseEnter={e => {
+              if (!scanning) {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.background = 'rgba(0,200,255,0.18)';
+                el.style.boxShadow = '0 0 12px rgba(0,200,255,0.2)';
+              }
+            }}
+            onMouseLeave={e => {
+              const el = e.currentTarget as HTMLButtonElement;
+              el.style.background = 'rgba(0,200,255,0.1)';
+              el.style.boxShadow = 'none';
+            }}
+          >
+            <HardDrive size={16} />
+            SCAN ALL
+          </button>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <span style={{
+              fontFamily: 'var(--font-mono)', fontSize: 10,
+              color: 'var(--text-dim)',
+            }}>
+              Scans: User Profile · System Temp · ProgramData · System32
+            </span>
+            <span style={{
+              fontFamily: 'var(--font-mono)', fontSize: 9,
+              color: 'var(--text-dim)', opacity: 0.6,
+            }}>
+              Covers the highest-risk locations — may take several minutes
+            </span>
+          </div>
+
+          {/* Live elapsed timer — only visible while a full scan runs */}
+          {scanning && scanMode === 'all' && (
+            <div style={{
+              marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6,
+              padding: '4px 10px',
+              background: 'rgba(0,200,255,0.08)',
+              border: '1px solid rgba(0,200,255,0.3)',
+              borderRadius: 4,
+              flexShrink: 0,
+            }}>
+              <div style={{
+                width: 6, height: 6, borderRadius: '50%',
+                background: 'var(--cyan)',
+                animation: 'pulse 1s ease-in-out infinite',
+              }} />
+              <span style={{
+                fontFamily: 'var(--font-mono)', fontSize: 13,
+                color: 'var(--cyan)', fontWeight: 600,
+                minWidth: 52,
+              }}>
+                {formatElapsed(elapsedSecs)}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -535,12 +699,40 @@ export default function Scanner() {
             alignItems: 'center', justifyContent: 'center', gap: 16,
           }}>
             <div style={{ animation: 'spin 1s linear infinite' }}>
-              <Loader size={28} color="var(--green)" />
+              <Loader size={28} color={scanMode === 'all' ? 'var(--cyan)' : 'var(--green)'} />
             </div>
-            <div style={{
-              fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--green)',
-            }}>
-              SCANNING...
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+              <div style={{
+                fontFamily: 'var(--font-mono)', fontSize: 12,
+                color: scanMode === 'all' ? 'var(--cyan)' : 'var(--green)',
+              }}>
+                {scanMode === 'all' ? 'SCANNING ALL...' : 'SCANNING...'}
+              </div>
+              {/* Elapsed timer — visible for all scan modes */}
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '4px 12px',
+                background: 'var(--elevated)',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+              }}>
+                <Clock size={11} color="var(--text-dim)" />
+                <span style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 13,
+                  color: scanMode === 'all' ? 'var(--cyan)' : 'var(--green)',
+                  fontWeight: 600, minWidth: 48, textAlign: 'center',
+                }}>
+                  {formatElapsed(elapsedSecs)}
+                </span>
+              </div>
+              {scanMode === 'all' && (
+                <div style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 10,
+                  color: 'var(--text-dim)', maxWidth: 320, textAlign: 'center',
+                }}>
+                  Scanning User Profile · System Temp · ProgramData · System32
+                </div>
+              )}
             </div>
           </div>
         ) : scanError ? (

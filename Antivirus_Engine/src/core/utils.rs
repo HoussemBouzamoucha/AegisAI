@@ -43,3 +43,12 @@ pub fn is_pe_file(data: &[u8]) -> bool {
     data.starts_with(b"MZ")
 }
 
+/// Compute SHA-256 from an already-loaded byte slice.
+/// Prefer this over `compute_sha256` when the file is already in memory
+/// to avoid re-opening and re-reading the file.
+pub fn compute_sha256_from_bytes(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+

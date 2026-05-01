@@ -92,7 +92,7 @@ The daemon reads one JSON line from stdin, writes one JSON line to stdout.
 - `invoke('export_incident_report', {correlate_result, actions_taken, output_path?})` — write structured JSON report
 
 ### Four Scanner Domains (`Antivirus_Engine/src/core/<domain>/`)
-- **file_system/** — YARA-X rules, SHA-256 hash DB, heuristics, ransomware context flags
+- **file_system/** — YARA-X rules, SHA-256 hash DB, heuristics, ransomware context flags, `scan_all.rs` system-wide scanner + scheduler
 - **process/** — Windows API call sequences via `API_feature_extractor.rs`; GRU inference in `Sys_API/`
 - **network/** — pcap capture → `OnePace.csv` (47 UNSW-NB15 features) → XGBoost IDS
 - **memory/** — VirtualQueryEx region analysis, shellcode heuristics, ML scoring
@@ -192,11 +192,20 @@ Memory ML: `Deep_dive/` diagnostic + inference pipeline (leakage/overfitting che
 - **Sliding 10-min window**: EntityManager prunes stale entities to bound memory.
 - **ML is optional**: `run_ml_and_patch_scores` silently no-ops if Python/CSV unavailable; graph falls back to heuristic-only.
 - **correlate command**: only threat-level processes also trigger file scan of their exe_path (avoids scanning all 300+ processes).
+- **File heuristics — single file read**: `HeuristicAnalyzer::analyze()` reads the file once into a `Vec<u8>` (≤10 MiB). Magic-byte detection, entropy, content analysis, and SHA-256 all derive from that buffer; no re-opens. Large files (>10 MiB) get filename/extension/timestamp checks only; SHA-256 streams separately.
+- **File heuristics — extension lookup O(log n)**: `DOCUMENT_EXTENSIONS`, `EXECUTABLE_EXTENSIONS`, `SCRIPT_EXTENSIONS` are sorted ASCII arrays; all lookups use `binary_search`. A CI test (`test_extension_arrays_sorted`) asserts order at compile time.
+- **File heuristics — script coverage**: `.py`, `.sh`, `.rb`, `.pl`, `.php`, `.lua` are included in ransomware-phrase and suspicious-keyword checks (previously skipped by the `is_doc || is_exec` gate).
+- **File heuristics — binary-safe content scan**: `check_content` uses `from_utf8_lossy` on the shared byte buffer instead of `read_to_string`; binary executables are no longer silently skipped.
+- **`utils::compute_sha256_from_bytes`**: takes a `&[u8]` slice; used by the heuristic engine for small files to avoid re-opening. `compute_sha256(path)` still exists for large-file streaming.
 
 ## Important Files
 | File | Purpose |
 |------|---------|
 | `Antivirus_Engine/src/main.rs` | CLI entry point, daemon loop, all serializers |
+| `Antivirus_Engine/src/core/utils.rs` | `compute_sha256`, `compute_sha256_from_bytes`, `calculate_entropy`, `is_pe_file` |
+| `Antivirus_Engine/src/core/file_system/heuristics.rs` | unified file scoring engine; single-read, binary-safe, script-aware |
+| `Antivirus_Engine/src/core/file_system/scan_all.rs` | `SystemScanner` + `ScanScheduler`; system-wide parallel scan with mtime cache |
+| `Antivirus_Engine/src/core/file_system/SCAN_ALL.md` | architecture doc for the scan_all module |
 | `Antivirus_Engine/src/core/entity/manager.rs` | ingestion, scoring, pruning, **`aggregate()`** |
 | `Antivirus_Engine/src/core/entity/types.rs` | `EntityNode`, **`AggregatedEntity`** |
 | `Antivirus_Engine/src/core/entity/correlator.rs` | cluster logic (EntityManager UI view only) |
@@ -206,11 +215,12 @@ Memory ML: `Deep_dive/` diagnostic + inference pipeline (leakage/overfitting che
 | `Antivirus_Engine/src/core/types.rs` | shared Rust types |
 | **`Antivirus_Engine/src/core/action/mod.rs`** | **post-verdict action module exports** |
 | **`Antivirus_Engine/src/core/action/executor.rs`** | **quarantine, firewall, dump, persistence, isolation** |
-| `UI/src-tauri/src/main.rs` | Tauri IPC commands, daemon lifecycle, `export_incident_report` |
-| `UI/src/store/index.ts` | Zustand store (all UI state) |
+| `UI/src-tauri/src/main.rs` | Tauri IPC commands, daemon lifecycle, `export_incident_report`, `scan_all` |
+| `UI/src/store/index.ts` | Zustand store (all UI state, incl. `lastScanDurationMs`, `scanAll`) |
 | `UI/src/types/index.ts` | TypeScript types (source of truth for UI contracts) |
 | `UI/src/lib/entityUtils.ts` | `buildProcessEntities`, `buildProcessEdges`, orphan helpers |
 | `UI/src/components/ThreatGraph.tsx` | entity graph rendering, fallback aggregation |
+| `UI/src/components/Scanner.tsx` | file/dir/all scan UI; live elapsed timer + final duration badge |
 | `Antivirus_Engine/src/core/network/Feature_extractor/ML_IDS/preprocessing_pipeline.py` | network XGBoost inference |
 | `Antivirus_Engine/src/core/process/Sys_API/preprocessing_pipeline.py` | GRU training/inference |
 
@@ -222,3 +232,15 @@ Memory ML: `Deep_dive/` diagnostic + inference pipeline (leakage/overfitting che
 - **UI wiring for new action commands** — `quarantine_file`, `block_ip`, `dump_memory`, `check_persistence`, `isolate_network`, `restore_network`, `export_incident_report` are registered in Tauri but the React components (`GraphVerdict.tsx`, a `Settings.tsx`, a `QuarantineManager.tsx`) that call them are not yet built
 - **`is_lolbin` UI badge** — `GraphNodeData` in `UI/src/types/index.ts` needs `is_lolbin: boolean` added, then `ThreatGraph.tsx` can render the "LOLBin" badge on vector nodes
 - **Autonomous mode** — `autonomousMode` flag in Zustand store + Settings toggle not yet implemented
+
+## Completed Work (recent)
+- **`scan_all.rs`** — system-wide file scanner with incremental mtime+size cache, thread-pool (one `FileSystemScanner` per worker via `Arc<Mutex<Receiver>>`), priority-first ordering, and `ScanScheduler` background thread. Documented in `SCAN_ALL.md`.
+- **Scan All UI** — `Scanner.tsx` gains a Scan All button; a `setInterval` live timer shows elapsed seconds while scanning; a duration badge shows the final time once complete. `store/index.ts` exposes `scanAll()` and `lastScanDurationMs`.
+- **Heuristics — utils integration** — `check_magic_bytes` uses `utils::is_pe_file`; `check_entropy` uses `utils::calculate_entropy`; `analyze()` calls `utils::compute_sha256` (hash was previously always `None`). Duplicate `shannon_entropy` method removed.
+- **Heuristics — single-read optimisation** — file opened once; magic bytes, entropy, content analysis, and SHA-256 all share the in-memory buffer. Eliminates 3 redundant file opens per scan on files ≤10 MiB.
+- **Heuristics — extension binary search** — sorted extension tables + `binary_search`; extension lowercased once per call. `test_extension_arrays_sorted` guards sort order.
+- **Heuristics — binary-safe content scan** — `from_utf8_lossy` replaces `read_to_string`; binary executables now get full content analysis.
+- **Heuristics — script coverage** — `.py/.sh/.rb/.pl/.php/.lua` included in ransomware-phrase and keyword checks.
+- **Heuristics — static name tables** — `RANSOMWARE_FILENAMES`, `MALWARE_FILENAMES`, `RANSOMWARE_EXTENSIONS` are `static`; `primary_category` is a zero-cost enum; `signal_source` is `&'static str`.
+- **Memory scanner — false-positive reduction** — 3-tier trust model (SystemOs / JitRuntime / TrustedInstall / Unknown); `KNOWN_JIT_PROCESSES` expanded to ~90 entries; shellcode sequence patterns added; NOP/INT3 thresholds tightened; content sample enlarged to 512 bytes.
+- **`utils::compute_sha256_from_bytes`** — computes SHA-256 from a `&[u8]` slice; used by heuristics to avoid re-opening small files.

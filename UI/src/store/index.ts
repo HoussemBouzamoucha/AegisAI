@@ -21,8 +21,10 @@ interface AppState {
   scanResults: ScanResult[];
   scanStats: DirectoryScanResult['statistics'] | null;
   scanError: string | null;
+  lastScanDurationMs: number | null;
   scanFile: (path: string) => Promise<void>;
   scanDirectory: (path: string) => Promise<void>;
+  scanAll: () => Promise<void>;
   clearScan: () => void;
 
   processScanning: boolean;
@@ -165,15 +167,17 @@ export const useStore = create<AppState>((set, get) => ({
   scanResults: [],
   scanStats: null,
   scanError: null,
+  lastScanDurationMs: null,
 
   scanFile: async (path) => {
-    set({ scanning: true, scanResults: [], scanStats: null, scanError: null });
+    set({ scanning: true, scanResults: [], scanStats: null, scanError: null, lastScanDurationMs: null });
     const t0 = Date.now();
     try {
       const result = await invoke<ScanOutput>('scan_file', { path });
       if (!result.success) throw new Error(result.error ?? 'Scan failed');
       const files = (result.files ?? []).map(normalizeScanResult);
-      set({ scanResults: files, scanStats: result.statistics });
+      const durationMs = Date.now() - t0;
+      set({ scanResults: files, scanStats: result.statistics, lastScanDurationMs: durationMs });
       const s = result.statistics;
       get().addHistory({
         id: crypto.randomUUID(),
@@ -186,7 +190,7 @@ export const useStore = create<AppState>((set, get) => ({
           suspicious: s.suspicious_files,
           malicious:  s.malicious_files,
         },
-        durationMs: Date.now() - t0,
+        durationMs,
       });
     } catch (e: any) {
       set({ scanError: String(e) });
@@ -196,13 +200,14 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   scanDirectory: async (path) => {
-    set({ scanning: true, scanResults: [], scanStats: null, scanError: null });
+    set({ scanning: true, scanResults: [], scanStats: null, scanError: null, lastScanDurationMs: null });
     const t0 = Date.now();
     try {
       const result = await invoke<DirectoryScanResult>('scan_directory', { path });
       if (!result.success) throw new Error(result.error ?? 'Scan failed');
       const files = (result.files ?? []).map(normalizeScanResult);
-      set({ scanResults: files, scanStats: result.statistics });
+      const durationMs = Date.now() - t0;
+      set({ scanResults: files, scanStats: result.statistics, lastScanDurationMs: durationMs });
       const s = result.statistics;
       get().addHistory({
         id: crypto.randomUUID(),
@@ -215,7 +220,7 @@ export const useStore = create<AppState>((set, get) => ({
           suspicious: s.suspicious_files,
           malicious:  s.malicious_files,
         },
-        durationMs: Date.now() - t0,
+        durationMs,
       });
     } catch (e: any) {
       set({ scanError: String(e) });
@@ -224,7 +229,37 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  clearScan: () => set({ scanResults: [], scanStats: null, scanError: null }),
+  scanAll: async () => {
+    set({ scanning: true, scanResults: [], scanStats: null, scanError: null, lastScanDurationMs: null });
+    const t0 = Date.now();
+    try {
+      const result = await invoke<ScanOutput>('scan_all');
+      if (!result.success) throw new Error(result.error ?? 'Full scan failed');
+      const files = (result.files ?? []).map(normalizeScanResult);
+      const durationMs = Date.now() - t0;
+      set({ scanResults: files, scanStats: result.statistics, lastScanDurationMs: durationMs });
+      const s = result.statistics;
+      get().addHistory({
+        id: crypto.randomUUID(),
+        timestamp: new Date(),
+        path: '[FULL SYSTEM SCAN]',
+        type: 'directory',
+        stats: {
+          total:      s.total_files,
+          clean:      s.clean_files,
+          suspicious: s.suspicious_files,
+          malicious:  s.malicious_files,
+        },
+        durationMs,
+      });
+    } catch (e: any) {
+      set({ scanError: String(e) });
+    } finally {
+      set({ scanning: false });
+    }
+  },
+
+  clearScan: () => set({ scanResults: [], scanStats: null, scanError: null, lastScanDurationMs: null }),
 
   processScanning: false,
   processes: [],

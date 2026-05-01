@@ -1,250 +1,369 @@
 """
-Diagnostics — check for leakage, overfitting, and inflated metrics.
+Malware Memory-Forensics — Inference Engine
+============================================
+Loads a trained model + preprocessor and exposes a clean API for
+your application to call.
 
-Run AFTER pipeline.py + train.py. Reads /content/splits.npz and optionally
-retrains small probes. Produces a leakage_report.txt and plots.
+Supported model formats
+-----------------------
+  - scikit-learn estimators  (RandomForest, LogisticRegression)
+  - XGBoost  (XGBClassifier saved with joblib)
+  - LightGBM (LGBMClassifier saved with joblib)
+  - ONNX     (.onnx files) — optional, needs onnxruntime
 
-Six diagnostics, in order of suspicion:
+Quick start
+-----------
+    from inference import MalwareDetector
 
-  1. Single-feature AUC           — can any single feature already hit ~1.0?
-  2. Train vs test gap            — classic overfitting check
-  3. Permutation test on labels   — shuffle y_train, does AUC stay high? (should drop to 0.5)
-  4. Duplicate / near-duplicate rows across train and test splits
-  5. Feature distribution drift   — KS test on every feature, benign vs malware
-  6. Held-out-feature probe       — drop the top SHAP feature, retrain, see if AUC collapses
+    detector = MalwareDetector.load(
+        model_path="./artifacts/winner_LightGBM.joblib",   # or .onnx
+        preprocessor_dir="./artifacts",
+    )
+
+    # --- batch prediction from a Volatility DataFrame ---
+    results = detector.predict_df(df)          # list[dict]
+
+    # --- single snapshot from a dict (e.g. from a live scan) ---
+    result  = detector.predict_dict(record)    # dict
+
+    # --- numpy array if you handle preprocessing yourself ---
+    labels, probas = detector.predict_array(X_float32)
 """
 
 from __future__ import annotations
 
+import os
+import json
+import warnings
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score
-from scipy.stats import ks_2samp
-import matplotlib.pyplot as plt
+import joblib
+
+from preprocess import MalMemPreprocessor
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
-SPLITS_PATH = "/content/splits.npz"
-OUT_DIR     = "/content"
+# ============================================================================
+# RESULT DATACLASS (plain dict for maximum compatibility)
+# ============================================================================
+def _make_result(label: int, proba: float, threshold: float) -> dict:
+    """
+    Returns a prediction result dict.
 
-
-def load():
-    d = np.load(SPLITS_PATH, allow_pickle=True)
+    Keys
+    ----
+    label     : int   — 1 = malware, 0 = benign
+    proba     : float — probability of malware (0–1)
+    verdict   : str   — 'MALWARE' | 'BENIGN'
+    confidence: str   — 'HIGH' (≥0.85 or ≤0.15) | 'MEDIUM' | 'LOW'
+    threshold : float — decision threshold used
+    """
+    verdict = "MALWARE" if label == 1 else "BENIGN"
+    if proba >= 0.85 or proba <= 0.15:
+        confidence = "HIGH"
+    elif proba >= 0.70 or proba <= 0.30:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
     return {
-        "X_train": d["X_train"], "y_train": d["y_train"],
-        "X_val":   d["X_val"],   "y_val":   d["y_val"],
-        "X_test":  d["X_test"],  "y_test":  d["y_test"],
-        "feature_names": d["feature_names"].tolist(),
+        "label":      int(label),
+        "proba":      round(float(proba), 6),
+        "verdict":    verdict,
+        "confidence": confidence,
+        "threshold":  threshold,
     }
 
 
 # ============================================================================
-# DIAGNOSTIC 1 — Single-feature AUC
+# MODEL LOADERS
 # ============================================================================
-def single_feature_auc(X_train, y_train, X_test, y_test, names):
-    """Fit LogReg on each feature alone. If any hits AUC > 0.99, that feature
-    is doing all the work — a strong leakage indicator."""
-    results = []
-    for i, name in enumerate(names):
-        xt = X_train[:, [i]]
-        xe = X_test[:, [i]]
-        # Skip zero-variance features
-        if xt.std() < 1e-9:
-            continue
-        model = LogisticRegression(max_iter=500)
-        model.fit(xt, y_train)
-        proba = model.predict_proba(xe)[:, 1]
-        auc = roc_auc_score(y_test, proba)
-        results.append((name, auc))
-    df = pd.DataFrame(results, columns=["feature", "auc"]).sort_values("auc", ascending=False)
-    return df
+def _load_sklearn_model(path: str):
+    """Load any joblib-serialised sklearn/xgb/lgb model."""
+    return joblib.load(path)
+
+
+def _load_onnx_model(path: str):
+    """Load an ONNX model. Requires onnxruntime."""
+    try:
+        import onnxruntime as ort
+    except ImportError as e:
+        raise ImportError(
+            "onnxruntime is required to load .onnx models. "
+            "Install it with: pip install onnxruntime"
+        ) from e
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    return session
+
+
+def _predict_sklearn(model, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    labels = model.predict(X)
+    probas = model.predict_proba(X)[:, 1]
+    return labels.astype(int), probas.astype(np.float32)
+
+
+def _predict_onnx(session, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    import onnxruntime as ort  # noqa: F401 – already imported during load
+    input_name  = session.get_inputs()[0].name
+    output_names = [o.name for o in session.get_outputs()]
+    X_f32 = X.astype(np.float32)
+    outputs = session.run(output_names, {input_name: X_f32})
+    # Outputs follow sklearn convention: [labels, probas_dict_or_array]
+    labels = np.array(outputs[0]).astype(int)
+    raw_proba = outputs[1]
+    if isinstance(raw_proba[0], dict):
+        probas = np.array([p[1] for p in raw_proba], dtype=np.float32)
+    else:
+        probas = np.array(raw_proba, dtype=np.float32)
+        if probas.ndim == 2:
+            probas = probas[:, 1]
+    return labels, probas
 
 
 # ============================================================================
-# DIAGNOSTIC 2 — Train vs test gap
+# MalwareDetector — main application class
 # ============================================================================
-def train_test_gap(X_train, y_train, X_test, y_test):
-    """Fit a strong but not-too-strong model; compare train and test AUC.
-    A gap > ~0.02 usually means overfitting."""
-    from sklearn.ensemble import RandomForestClassifier
-    model = RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=0)
-    model.fit(X_train, y_train)
-    train_auc = roc_auc_score(y_train, model.predict_proba(X_train)[:, 1])
-    test_auc  = roc_auc_score(y_test,  model.predict_proba(X_test)[:,  1])
-    return train_auc, test_auc
+class MalwareDetector:
+    """
+    End-to-end malware detector: preprocessing → model → structured result.
+
+    Parameters
+    ----------
+    model             : fitted sklearn/xgb/lgb estimator or ONNX session
+    preprocessor      : fitted MalMemPreprocessor
+    threshold         : float, decision threshold (default 0.5)
+    model_name        : str, display name logged in results
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        preprocessor: MalMemPreprocessor,
+        threshold: float = 0.5,
+        model_name: str = "unknown",
+    ) -> None:
+        self._model       = model
+        self._pre         = preprocessor
+        self._threshold   = threshold
+        self._model_name  = model_name
+        self._is_onnx     = _is_onnx_session(model)
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+    @classmethod
+    def load(
+        cls,
+        model_path: str,
+        preprocessor_dir: str = "./artifacts",
+        threshold: float = 0.5,
+    ) -> "MalwareDetector":
+        """
+        Load a detector from disk.
+
+        Parameters
+        ----------
+        model_path       : path to a .joblib (sklearn/xgb/lgb) or .onnx model
+        preprocessor_dir : directory containing preprocessor.joblib and
+                           feature_names.json (output of MalMemPreprocessor.save)
+        threshold        : decision threshold (default 0.5)
+        """
+        path = Path(model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Model not found: '{model_path}'")
+
+        if path.suffix == ".onnx":
+            model = _load_onnx_model(str(path))
+        else:
+            model = _load_sklearn_model(str(path))
+
+        pre = MalMemPreprocessor.load(preprocessor_dir)
+
+        print(f"Loaded model '{path.name}' | threshold={threshold} | features={pre.n_features}")
+        return cls(model, pre, threshold=threshold, model_name=path.stem)
+
+    # ------------------------------------------------------------------
+    # Predict from raw Volatility DataFrame
+    # ------------------------------------------------------------------
+    def predict_df(self, df: pd.DataFrame) -> list[dict]:
+        """
+        Run end-to-end prediction on a Volatility DataFrame.
+        Each row corresponds to one memory snapshot.
+
+        Returns a list of result dicts (one per row).
+        """
+        X = self._pre.transform(df)
+        return self._predict_X(X)
+
+    # ------------------------------------------------------------------
+    # Predict from a single dict (live scan scenario)
+    # ------------------------------------------------------------------
+    def predict_dict(self, record: dict) -> dict:
+        """
+        Predict a single memory snapshot given as a dict.
+        Keys must match the 55 Volatility column names.
+
+        Example
+        -------
+        result = detector.predict_dict({
+            "pslist.nproc": 52,
+            "malfind.ninjections": 3,
+            "malfind.protection": 0x40,
+            ...
+        })
+        # → {"label": 1, "proba": 0.9823, "verdict": "MALWARE", ...}
+        """
+        X = self._pre.transform_dict(record)
+        return self._predict_X(X)[0]
+
+    # ------------------------------------------------------------------
+    # Predict from pre-processed numpy array (bypass preprocessing)
+    # ------------------------------------------------------------------
+    def predict_array(
+        self, X: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Predict on an already-preprocessed float32 array.
+        Returns (labels, probas) as numpy arrays.
+        Useful when you manage preprocessing separately.
+        """
+        labels, probas = self._run_model(X)
+        return labels, probas
+
+    # ------------------------------------------------------------------
+    # Batch scoring — returns a DataFrame with results appended
+    # ------------------------------------------------------------------
+    def score_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Like predict_df() but returns the original DataFrame with three
+        extra columns: 'pred_label', 'pred_proba', 'verdict'.
+        """
+        results = self.predict_df(df)
+        out = df.copy()
+        out["pred_label"] = [r["label"]   for r in results]
+        out["pred_proba"] = [r["proba"]   for r in results]
+        out["verdict"]    = [r["verdict"] for r in results]
+        return out
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
+    @threshold.setter
+    def threshold(self, value: float) -> None:
+        if not 0.0 < value < 1.0:
+            raise ValueError("threshold must be in (0, 1)")
+        self._threshold = value
+
+    @property
+    def feature_names(self) -> list[str]:
+        return self._pre.feature_names
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _run_model(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self._is_onnx:
+            return _predict_onnx(self._model, X)
+        return _predict_sklearn(self._model, X)
+
+    def _predict_X(self, X: np.ndarray) -> list[dict]:
+        _, probas = self._run_model(X)
+        labels = (probas >= self._threshold).astype(int)
+        return [_make_result(int(l), float(p), self._threshold)
+                for l, p in zip(labels, probas)]
 
 
 # ============================================================================
-# DIAGNOSTIC 3 — Permutation test on labels
+# Utility: batch predict from a parquet / CSV file
 # ============================================================================
-def permutation_test(X_train, y_train, X_test, y_test, n_perms=3):
-    """Shuffle y_train randomly. If the model can STILL separate, the 'signal'
-    is really in the splitting procedure, not in real features.
-    Expected AUC under permutation: ~0.5. Anything much above = leakage."""
-    rng = np.random.default_rng(0)
-    aucs = []
-    for _ in range(n_perms):
-        y_shuf = rng.permutation(y_train)
-        model = LogisticRegression(max_iter=500)
-        model.fit(X_train, y_shuf)
-        aucs.append(roc_auc_score(y_test, model.predict_proba(X_test)[:, 1]))
-    return aucs
+def predict_file(
+    data_path: str,
+    model_path: str,
+    preprocessor_dir: str = "./artifacts",
+    output_path: str | None = None,
+    threshold: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Convenience function: load a parquet or CSV, run predictions, optionally save.
+
+    Parameters
+    ----------
+    data_path        : .parquet or .csv file with Volatility features
+    model_path       : .joblib or .onnx model
+    preprocessor_dir : directory with saved preprocessor artifacts
+    output_path      : if given, write results as CSV here
+    threshold        : decision threshold
+
+    Returns
+    -------
+    DataFrame with original columns + pred_label, pred_proba, verdict
+    """
+    ext = Path(data_path).suffix.lower()
+    if ext == ".parquet":
+        df = pd.read_parquet(data_path)
+    elif ext in (".csv", ".tsv"):
+        df = pd.read_csv(data_path)
+    else:
+        raise ValueError(f"Unsupported file format: '{ext}'. Use .parquet or .csv")
+
+    detector = MalwareDetector.load(model_path, preprocessor_dir, threshold)
+    results  = detector.score_df(df)
+
+    if output_path:
+        results.to_csv(output_path, index=False)
+        print(f"Saved predictions to '{output_path}'")
+
+    n_malware = (results["pred_label"] == 1).sum()
+    print(f"Predictions: {n_malware}/{len(results)} rows flagged as MALWARE "
+          f"({100*n_malware/len(results):.1f}%)")
+    return results
 
 
 # ============================================================================
-# DIAGNOSTIC 4 — Cross-split duplicates
+# Helper — detect ONNX session without importing onnxruntime at module level
 # ============================================================================
-def duplicate_check(X_train, X_test):
-    """Hash each row; count how many test rows have an exact match in train.
-    MalMem2022 in particular has repeated captures — a test row that is
-    identical to a train row turns evaluation into memorization."""
-    # Round to avoid float32 hash noise
-    Xt = np.round(X_train, 6)
-    Xe = np.round(X_test, 6)
-    train_hashes = {hash(row.tobytes()) for row in Xt}
-    dups = sum(1 for row in Xe if hash(row.tobytes()) in train_hashes)
-    return dups, len(Xe)
+def _is_onnx_session(obj: Any) -> bool:
+    try:
+        import onnxruntime as ort
+        return isinstance(obj, ort.InferenceSession)
+    except ImportError:
+        return False
 
 
 # ============================================================================
-# DIAGNOSTIC 5 — Feature distribution drift (benign vs malware)
-# ============================================================================
-def feature_drift(X_train, y_train, names, top_k=10):
-    """KS test comparing benign vs malware distribution per feature.
-    Huge separations (KS > 0.8) suggest the distributions barely overlap —
-    which makes classification trivial but may not reflect a real-world
-    deployment where benign and malware processes run on the same machine."""
-    benign = X_train[y_train == 0]
-    malware = X_train[y_train == 1]
-    rows = []
-    for i, name in enumerate(names):
-        if benign[:, i].std() < 1e-9 and malware[:, i].std() < 1e-9:
-            continue
-        stat, _ = ks_2samp(benign[:, i], malware[:, i])
-        rows.append((name, stat))
-    df = pd.DataFrame(rows, columns=["feature", "ks_statistic"]).sort_values(
-        "ks_statistic", ascending=False
-    )
-    return df
-
-
-# ============================================================================
-# DIAGNOSTIC 6 — Held-out-feature probe
-# ============================================================================
-def holdout_feature_probe(X_train, y_train, X_test, y_test, names, drop_feature):
-    """Drop the top-SHAP feature and retrain. If AUC barely moves, the model
-    has backups. If AUC collapses, that one feature was carrying the result —
-    which is fragile for deployment."""
-    idx = names.index(drop_feature)
-    keep = [i for i in range(len(names)) if i != idx]
-    model = RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=0)
-    model.fit(X_train[:, keep], y_train)
-    auc = roc_auc_score(y_test, model.predict_proba(X_test[:, keep])[:, 1])
-    return auc
-
-
-# ============================================================================
-# RUN ALL + REPORT
+# CLI entry point
 # ============================================================================
 if __name__ == "__main__":
-    Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
-    splits = load()
-    X_train, y_train = splits["X_train"], splits["y_train"]
-    X_test,  y_test  = splits["X_test"],  splits["y_test"]
-    names = splits["feature_names"]
+    import argparse
 
-    report_lines = []
-    def log(s): print(s); report_lines.append(s)
+    parser = argparse.ArgumentParser(
+        description="Run malware inference on a Volatility feature file."
+    )
+    parser.add_argument("data",  help="Input .parquet or .csv file")
+    parser.add_argument("model", help="Trained model (.joblib or .onnx)")
+    parser.add_argument("--artifacts-dir", default="./artifacts",
+                        help="Directory containing preprocessor artifacts (default: ./artifacts)")
+    parser.add_argument("--output", default=None,
+                        help="Save predictions to this CSV path")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Decision threshold (default: 0.5)")
+    args = parser.parse_args()
 
-    log("=" * 70)
-    log("DIAGNOSTIC 1 — Single-feature AUC")
-    log("=" * 70)
-    sf = single_feature_auc(X_train, y_train, X_test, y_test, names)
-    log("Top 10 features by single-feature test AUC:")
-    log(sf.head(10).to_string(index=False))
-    n_high = (sf["auc"] > 0.99).sum()
-    n_very_high = (sf["auc"] > 0.95).sum()
-    log(f"\n{n_high} features alone achieve AUC > 0.99")
-    log(f"{n_very_high} features alone achieve AUC > 0.95")
-    if n_high > 0:
-        log(">>> SUSPICIOUS: at least one feature is a near-perfect classifier on its own.")
-        log("    This is the #1 leakage signature.")
-
-    log("\n" + "=" * 70)
-    log("DIAGNOSTIC 2 — Train vs test AUC gap (overfitting)")
-    log("=" * 70)
-    train_auc, test_auc = train_test_gap(X_train, y_train, X_test, y_test)
-    gap = train_auc - test_auc
-    log(f"Train AUC: {train_auc:.4f}")
-    log(f"Test  AUC: {test_auc:.4f}")
-    log(f"Gap      : {gap:+.4f}")
-    if gap > 0.02:
-        log(">>> Overfitting: train significantly beats test.")
-    elif test_auc > 0.999 and train_auc > 0.999:
-        log(">>> Both essentially perfect — problem is too easy or leaked.")
-
-    log("\n" + "=" * 70)
-    log("DIAGNOSTIC 3 — Permutation test (labels shuffled)")
-    log("=" * 70)
-    perm_aucs = permutation_test(X_train, y_train, X_test, y_test)
-    log(f"AUCs after shuffling train labels: {[f'{a:.4f}' for a in perm_aucs]}")
-    mean_perm = np.mean(perm_aucs)
-    log(f"Mean: {mean_perm:.4f}  (expected ~0.5)")
-    if abs(mean_perm - 0.5) > 0.1:
-        log(">>> SUSPICIOUS: model separates test even when train labels are random.")
-        log("    This means train and test rows have structural overlap.")
-    else:
-        log("    Good: when train labels are random, the model cannot predict test.")
-
-    log("\n" + "=" * 70)
-    log("DIAGNOSTIC 4 — Duplicate rows across train/test")
-    log("=" * 70)
-    dups, n_test = duplicate_check(X_train, X_test)
-    log(f"Test rows with exact match in train: {dups}/{n_test} ({100*dups/n_test:.2f}%)")
-    if dups > 0:
-        log(">>> Duplicates found: test set contains rows the model has seen verbatim.")
-
-    log("\n" + "=" * 70)
-    log("DIAGNOSTIC 5 — Feature drift (KS test, benign vs malware)")
-    log("=" * 70)
-    drift = feature_drift(X_train, y_train, names)
-    log("Top 10 features by KS statistic:")
-    log(drift.head(10).to_string(index=False))
-    n_huge = (drift["ks_statistic"] > 0.8).sum()
-    log(f"\n{n_huge} features have KS > 0.8 (distributions barely overlap)")
-    if n_huge > 5:
-        log(">>> Several features have near-disjoint distributions.")
-        log("    Classification is trivial; real deployment will differ.")
-
-    log("\n" + "=" * 70)
-    log("DIAGNOSTIC 6 — Drop top feature, see if AUC survives")
-    log("=" * 70)
-    top_feat = sf.iloc[0]["feature"]
-    log(f"Top single-feature classifier: {top_feat} (AUC={sf.iloc[0]['auc']:.4f})")
-    auc_without = holdout_feature_probe(X_train, y_train, X_test, y_test, names, top_feat)
-    log(f"Test AUC after dropping {top_feat}: {auc_without:.4f}")
-    if auc_without < 0.90:
-        log(">>> Dropping one feature collapses the model — brittle.")
-    else:
-        log("    Model has backups; other features still carry signal.")
-
-    # Save report
-    with open(f"{OUT_DIR}/leakage_report.txt", "w") as f:
-        f.write("\n".join(report_lines))
-    log(f"\nFull report saved to {OUT_DIR}/leakage_report.txt")
-
-    # Plot: single-feature AUC distribution
-    plt.figure(figsize=(10, 5))
-    plt.hist(sf["auc"], bins=50, edgecolor="black")
-    plt.axvline(0.95, color="orange", linestyle="--", label="0.95 threshold")
-    plt.axvline(0.99, color="red", linestyle="--", label="0.99 (leakage zone)")
-    plt.xlabel("Single-feature test AUC")
-    plt.ylabel("Number of features")
-    plt.title("Distribution of single-feature classifier AUCs")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{OUT_DIR}/single_feature_auc_hist.png", dpi=120, bbox_inches="tight")
-    plt.close()
-    print(f"Saved {OUT_DIR}/single_feature_auc_hist.png")
+    predict_file(
+        data_path=args.data,
+        model_path=args.model,
+        preprocessor_dir=args.artifacts_dir,
+        output_path=args.output,
+        threshold=args.threshold,
+    )
