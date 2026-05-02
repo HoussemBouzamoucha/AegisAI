@@ -808,68 +808,50 @@ async fn get_engine_status(
 
 // ─── Full system scan ─────────────────────────────────────────────────────────
 
-/// Scan the highest-risk locations on the machine without attempting a full
-/// C:\ walk (which the serial daemon engine cannot complete in time).
+/// Full-system scan delegated entirely to the daemon's `scan-all` command,
+/// which runs [`SystemScanner`] internally (parallel thread pool + incremental
+/// mtime cache + [`ScanPrioritizer`]).
 ///
-/// Roots scanned in order:
-///   1. `%USERPROFILE%`   — Downloads, Desktop, Documents, AppData (persistence + drops)
-///   2. `%SystemRoot%\Temp` — Dropper staging area
-///   3. `%ProgramData%`   — Service abuse, malware persistence
-///   4. `%SystemRoot%\System32` — DLL hijacking, in-place malware drops
+/// A single long-running daemon request replaces the previous loop of four
+/// sequential `scan-dir` requests, each of which timed out at 300 s on large
+/// roots like `%USERPROFILE%` and `%SystemRoot%\System32`.
 ///
-/// Each root is given a 5-minute daemon timeout.  Roots that timeout or fail
-/// are skipped with a warning; results from the remaining roots are merged.
+/// The daemon applies its own skip rules, size caps, and cache — no timeout
+/// coordination or result merging is needed on the Tauri side.
 #[tauri::command]
 async fn scan_all(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<ScanOutput, String> {
-    let sys_root = std::env::var("SystemRoot")
-        .unwrap_or_else(|_| r"C:\Windows".to_string());
-    let profile = std::env::var("USERPROFILE")
-        .unwrap_or_else(|_| r"C:\Users\Public".to_string());
-    let programdata = std::env::var("ProgramData")
-        .unwrap_or_else(|_| r"C:\ProgramData".to_string());
+    eprintln!("scan_all: delegating to daemon scan-all command");
 
-    let roots = vec![
-        profile,
-        format!(r"{}\Temp", sys_root),
-        programdata,
-        format!(r"{}\System32", sys_root),
-    ];
+    let request = serde_json::json!({ "id": next_id(), "cmd": "scan-all" });
 
-    let mut all_files = Vec::<ScanResult>::new();
-    let mut total = ScanStats {
-        total_files: 0, clean_files: 0, suspicious_files: 0,
-        malicious_files: 0, error_files: 0, total_size_mb: 0.0,
-    };
+    // SystemScanner uses a thread pool and incremental cache so the wall-clock
+    // time is a fraction of a serial walk.  30 minutes is a generous ceiling
+    // that covers a cold (no-cache) first run over tens of thousands of files.
+    let json = daemon_request(&state, request, Duration::from_secs(1800))
+        .map_err(|e| format!("scan-all daemon error: {}", e))?;
 
-    for root in &roots {
-        eprintln!("scan_all: scanning '{}'…", root);
-        let request = serde_json::json!({
-            "id": next_id(), "cmd": "scan-dir", "path": root,
-        });
-        match daemon_request(&state, request, Duration::from_secs(300)) {
-            Ok(json) => {
-                if let Some(err) = json["error"].as_str() {
-                    eprintln!("scan_all: '{}' daemon error — {}", root, err);
-                    continue;
-                }
-                if let Some(arr) = json["files"].as_array() {
-                    all_files.extend(arr.iter().map(|f| parse_scan_result(f, "")));
-                }
-                let s = &json["statistics"];
-                total.total_files      += s["total_files"].as_u64().unwrap_or(0);
-                total.clean_files      += s["clean_files"].as_u64().unwrap_or(0);
-                total.suspicious_files += s["suspicious_files"].as_u64().unwrap_or(0);
-                total.malicious_files  += s["malicious_files"].as_u64().unwrap_or(0);
-                total.error_files      += s["error_files"].as_u64().unwrap_or(0);
-                total.total_size_mb    += s["total_size_mb"].as_f64().unwrap_or(0.0);
-            }
-            Err(e) => eprintln!("scan_all: '{}' skipped — {}", root, e),
-        }
+    if let Some(err) = json["error"].as_str() {
+        return Err(format!("scan-all: {}", err));
     }
 
-    Ok(ScanOutput { success: true, files: all_files, statistics: total, error: None })
+    let files: Vec<ScanResult> = json["files"]
+        .as_array()
+        .map(|arr| arr.iter().map(|f| parse_scan_result(f, "")).collect())
+        .unwrap_or_default();
+
+    let s = &json["statistics"];
+    let statistics = ScanStats {
+        total_files:      s["total_files"].as_u64().unwrap_or(0),
+        clean_files:      s["clean_files"].as_u64().unwrap_or(0),
+        suspicious_files: s["suspicious_files"].as_u64().unwrap_or(0),
+        malicious_files:  s["malicious_files"].as_u64().unwrap_or(0),
+        error_files:      s["error_files"].as_u64().unwrap_or(0),
+        total_size_mb:    s["total_size_mb"].as_f64().unwrap_or(0.0),
+    };
+
+    Ok(ScanOutput { success: true, files, statistics, error: None })
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────

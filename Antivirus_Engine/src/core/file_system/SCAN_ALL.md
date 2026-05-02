@@ -1,13 +1,14 @@
-# `scan_all.rs` — Full-System Scanner & Scheduler
+# `scan_all.rs` — Full-System Scanner, Prioritizer & Scheduler
 
 ## Overview
 
 `scan_all.rs` adds **machine-wide scanning** to AegisAI on top of the existing
-per-file / per-directory `FileSystemScanner`.  It introduces two public types:
+per-file / per-directory `FileSystemScanner`.  It introduces three public types:
 
 | Type | Purpose |
 |------|---------|
 | `SystemScanner` | Collects paths, applies skip/priority rules, and dispatches to a thread pool |
+| `ScanPrioritizer` | Scores every candidate file on 4 risk axes and sorts the queue highest-risk first |
 | `ScanScheduler` | Wraps `SystemScanner` and fires full scans automatically on a configurable interval |
 
 ---
@@ -22,14 +23,19 @@ ScanScheduler (background thread)
         │     ├── Walk all configured roots (WalkDir)
         │     ├── Prune skip-dirs early (no descent into Windows\WinSxS etc.)
         │     ├── Filter individual files (extension, size limit)
+        │     ├── Read (size, mtime) once per file from the WalkDir entry
         │     └── Partition into priority_paths / normal_paths
         │
-        ├── 2. filter_cached()          [incremental mode only]
+        ├── 2. ScanPrioritizer::sort()    ← NEW
+        │     ├── Score each file 0–100 across 4 axes (see below)
+        │     └── Stable-sort combined list → highest-risk files move to front
+        │
+        ├── 3. filter_cached()          [incremental mode only]
         │     └── Compare (mtime_secs, file_size) against FileStateCache
         │         → unchanged clean files → synthetic Clean result (no re-scan)
         │         → changed / unknown files → passed to parallel_scan
         │
-        └── 3. parallel_scan()
+        └── 4. parallel_scan()
               ├── N worker threads (each owns its own FileSystemScanner)
               ├── Work channel: main → workers  (Arc<Mutex<Receiver<PathBuf>>>)
               ├── Result channel: workers → collector
@@ -68,10 +74,46 @@ of irrelevant files):
 
 ---
 
-### 2 — Priority-first scanning
+### 2 — `ScanPrioritizer` — fine-grained risk scoring
 
-High-risk directories are scanned **before** generic ones so the most likely
-infection vectors surface early in the result stream:
+After the coarse priority/normal split, `ScanPrioritizer` assigns every file a
+score from **0 to 100** and stable-sorts the queue so the thread pool always
+picks up the highest-risk files first.  The scorer is entirely read-only — it
+never opens a file and uses only the path string plus the `(size, mtime)` values
+already collected by `collect_paths`.
+
+#### Scoring axes
+
+| Factor | Max pts | How it works |
+|--------|---------|--------------|
+| **Extension tier** | 40 | Native executables (`exe`, `dll`, `sys`, `drv`, `ocx`, `scr`, `cpl`, `com`) → 40 pts · Scripts & macro docs (`ps1`, `bat`, `vbs`, `js`, `hta`, `lnk`, `xlsm`, `docm` …) → 30 pts · Archives (`zip`, `7z`, `rar`, `cab` …) → 15 pts · Documents (`pdf`, `doc`, `xls` …) → 10 pts · Everything else → 5 pts |
+| **Location risk** | 30 | High-risk locations (`Temp`, `Downloads`, `Desktop`, `AppData\Local\Temp`, `AppData\Roaming`, `Startup`, `Tasks`, `ProgramData`) → 30 pts · Medium-risk (`System32`, `SysWOW64`, `Program Files`) → 15 pts · Elsewhere → 0 pts |
+| **Recency** | 20 | Modified < 1 hour ago → 20 pts · < 24 h → 15 pts · < 7 days → 10 pts · < 30 days → 5 pts · Older → 0 pts |
+| **Filename anomaly** | 10 | Double extension (`.pdf.exe`) → 10 pts · Suspicious stem keyword (`payload`, `dropper`, `inject`, `backdoor`, `mimikatz` … 26 patterns) → 8 pts · High-entropy stem ≥ 8 chars (Shannon > 4.0 bits) → 5 pts · Very short stem ≤ 3 chars → 3 pts |
+
+#### Score examples
+
+| File | Ext | Location | Recency | Filename | **Total** |
+|------|-----|----------|---------|----------|-----------|
+| `Downloads\payload.exe` (modified 5 min ago) | 40 | 30 | 20 | 8 | **98** |
+| `AppData\Local\Temp\abc.ps1` (1 day old) | 30 | 30 | 15 | 0 | **75** |
+| `System32\ntdll.dll` (2 years old) | 40 | 15 | 0 | 0 | **55** |
+| `Documents\report.pdf` (3 weeks old) | 10 | 0 | 5 | 0 | **15** |
+| `Pictures\photo.bmp` (6 months old) | 5 | 0 | 0 | 0 | **5** |
+
+#### Stable sort
+
+`ScanPrioritizer::sort` uses a **stable** sort, so files with identical scores
+preserve the coarse ordering already established by the priority/normal split —
+priority-location files always stay ahead of normal files when tied.
+
+---
+
+### 3 — Priority-first coarse split
+
+Before the prioritizer applies fine-grained scoring, paths are partitioned into
+two buckets so that high-risk locations are guaranteed to sort ahead of the
+normal bucket even in the event of equal scores:
 
 - `Downloads`, `Desktop` — common initial drop locations
 - `Temp`, `AppData\Local\Temp` — dropper staging areas
@@ -81,7 +123,7 @@ infection vectors surface early in the result stream:
 
 ---
 
-### 3 — Thread pool
+### 4 — Thread pool
 
 Each worker thread owns its own `FileSystemScanner` instance — no lock contention
 on scanner state.
@@ -99,7 +141,7 @@ Default thread count: **4**. Configurable via `SystemScanConfig::num_threads`
 
 ---
 
-### 4 — Incremental scan cache (`FileStateCache`)
+### 5 — Incremental scan cache (`FileStateCache`)
 
 The in-memory cache maps `PathBuf → (mtime_secs, file_size, ThreatLevel)`.
 
@@ -136,6 +178,30 @@ defaults (256 MB limit, 4 threads, incremental enabled).
 
 ---
 
+### `ScanPrioritizer`
+
+```rust
+// Construction (zero-size struct — cheap to create)
+ScanPrioritizer::new()
+
+// Score a single file (all inputs already known, no file I/O)
+prioritizer.score(
+    path:       &Path,
+    size:       u64,        // bytes
+    mtime_secs: u64,        // Unix seconds
+    now_secs:   u64,        // current Unix seconds (capture once per batch)
+) -> u32                    // 0..=100, higher = scan sooner
+
+// Sort a batch of (path, size, mtime) triples in-place, highest score first
+prioritizer.sort(paths: &mut Vec<(PathBuf, u64, u64)>, now_secs: u64)
+```
+
+`SystemScanner` holds a `ScanPrioritizer` internally and calls `sort` after
+`collect_paths`.  External callers can also obtain a reference via
+`scanner.prioritizer()` to score individual files without running a full scan.
+
+---
+
 ### `SystemScanner`
 
 ```rust
@@ -147,6 +213,7 @@ SystemScanner::default_roots() -> Vec<PathBuf>// helper: platform default roots
 // Operations
 scanner.scan(progress: Option<ProgressFn>) -> ScanAllResult
 scanner.clear_cache()                         // force full re-scan next time
+scanner.prioritizer() -> &ScanPrioritizer     // access the internal prioritizer
 ```
 
 `ProgressFn = Arc<dyn Fn(done: usize, total: usize, path: &Path) + Send + Sync>`
@@ -201,6 +268,28 @@ out of scope.
 ---
 
 ## Usage Examples
+
+### Score a single file without scanning
+
+```rust
+use crate::core::file_system::scan_all::ScanPrioritizer;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+let p = ScanPrioritizer::new();
+let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+// Would this file be queued early?
+let score = p.score(
+    std::path::Path::new(r"C:\Users\user\Downloads\setup.exe"),
+    512_000,   // 500 KB
+    now - 120, // modified 2 minutes ago
+    now,
+);
+// score ≈ 90  (exe=40 + Downloads=30 + <1h=20 + no anomaly=0)
+println!("Priority score: {score}/100");
+```
+
+---
 
 ### Minimal — on-demand full scan
 
@@ -306,7 +395,7 @@ Suggested integration points:
 
 | File | Role |
 |------|------|
-| `scan_all.rs` | This module — `SystemScanner` + `ScanScheduler` |
+| `scan_all.rs` | This module — `SystemScanner` + `ScanPrioritizer` + `ScanScheduler` |
 | `scanner.rs` | Per-file / per-directory scanner (called by `SystemScanner`) |
 | `heuristics.rs` | Heuristic analysis layer (used by `scanner.rs`) |
 | `yara_engine.rs` | YARA rule engine (used by `scanner.rs`) |
@@ -316,6 +405,32 @@ Suggested integration points:
 ---
 
 ## Design decisions
+
+**`ScanPrioritizer` is stateless and read-only**  
+The prioritizer is a zero-size struct with no mutable state.  It reads only what
+`collect_paths` already has — path string, file size, and mtime.  No file is
+opened, no external state is consulted.  This keeps the sort step cheap: a
+typical 50 000-file collection sorts in a few milliseconds, adding no measurable
+overhead before the thread pool starts.
+
+**Stable sort preserves coarse ordering on ties**  
+The coarse priority/normal split already places `Downloads`, `Temp`, and startup
+folders at the front of the slice.  Using a stable sort means that two files with
+identical priority scores keep their relative order from `collect_paths` — a tie
+between a file in `Downloads` and one in `Documents` always resolves in favour of
+`Downloads`.
+
+**Four axes rather than one composite signal**  
+Each axis captures a distinct dimension of risk.  A very old executable in
+`System32` scores differently from a brand-new script in `Temp` even though both
+are "suspicious".  Additive scoring lets each axis contribute proportionally;
+no single factor can suppress a strong signal from another.
+
+**Mtime read once in `collect_paths`, not again in `ScanPrioritizer`**  
+`collect_paths` returns `(PathBuf, size, mtime)` triples.  `ScanPrioritizer::sort`
+receives these triples directly and never calls `stat` again.  Previously
+`filter_cached` also re-read mtime from disk; it now uses the value from the
+tuple.  This halves the metadata syscall count in incremental mode.
 
 **One scanner per thread, not one shared scanner**  
 `FileSystemScanner` holds mutable YARA engine state.  Sharing it across threads

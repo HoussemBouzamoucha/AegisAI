@@ -4,6 +4,7 @@
 mod core;
 
 use core::file_system::scanner::FileSystemScanner;
+use core::file_system::scan_all::SystemScanner;
 use core::memory::scanner::MemoryScanner;
 use core::network::NetworkScanner;
 use core::process::ProcessScanner;
@@ -102,6 +103,7 @@ fn run_daemon() {
     io::stdout().flush().ok();
 
     let scanner         = FileSystemScanner::new();
+    let system_scanner  = SystemScanner::new();
     let process_scanner = ProcessScanner::new();
     let network_scanner = NetworkScanner::new();
     // FIX: MemoryScanner is now created once here instead of being
@@ -136,6 +138,7 @@ fn run_daemon() {
                 let path = request["path"].as_str().unwrap_or("");
                 daemon_scan_file(&scanner, Path::new(path), &id)
             }
+            "scan-all"       => daemon_scan_all(&system_scanner, &id),
             "scan-dir"       => {
                 let path = request["path"].as_str().unwrap_or("");
                 daemon_scan_dir(&scanner, Path::new(path), &id)
@@ -297,6 +300,43 @@ fn daemon_scan_dir(scanner: &FileSystemScanner, path: &Path, id: &str) -> serde_
             "malicious_files":  stats.malicious_files,
             "error_files":      stats.error_files,
             "total_size_mb":    (stats.total_size_scanned as f64) / 1024.0 / 1024.0,
+        },
+        "files": files,
+    })
+}
+
+/// Full-system scan using [`SystemScanner`] (thread pool + incremental cache +
+/// [`ScanPrioritizer`]).  Returns the same JSON shape as `daemon_scan_dir` so
+/// the Tauri frontend can parse results identically.
+///
+/// Unlike `daemon_scan_dir`, this command:
+/// - Uses multiple worker threads (no 300-second timeout risk on large roots).
+/// - Applies the incremental mtime+size cache — unchanged files from the last
+///   scan are served instantly without re-reading disk.
+/// - Sorts the queue by risk score before dispatching, so threats surface first.
+fn daemon_scan_all(scanner: &SystemScanner, id: &str) -> serde_json::Value {
+    eprintln!("DAEMON scan-all: starting system scan (thread pool + cache)");
+    let result = scanner.scan(None);
+
+    let files: Vec<serde_json::Value> = result.results.iter()
+        .map(serialize_result)
+        .collect();
+
+    let total_size_mb = result.stats.total_size_scanned as f64 / 1024.0 / 1024.0;
+
+    json!({
+        "id":      id,
+        "success": true,
+        "statistics": {
+            "total_files":      result.stats.total_files,
+            "clean_files":      result.stats.clean_files,
+            "suspicious_files": result.stats.suspicious_files,
+            "malicious_files":  result.stats.malicious_files,
+            "error_files":      result.stats.error_files,
+            "total_size_mb":    total_size_mb,
+            "skipped_files":    result.skipped_files,
+            "cached_hits":      result.cached_hits,
+            "duration_secs":    result.duration_secs,
         },
         "files": files,
     })

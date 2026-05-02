@@ -1,4 +1,4 @@
-//! # Full-System Scanner & Scheduler
+//! # Full-System Scanner, Prioritizer & Scheduler
 //!
 //! `scan_all.rs` orchestrates machine-wide antivirus scanning on top of the
 //! existing [`FileSystemScanner`] single-file / single-directory engine.
@@ -8,7 +8,7 @@
 //! | Goal | Mechanism |
 //! |------|-----------|
 //! | Don't scan forever | Skip large / low-risk files, OS system dirs, and hash-cache for clean results |
-//! | Hit the riskiest spots first | Priority-path list is scanned before generic directories |
+//! | Hit the riskiest spots first | [`ScanPrioritizer`] scores every file on 4 axes and sorts before scanning |
 //! | Avoid redundant work across runs | Incremental mode: skip files unchanged since last scan |
 //! | Use all CPU cores | Thread pool — one `FileSystemScanner` per worker thread |
 //! | Automated periodic protection | `ScanScheduler` fires full scans on a configurable interval |
@@ -18,13 +18,22 @@
 //! ```text
 //! ScanScheduler
 //!   └── fires SystemScanner::scan() every N hours (background thread)
-//!         ├── 1. collect_paths()  — walk roots, apply skip rules, sort by priority
-//!         ├── 2. filter_cached()  — drop files unchanged since last scan (mtime + size)
-//!         └── 3. parallel_scan() — thread pool (FileSystemScanner per thread)
+//!         ├── 1. collect_paths()  — walk roots, apply skip rules → (path, size, mtime)[]
+//!         ├── 2. ScanPrioritizer  — score each file on 4 axes, stable-sort highest first
+//!         ├── 3. filter_cached()  — drop files unchanged since last scan (mtime + size)
+//!         └── 4. parallel_scan() — thread pool (FileSystemScanner per thread)
 //!               ├── worker-0: scan_file() → ScanResult
 //!               ├── worker-1: scan_file() → ScanResult
 //!               └── worker-N: scan_file() → ScanResult
 //! ```
+//!
+//! ## Three components
+//!
+//! | Component | Role |
+//! |-----------|------|
+//! | [`SystemScanner`] | Walk filesystem, drive cache + thread pool |
+//! | [`ScanPrioritizer`] | Score & sort candidate files before they enter the queue |
+//! | [`ScanScheduler`] | Fire [`SystemScanner::scan`] automatically on a configurable interval |
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,8 +50,6 @@ use crate::core::types::{ScanResult, ThreatLevel};
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// Files larger than this are skipped (default 256 MB).
-/// Malware rarely exceeds this size; scanning multi-GB VM disks or ISOs would
-/// dominate total scan time without a meaningful security benefit.
 const DEFAULT_MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default number of worker threads in the scan thread pool.
@@ -52,10 +59,6 @@ const DEFAULT_THREAD_COUNT: usize = 4;
 const MAX_THREADS: usize = 16;
 
 /// Extensions excluded from scanning by default.
-///
-/// These formats are media/data containers that are almost never used as malware
-/// vectors and can be extremely large, dominating scan time.
-/// Scripts, executables, documents, and archives are intentionally NOT excluded.
 const SKIP_EXTENSIONS: &[&str] = &[
     // Video
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts",
@@ -68,22 +71,13 @@ const SKIP_EXTENSIONS: &[&str] = &[
     "iso", "img", "vmdk", "vhd", "vhdx", "qcow2",
 ];
 
-/// Windows system paths skipped by default (trusted OS components, not writable
-/// by user-space malware without elevation, and very large).
-///
-/// Note: `C:\Windows\System32` itself is NOT excluded — malware frequently
-/// drops files or DLL-hijacks there — only the known-large package caches are.
+/// Windows system paths skipped by default.
 #[cfg(windows)]
 const DEFAULT_SKIP_DIRS: &[&str] = &[
-    // Side-by-side component store — ~10 GB, fully trusted, read-only for users
     r"C:\Windows\WinSxS",
-    // MSI installer cache — large, trusted
     r"C:\Windows\Installer",
-    // Windows Update download cache
     r"C:\Windows\SoftwareDistribution\Download",
-    // Recycle bin
     r"C:\$Recycle.Bin",
-    // Volume shadow / restore — not accessible without elevation
     r"C:\System Volume Information",
 ];
 
@@ -94,26 +88,222 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     "/dev",
 ];
 
-/// Keyword fragments in a path that bump it to the front of the scan queue.
-///
-/// These directories host the most common initial-infection vectors:
-/// downloaded files, temporary drop zones, autorun startup folders, and
-/// the roaming profile (common persistence target).
+/// Keyword fragments that bump a path to the front of the priority split
+/// (before [`ScanPrioritizer`] applies fine-grained scoring within each group).
 const PRIORITY_FRAGMENTS: &[&str] = &[
     "Downloads",
     "Desktop",
     "Temp",
     "tmp",
-    // Startup persistence locations
     "Startup",
     "Start Menu",
-    // Common malware drop zones
     "AppData\\Local\\Temp",
     "AppData\\Roaming",
-    // Script and task directories
     "Tasks",
     "Scheduled Tasks",
 ];
+
+// ─── ScanPrioritizer constants ────────────────────────────────────────────────
+
+/// Path fragments that indicate a high-infection-risk location (score 30).
+const HIGH_RISK_LOCATIONS: &[&str] = &[
+    "AppData\\Local\\Temp",
+    "AppData\\Roaming",
+    "Downloads",
+    "Desktop",
+    "Temp",
+    "tmp",
+    "Startup",
+    "Start Menu",
+    "Tasks",
+    "Scheduled Tasks",
+    "ProgramData",
+];
+
+/// Path fragments that indicate a medium-infection-risk location (score 15).
+const MEDIUM_RISK_LOCATIONS: &[&str] = &[
+    "System32",
+    "SysWOW64",
+    "drivers",
+    "Program Files",
+    "Program Files (x86)",
+];
+
+/// File-stem substrings frequently found in malware samples.
+/// Case-insensitive substring match is used.
+const SUSPICIOUS_STEMS: &[&str] = &[
+    "payload", "dropper", "loader", "inject", "exploit", "shellcode",
+    "ransomware", "cryptor", "locker", "wiper", "stealer", "keylogger",
+    "backdoor", "rootkit", "trojan", "meterpreter", "mimikatz",
+    "beacon", "empire", "havoc", "sliver", "cobalt",
+    "brute", "crack", "rat", "c2", "cnc", "bot",
+];
+
+// ─── ScanPrioritizer ──────────────────────────────────────────────────────────
+
+/// Decides the order in which candidate files are fed to the scan thread pool.
+///
+/// Each file receives a **priority score in `0..=100`**; files with higher
+/// scores are scanned earlier.  The scorer is completely read-only — it uses
+/// only the path string, file size, and precomputed mtime from
+/// [`SystemScanner::collect_paths`]; it never opens files or modifies state.
+///
+/// ## Scoring breakdown
+///
+/// | Factor              | Max pts | Signal                                         |
+/// |---------------------|---------|------------------------------------------------|
+/// | Extension risk tier | 40      | Executables → scripts → archives → documents  |
+/// | Location risk tier  | 30      | Temp/Downloads > AppData > System32 > other    |
+/// | Recency             | 20      | Last hour scores highest; >30 days scores 0    |
+/// | Filename anomaly    | 10      | Double-ext, suspicious stem, high-entropy name |
+///
+/// ## Integration
+///
+/// `SystemScanner` holds a `ScanPrioritizer` and calls [`ScanPrioritizer::sort`]
+/// after path collection and before dispatching work to threads.
+///
+/// The sort is **stable** so that equal-score files preserve the relative order
+/// from `collect_paths` (priority-location files remain ahead of normal files).
+pub struct ScanPrioritizer;
+
+impl ScanPrioritizer {
+    pub fn new() -> Self { Self }
+
+    /// Computes the priority score for a single file.
+    ///
+    /// * `path`       — absolute path to the file
+    /// * `size`       — file size in bytes
+    /// * `mtime_secs` — modification time as Unix seconds
+    /// * `now_secs`   — current time as Unix seconds (capture once per batch)
+    pub fn score(&self, path: &Path, _size: u64, mtime_secs: u64, now_secs: u64) -> u32 {
+        let ext_score  = self.score_extension(path);
+        let loc_score  = self.score_location(path);
+        let age_score  = self.score_recency(mtime_secs, now_secs);
+        let name_score = self.score_filename(path);
+        ext_score + loc_score + age_score + name_score
+    }
+
+    /// Sorts `paths` in-place, highest-scoring files first.
+    ///
+    /// Stable sort: equal-score files preserve the order already set by
+    /// `collect_paths` (priority-location bucket is at the front of the slice).
+    pub fn sort(&self, paths: &mut Vec<(PathBuf, u64, u64)>, now_secs: u64) {
+        paths.sort_by(|(pa, sa, ma), (pb, sb, mb)| {
+            let sa = self.score(pa, *sa, *ma, now_secs);
+            let sb = self.score(pb, *sb, *mb, now_secs);
+            sb.cmp(&sa) // descending
+        });
+    }
+
+    // ── Factor: extension risk tier (0–40) ────────────────────────────────────
+
+    fn score_extension(&self, path: &Path) -> u32 {
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e.to_lowercase(),
+            None    => return 5, // no extension — low but non-zero default
+        };
+        match ext.as_str() {
+            // Tier 1 — native executables / drivers
+            "exe" | "dll" | "sys" | "drv" | "ocx" | "scr" | "cpl" | "com" => 40,
+
+            // Tier 2 — scripts, macro-enabled docs, launchers
+            "ps1" | "psm1" | "psd1"                            // PowerShell
+            | "bat" | "cmd"                                     // Windows batch
+            | "vbs" | "vbe"                                     // VBScript
+            | "js"  | "jse"                                     // JScript
+            | "hta" | "wsf" | "wsh"                            // Windows scripting
+            | "msi" | "msp" | "mst"                            // Windows Installer
+            | "reg"                                             // Registry import
+            | "xlsm" | "docm" | "pptm" | "xltm" | "dotm"     // Office macros
+            | "lnk" | "url" => 30,                             // Shortcuts / launchers
+
+            // Tier 3 — archives (may contain executables)
+            "zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz" | "cab" | "arj" => 15,
+
+            // Tier 4 — documents (can carry exploits)
+            "pdf" | "doc" | "xls" | "ppt" | "rtf" | "odt" | "ods" | "odp" => 10,
+
+            _ => 5,
+        }
+    }
+
+    // ── Factor: location risk tier (0–30) ─────────────────────────────────────
+
+    fn score_location(&self, path: &Path) -> u32 {
+        let s = path.to_string_lossy();
+        for frag in HIGH_RISK_LOCATIONS {
+            if s.contains(frag) { return 30; }
+        }
+        for frag in MEDIUM_RISK_LOCATIONS {
+            if s.contains(frag) { return 15; }
+        }
+        0
+    }
+
+    // ── Factor: recency (0–20) ────────────────────────────────────────────────
+
+    fn score_recency(&self, mtime_secs: u64, now_secs: u64) -> u32 {
+        let age = now_secs.saturating_sub(mtime_secs);
+        match age {
+            0..=3_599            => 20, // < 1 hour
+            3_600..=86_399       => 15, // 1 h – 24 h
+            86_400..=604_799     => 10, // 1 day – 7 days
+            604_800..=2_591_999  => 5,  // 1 week – 30 days
+            _                    => 0,  // older
+        }
+    }
+
+    // ── Factor: filename anomalies (0–10) ─────────────────────────────────────
+
+    fn score_filename(&self, path: &Path) -> u32 {
+        let mut pts = 0u32;
+
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_lowercase(),
+            None    => return 0,
+        };
+
+        // Double extension: "document.pdf.exe" — the stem itself still has an extension.
+        if Path::new(&stem).extension().is_some() {
+            pts = pts.max(10);
+        }
+
+        // Suspicious keyword in the stem.
+        if SUSPICIOUS_STEMS.iter().any(|kw| stem.contains(kw)) {
+            pts = pts.max(8);
+        }
+
+        // High-entropy stem (≥8 chars) — random-looking names common in droppers.
+        if stem.len() >= 8 && Self::stem_entropy(&stem) > 4.0 {
+            pts = pts.max(5);
+        }
+
+        // Very short stem (≤3 chars) on any file — unusual, warrants early look.
+        if stem.len() <= 3 {
+            pts = pts.max(3);
+        }
+
+        pts.min(10)
+    }
+
+    // ── Helper: Shannon entropy of a file stem (bits per char) ───────────────
+
+    fn stem_entropy(s: &str) -> f32 {
+        let mut freq = [0u32; 256];
+        for b in s.bytes() {
+            freq[b as usize] += 1;
+        }
+        let len = s.len() as f32;
+        freq.iter()
+            .filter(|&&c| c > 0)
+            .map(|&c| { let p = c as f32 / len; -p * p.log2() })
+            .sum()
+    }
+}
+
+impl Default for ScanPrioritizer {
+    fn default() -> Self { Self }
+}
 
 // ─── Progress / threat callbacks ──────────────────────────────────────────────
 
@@ -126,29 +316,15 @@ pub type ThreatFn = Arc<dyn Fn(&ScanResult) + Send + Sync>;
 // ─── SystemScanConfig ─────────────────────────────────────────────────────────
 
 /// Full configuration for a system-wide scan.
-///
-/// # Example — quick scan of user directories only
-///
-/// ```rust,ignore
-/// let config = SystemScanConfig {
-///     roots: vec![PathBuf::from(r"C:\Users")],
-///     max_file_bytes: 64 * 1024 * 1024, // 64 MB limit
-///     num_threads: 2,
-///     incremental: true,
-///     ..SystemScanConfig::default()
-/// };
-/// ```
 #[derive(Debug, Clone)]
 pub struct SystemScanConfig {
     /// Root directories to walk. Defaults to all common Windows locations.
     pub roots: Vec<PathBuf>,
 
     /// Directories that are never entered during the walk.
-    /// The defaults come from [`DEFAULT_SKIP_DIRS`].
     pub skip_dirs: Vec<PathBuf>,
 
     /// File extensions that are skipped without scanning.
-    /// The defaults come from [`SKIP_EXTENSIONS`].
     pub skip_extensions: Vec<String>,
 
     /// Files larger than this (in bytes) are skipped.
@@ -162,7 +338,6 @@ pub struct SystemScanConfig {
     pub incremental: bool,
 
     /// Optional directory containing custom `.yar` / `.yara` rules.
-    /// Each worker thread loads the same directory independently.
     pub yara_rules_dir: Option<PathBuf>,
 }
 
@@ -187,7 +362,6 @@ impl Default for SystemScanConfig {
 }
 
 impl SystemScanConfig {
-    /// Returns `true` if `path` should be skipped (extension or size filters).
     fn should_skip_file(&self, path: &Path, size: u64) -> bool {
         if size > self.max_file_bytes {
             return true;
@@ -199,8 +373,6 @@ impl SystemScanConfig {
         false
     }
 
-    /// Returns `true` if `dir` matches any entry in the skip list
-    /// (exact prefix match, case-insensitive on Windows).
     fn should_skip_dir(&self, dir: &Path) -> bool {
         let dir_str = dir.to_string_lossy().to_lowercase();
         self.skip_dirs.iter().any(|skip| {
@@ -209,12 +381,11 @@ impl SystemScanConfig {
         })
     }
 
-    /// Returns `true` if `path` contains any priority fragment.
+    /// Returns `true` if `path` contains any priority fragment (coarse split
+    /// before fine-grained prioritizer scoring).
     fn is_priority(&self, path: &Path) -> bool {
         let s = path.to_string_lossy();
-        PRIORITY_FRAGMENTS.iter().any(|frag| {
-            s.contains(frag)
-        })
+        PRIORITY_FRAGMENTS.iter().any(|frag| s.contains(frag))
     }
 }
 
@@ -251,21 +422,14 @@ impl ScanAllResult {
 
 // ─── FileStateCache ───────────────────────────────────────────────────────────
 
-/// Per-file scan state, stored in the incremental cache.
 #[derive(Debug, Clone)]
 struct CachedFileState {
-    /// File modification time as seconds since the Unix epoch.
     mtime_secs: u64,
-    /// File size in bytes at the time of the last scan.
     file_size: u64,
-    /// Verdict from the last scan.
     level: ThreatLevel,
 }
 
 /// In-memory cache mapping `PathBuf → CachedFileState`.
-///
-/// When incremental mode is on, a file is re-scanned only when either its
-/// modification time or its size has changed since the last scan.
 ///
 /// Non-clean entries are never cached — they are always re-evaluated so that
 /// remediated files are promptly reclassified.
@@ -275,13 +439,9 @@ pub struct FileStateCache {
 
 impl FileStateCache {
     pub fn new() -> Self {
-        Self {
-            inner: HashMap::new(),
-        }
+        Self { inner: HashMap::new() }
     }
 
-    /// Returns the cached `ThreatLevel` for `path` if the file is unchanged,
-    /// or `None` if the file must be re-scanned.
     fn check(&self, path: &Path, mtime_secs: u64, file_size: u64) -> Option<ThreatLevel> {
         let state = self.inner.get(path)?;
         if state.mtime_secs == mtime_secs && state.file_size == file_size {
@@ -291,25 +451,18 @@ impl FileStateCache {
         }
     }
 
-    /// Inserts or updates the cached state for `path`.
-    /// Only `Clean` results are stored; non-clean results must always be
-    /// re-scanned so they are never served stale from the cache.
     fn update(&mut self, path: PathBuf, mtime_secs: u64, file_size: u64, level: ThreatLevel) {
         if level == ThreatLevel::Clean {
             self.inner.insert(path, CachedFileState { mtime_secs, file_size, level });
         } else {
-            // Remove any stale clean entry for a path that is now a threat.
             self.inner.remove(&path);
         }
     }
 
-    /// Drops all entries — call before a non-incremental full scan to ensure a
-    /// completely fresh pass.
     pub fn clear(&mut self) {
         self.inner.clear();
     }
 
-    /// Number of cached entries.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -325,66 +478,60 @@ impl Default for FileStateCache {
 ///
 /// Internally it:
 /// 1. Walks the filesystem and applies skip / priority rules.
-/// 2. Checks each file against the incremental cache.
-/// 3. Dispatches remaining paths to a thread pool for parallel scanning.
-///
-/// # Thread safety
-///
-/// `SystemScanner` is `Send + Sync` and can be wrapped in an `Arc` for
-/// shared use between a [`ScanScheduler`] background thread and the main thread.
+/// 2. Runs [`ScanPrioritizer`] to sort the queue highest-risk first.
+/// 3. Checks each file against the incremental cache.
+/// 4. Dispatches remaining paths to a thread pool for parallel scanning.
 pub struct SystemScanner {
     config: SystemScanConfig,
     /// Shared incremental cache — updated after every scan.
     cache: Arc<Mutex<FileStateCache>>,
+    /// Scores and sorts candidate files before the scan queue is built.
+    prioritizer: ScanPrioritizer,
 }
 
 impl SystemScanner {
-    /// Creates a new scanner with default configuration.
     pub fn new() -> Self {
         Self {
             config: SystemScanConfig::default(),
             cache: Arc::new(Mutex::new(FileStateCache::new())),
+            prioritizer: ScanPrioritizer::new(),
         }
     }
 
-    /// Creates a scanner with a custom configuration.
     pub fn with_config(config: SystemScanConfig) -> Self {
         Self {
             config,
             cache: Arc::new(Mutex::new(FileStateCache::new())),
+            prioritizer: ScanPrioritizer::new(),
         }
     }
 
-    /// Clears the incremental cache, forcing a full re-scan next time.
     pub fn clear_cache(&self) {
         self.cache.lock().unwrap().clear();
     }
 
+    /// Returns a reference to the [`ScanPrioritizer`] used by this scanner.
+    ///
+    /// Useful for callers that want to inspect or test scoring without running
+    /// a full scan (e.g. the UI showing why a file was queued first).
+    pub fn prioritizer(&self) -> &ScanPrioritizer {
+        &self.prioritizer
+    }
+
     // ── Root discovery ────────────────────────────────────────────────────────
 
-    /// Returns a default set of scan roots for the current platform.
-    ///
-    /// On Windows this covers:
-    /// - All user home directories
-    /// - Program Files
-    /// - ProgramData
-    /// - The Windows directory (excluding the large package-cache skip-dirs)
-    /// - Common temp directories
     pub fn default_roots() -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
 
         #[cfg(windows)]
         {
-            // Users directory (covers all profiles)
             if let Ok(users) = std::env::var("SystemDrive") {
                 let p = PathBuf::from(format!("{}\\Users", users));
                 if p.exists() { roots.push(p); }
-                // Windows directory (threats often land in System32, Temp, etc.)
                 let win = PathBuf::from(format!("{}\\Windows", users));
                 if win.exists() { roots.push(win); }
             }
 
-            // Program files
             for var in &["ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
                 if let Ok(p) = std::env::var(var) {
                     let pb = PathBuf::from(p);
@@ -392,7 +539,6 @@ impl SystemScanner {
                 }
             }
 
-            // System temp
             if let Ok(tmp) = std::env::var("TEMP") {
                 let pb = PathBuf::from(tmp);
                 if pb.exists() { roots.push(pb); }
@@ -412,14 +558,14 @@ impl SystemScanner {
 
     // ── Path collection ───────────────────────────────────────────────────────
 
-    /// Walks all configured roots and builds two sorted path lists:
-    /// - `priority_paths` — files under [`PRIORITY_FRAGMENTS`] directories
-    /// - `normal_paths`   — all other eligible files
+    /// Walks all configured roots and returns two sorted path lists with
+    /// per-file metadata already read: `(priority, normal, skipped_count)`.
     ///
-    /// Returns `(priority_paths, normal_paths, skipped_count)`.
-    fn collect_paths(&self) -> (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>, usize) {
-        let mut priority: Vec<(PathBuf, u64)> = Vec::new();
-        let mut normal: Vec<(PathBuf, u64)> = Vec::new();
+    /// Each element is `(path, size_bytes, mtime_unix_secs)`.
+    /// Reading mtime here avoids a second `stat` call in `filter_cached`.
+    fn collect_paths(&self) -> (Vec<(PathBuf, u64, u64)>, Vec<(PathBuf, u64, u64)>, usize) {
+        let mut priority: Vec<(PathBuf, u64, u64)> = Vec::new();
+        let mut normal:   Vec<(PathBuf, u64, u64)> = Vec::new();
         let mut skipped = 0usize;
 
         for root in &self.config.roots {
@@ -429,7 +575,6 @@ impl SystemScanner {
                 .follow_links(false)
                 .into_iter()
                 .filter_entry(|e| {
-                    // Prune entire skip-dirs early (avoids descending into them)
                     if e.file_type().is_dir() {
                         !self.config.should_skip_dir(e.path())
                     } else {
@@ -438,14 +583,22 @@ impl SystemScanner {
                 })
             {
                 let entry = match entry {
-                    Ok(e) => e,
+                    Ok(e)  => e,
                     Err(_) => { skipped += 1; continue; }
                 };
 
                 if !entry.file_type().is_file() { continue; }
 
                 let path = entry.path().to_path_buf();
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+
+                // Read size and mtime together from one metadata call.
+                let meta = entry.metadata();
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let mtime_secs = meta.ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
 
                 if self.config.should_skip_file(&path, size) {
                     skipped += 1;
@@ -453,9 +606,9 @@ impl SystemScanner {
                 }
 
                 if self.config.is_priority(&path) {
-                    priority.push((path, size));
+                    priority.push((path, size, mtime_secs));
                 } else {
-                    normal.push((path, size));
+                    normal.push((path, size, mtime_secs));
                 }
             }
         }
@@ -465,35 +618,23 @@ impl SystemScanner {
 
     // ── Incremental cache filtering ───────────────────────────────────────────
 
-    /// Removes from `paths` any entry whose `(mtime, size)` matches the cache,
-    /// inserting a synthetic clean `ScanResult` for each cache hit.
-    ///
+    /// Removes from `paths` any entry whose `(mtime, size)` matches the cache.
     /// Returns `(paths_to_scan, cache_hit_results, cache_hit_count)`.
     fn filter_cached(
         &self,
-        paths: Vec<(PathBuf, u64)>,
+        paths: Vec<(PathBuf, u64, u64)>,
         cache: &FileStateCache,
-    ) -> (Vec<(PathBuf, u64)>, Vec<ScanResult>, usize) {
-        let mut to_scan: Vec<(PathBuf, u64)> = Vec::new();
+    ) -> (Vec<PathBuf>, Vec<ScanResult>, usize) {
+        let mut to_scan: Vec<PathBuf> = Vec::new();
         let mut from_cache: Vec<ScanResult> = Vec::new();
         let mut hits = 0usize;
 
-        for (path, size) in paths {
-            // Obtain mtime as seconds since epoch (fails gracefully)
-            let mtime_secs = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-
-            if let Some(cached_level) = cache.check(&path, mtime_secs, size) {
+        for (path, size, mtime_secs) in paths {
+            if let Some(_cached_level) = cache.check(&path, mtime_secs, size) {
                 hits += 1;
-                // Synthesise a lightweight result for the cache hit
                 from_cache.push(ScanResult::clean(path, None));
-                let _ = cached_level; // already Clean by construction (we only cache Clean)
             } else {
-                to_scan.push((path, size));
+                to_scan.push(path);
             }
         }
 
@@ -503,13 +644,9 @@ impl SystemScanner {
     // ── Parallel scan engine ──────────────────────────────────────────────────
 
     /// Distributes `paths` across a thread pool and collects `ScanResult`s.
-    ///
-    /// Each worker thread owns its own [`FileSystemScanner`] instance to avoid
-    /// any synchronisation overhead on the scanner state itself.
-    /// If `progress` is provided, it is called after every completed file.
     fn parallel_scan(
         &self,
-        paths: Vec<(PathBuf, u64)>,
+        paths: Vec<PathBuf>,
         progress: Option<ProgressFn>,
     ) -> Vec<ScanResult> {
         if paths.is_empty() { return Vec::new(); }
@@ -518,14 +655,11 @@ impl SystemScanner {
         let num_threads = self.config.num_threads.clamp(1, MAX_THREADS);
         let yara_dir = self.config.yara_rules_dir.clone();
 
-        // ── Work channel: main thread → workers ───────────────────────────────
         let (work_tx, work_rx) = mpsc::channel::<PathBuf>();
         let work_rx = Arc::new(Mutex::new(work_rx));
 
-        // ── Result channel: workers → collector ───────────────────────────────
         let (result_tx, result_rx) = mpsc::channel::<ScanResult>();
 
-        // ── Spawn worker threads ───────────────────────────────────────────────
         let handles: Vec<_> = (0..num_threads)
             .map(|_| {
                 let rx = Arc::clone(&work_rx);
@@ -533,25 +667,20 @@ impl SystemScanner {
                 let yara = yara_dir.clone();
 
                 thread::spawn(move || {
-                    // Each thread builds its own scanner — no shared mutable state.
                     let mut scanner = FileSystemScanner::new();
                     if let Some(ref dir) = yara {
                         scanner.load_yara_rules(dir).ok();
                     }
 
                     loop {
-                        let path = {
-                            // Hold the lock only for the recv() call.
-                            match rx.lock().unwrap().recv() {
-                                Ok(p) => p,
-                                Err(_) => break, // channel closed, no more work
-                            }
+                        let path = match rx.lock().unwrap().recv() {
+                            Ok(p)  => p,
+                            Err(_) => break,
                         };
 
                         match scanner.scan_file(&path) {
                             Ok(result) => { tx.send(result).ok(); }
-                            Err(e) => {
-                                // Send an error result so the total count stays consistent.
+                            Err(e)     => {
                                 tx.send(ScanResult::error(path, e.to_string())).ok();
                             }
                         }
@@ -560,16 +689,13 @@ impl SystemScanner {
             })
             .collect();
 
-        // Drop the extra sender so result_rx drains when all workers finish.
         drop(result_tx);
 
-        // ── Feed paths to workers ──────────────────────────────────────────────
-        for (path, _size) in paths {
+        for path in paths {
             work_tx.send(path).ok();
         }
-        drop(work_tx); // signal workers: no more work coming
+        drop(work_tx);
 
-        // ── Collect results with optional progress reporting ───────────────────
         let mut results: Vec<ScanResult> = Vec::with_capacity(total);
         for result in result_rx {
             if let Some(ref cb) = progress {
@@ -578,7 +704,6 @@ impl SystemScanner {
             results.push(result);
         }
 
-        // Wait for all threads to exit cleanly.
         for h in handles { h.join().ok(); }
 
         results
@@ -589,42 +714,52 @@ impl SystemScanner {
     /// Run a full system scan and return aggregated results.
     ///
     /// **Steps:**
-    /// 1. Walk all roots → collect eligible paths (skipping large/media files and OS dirs).
-    /// 2. Sort: priority paths first.
-    /// 3. If `incremental` is enabled, check each path against the cache.
-    /// 4. Dispatch uncached paths to the thread pool.
-    /// 5. Merge cache-hit results + freshly scanned results.
-    /// 6. Update the incremental cache with new verdicts.
-    ///
-    /// # Arguments
-    ///
-    /// * `progress` — optional callback `(done, total, current_path)`.
+    /// 1. Walk all roots → collect eligible paths with precomputed `(size, mtime)`.
+    /// 2. Coarse sort: priority-location paths first, normal paths after.
+    /// 3. [`ScanPrioritizer`] stable-sorts each group by risk score (highest first).
+    /// 4. If `incremental` is enabled, check each path against the cache.
+    /// 5. Dispatch uncached paths to the thread pool.
+    /// 6. Merge cache-hit results + freshly scanned results.
+    /// 7. Update the incremental cache with new verdicts.
     pub fn scan(&self, progress: Option<ProgressFn>) -> ScanAllResult {
         let scan_time = SystemTime::now();
         let timer = Instant::now();
+
+        // Capture current time once for consistent recency scoring across the batch.
+        let now_secs = scan_time
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         // ── Step 1: collect paths ──────────────────────────────────────────────
         let (mut priority_paths, normal_paths, mut skipped_files) =
             self.collect_paths();
 
-        // Priority paths are scanned first; normal paths follow.
+        // Priority-location paths first; normal paths follow.
         priority_paths.extend(normal_paths);
-        let all_paths = priority_paths;
+        let mut all_paths = priority_paths;
 
-        // ── Step 2: incremental cache filter ──────────────────────────────────
+        // ── Step 2: fine-grained priority sort ────────────────────────────────
+        // ScanPrioritizer stable-sorts: highest-risk files bubble to the front.
+        // Equal-score files preserve the coarse order (priority bucket before
+        // normal bucket) because sort_by is stable.
+        self.prioritizer.sort(&mut all_paths, now_secs);
+
+        // ── Step 3: incremental cache filter ──────────────────────────────────
         let (paths_to_scan, mut results, cached_hits) = if self.config.incremental {
             let cache = self.cache.lock().unwrap();
             self.filter_cached(all_paths, &cache)
         } else {
-            (all_paths, Vec::new(), 0)
+            let paths: Vec<PathBuf> = all_paths.into_iter().map(|(p, _, _)| p).collect();
+            (paths, Vec::new(), 0)
         };
 
         skipped_files += cached_hits;
 
-        // ── Step 3: parallel scan ─────────────────────────────────────────────
+        // ── Step 4: parallel scan ─────────────────────────────────────────────
         let fresh_results = self.parallel_scan(paths_to_scan, progress);
 
-        // ── Step 4: update incremental cache ──────────────────────────────────
+        // ── Step 5: update incremental cache ──────────────────────────────────
         {
             let mut cache = self.cache.lock().unwrap();
             for r in &fresh_results {
@@ -641,7 +776,7 @@ impl SystemScanner {
 
         results.extend(fresh_results);
 
-        // ── Step 5: aggregate statistics ─────────────────────────────────────
+        // ── Step 6: aggregate statistics ──────────────────────────────────────
         let mut stats = ScanStatistics::new();
         for r in &results {
             let size = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
@@ -687,34 +822,20 @@ impl Default for SystemScanner {
 /// ```
 pub struct ScanScheduler {
     scanner: Arc<SystemScanner>,
-    /// How often a full scan is triggered.
     interval: Duration,
-    /// Shared: last time a scan completed successfully.
     last_scan: Arc<Mutex<Option<SystemTime>>>,
-    /// Shared flag — set to `false` to stop the background thread.
     running: Arc<Mutex<bool>>,
-    /// Handle to the background thread (held so we can join on `stop()`).
     thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
-    /// Called for every non-clean result discovered during scheduled scans.
     on_threat: ThreatFn,
 }
 
 impl ScanScheduler {
-    // ── Construction ──────────────────────────────────────────────────────────
-
-    /// Creates a scheduler with default configuration.
-    ///
-    /// Default interval: **6 hours**.
-    /// Default threat handler: logs to stderr.
     pub fn new(scanner: SystemScanner) -> Self {
         Self::with_options(
             Arc::new(scanner),
             Duration::from_secs(6 * 3600),
             Arc::new(|r: &ScanResult| {
-                eprintln!(
-                    "[AegisAI THREAT] {:?} — {}",
-                    r.level, r.path.display()
-                );
+                eprintln!("[AegisAI THREAT] {:?} — {}", r.level, r.path.display());
             }),
         )
     }
@@ -734,43 +855,33 @@ impl ScanScheduler {
         }
     }
 
-    /// Returns a [`SchedulerBuilder`] for fluent configuration.
     pub fn builder() -> SchedulerBuilder {
         SchedulerBuilder::default()
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
-
-    /// Starts the background scan loop.
-    ///
-    /// If the scheduler is already running this is a no-op.
     pub fn start(&self) {
         let mut handle = self.thread_handle.lock().unwrap();
-        if handle.is_some() { return; } // already started
+        if handle.is_some() { return; }
 
         *self.running.lock().unwrap() = true;
 
-        let scanner  = Arc::clone(&self.scanner);
-        let interval = self.interval;
+        let scanner   = Arc::clone(&self.scanner);
+        let interval  = self.interval;
         let last_scan = Arc::clone(&self.last_scan);
-        let running  = Arc::clone(&self.running);
+        let running   = Arc::clone(&self.running);
         let on_threat = Arc::clone(&self.on_threat);
 
         *handle = Some(thread::spawn(move || {
-            // The thread wakes every 60 seconds to check if a scan is due.
-            // This gives the scheduler sub-minute responsiveness to interval
-            // changes without burning CPU in a tight loop.
             let tick = Duration::from_secs(60);
 
             loop {
-                // Check the stop flag first.
                 if !*running.lock().unwrap() { break; }
 
                 let now = SystemTime::now();
                 let should_fire = {
                     let last = last_scan.lock().unwrap();
                     match *last {
-                        None => true, // first run
+                        None    => true,
                         Some(t) => now.duration_since(t).unwrap_or_default() >= interval,
                     }
                 };
@@ -779,7 +890,6 @@ impl ScanScheduler {
                     eprintln!("[ScanScheduler] Starting scheduled full-system scan…");
                     let result = scanner.scan(None);
 
-                    // Report all non-clean findings via the callback.
                     for r in result.threats() {
                         on_threat(r);
                     }
@@ -796,8 +906,6 @@ impl ScanScheduler {
                     *last_scan.lock().unwrap() = Some(SystemTime::now());
                 }
 
-                // Sleep in small increments so we can react to a stop() call
-                // without waiting a full tick.
                 let mut slept = Duration::ZERO;
                 while slept < tick {
                     thread::sleep(Duration::from_secs(5));
@@ -808,9 +916,6 @@ impl ScanScheduler {
         }));
     }
 
-    /// Signals the background thread to stop and waits for it to exit.
-    ///
-    /// If a scan is in progress, this blocks until the scan finishes.
     pub fn stop(&self) {
         *self.running.lock().unwrap() = false;
         if let Some(h) = self.thread_handle.lock().unwrap().take() {
@@ -818,32 +923,24 @@ impl ScanScheduler {
         }
     }
 
-    /// Returns `true` if the background loop is currently running.
     pub fn is_running(&self) -> bool {
         *self.running.lock().unwrap()
     }
 
-    /// Returns the timestamp of the last completed scheduled scan, if any.
     pub fn last_scan_time(&self) -> Option<SystemTime> {
         *self.last_scan.lock().unwrap()
     }
 
-    /// Immediately triggers a scan from the calling thread (blocking).
-    ///
-    /// Useful for "Scan Now" buttons in a UI — runs outside the scheduler loop
-    /// so it does not reset the scheduler's timing.
     pub fn trigger_now(&self, progress: Option<ProgressFn>) -> ScanAllResult {
         self.scanner.scan(progress)
     }
 
-    /// Returns a reference to the underlying [`SystemScanner`].
     pub fn scanner(&self) -> &SystemScanner {
         &self.scanner
     }
 }
 
 impl Drop for ScanScheduler {
-    /// Automatically stops the background thread when the scheduler is dropped.
     fn drop(&mut self) {
         self.stop();
     }
@@ -851,17 +948,6 @@ impl Drop for ScanScheduler {
 
 // ─── SchedulerBuilder ─────────────────────────────────────────────────────────
 
-/// Fluent builder for [`ScanScheduler`].
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let scheduler = ScanScheduler::builder()
-///     .scanner(SystemScanner::with_config(config))
-///     .interval(Duration::from_secs(3600))
-///     .on_threat(|r| println!("Threat: {}", r.path.display()))
-///     .build();
-/// ```
 pub struct SchedulerBuilder {
     scanner:  Option<SystemScanner>,
     interval: Duration,
@@ -879,19 +965,16 @@ impl Default for SchedulerBuilder {
 }
 
 impl SchedulerBuilder {
-    /// Sets the scanner instance (required).
     pub fn scanner(mut self, s: SystemScanner) -> Self {
         self.scanner = Some(s);
         self
     }
 
-    /// Sets the scan interval.
     pub fn interval(mut self, d: Duration) -> Self {
         self.interval = d;
         self
     }
 
-    /// Sets the callback invoked for every non-clean result.
     pub fn on_threat<F>(mut self, f: F) -> Self
     where
         F: Fn(&ScanResult) + Send + Sync + 'static,
@@ -900,11 +983,6 @@ impl SchedulerBuilder {
         self
     }
 
-    /// Builds the [`ScanScheduler`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `scanner()` was not called.
     pub fn build(self) -> ScanScheduler {
         let scanner = self.scanner.expect("ScanScheduler requires a SystemScanner");
         let on_threat = self.on_threat.unwrap_or_else(|| {
@@ -923,7 +1001,112 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Basic smoke test: scan a temp directory we control.
+    // ── ScanPrioritizer unit tests ─────────────────────────────────────────────
+
+    /// Extension tier ordering: executables > scripts > archives > documents.
+    #[test]
+    fn test_prioritizer_extension_tiers() {
+        let p = ScanPrioritizer::new();
+        let now = 0u64;
+
+        let score = |name: &str| -> u32 {
+            p.score(Path::new(name), 0, 0, now)
+        };
+
+        assert!(score("malware.exe") > score("script.ps1"),  "exe > ps1");
+        assert!(score("script.bat") > score("archive.zip"), "bat > zip");
+        assert!(score("archive.zip") > score("report.pdf"), "zip > pdf");
+        assert!(score("report.pdf") > score("data.csv"),    "pdf > csv (default tier)");
+    }
+
+    /// Location scoring: Temp/Downloads outscores system dirs.
+    #[test]
+    fn test_prioritizer_location_tiers() {
+        let p = ScanPrioritizer::new();
+        let now = 1_000_000u64;
+
+        let score = |path: &str| -> u32 {
+            p.score(Path::new(path), 0, now, now)
+        };
+
+        // High-risk locations
+        let temp_score = score(r"C:\Users\user\AppData\Local\Temp\evil.exe");
+        // Medium-risk locations
+        let sys32_score = score(r"C:\Windows\System32\legit.exe");
+        // Unknown location
+        let other_score = score(r"C:\SomeDir\file.exe");
+
+        assert!(temp_score > sys32_score,  "Temp > System32");
+        assert!(sys32_score > other_score, "System32 > unknown location");
+    }
+
+    /// Recency: recently modified files score higher than old ones.
+    #[test]
+    fn test_prioritizer_recency() {
+        let p = ScanPrioritizer::new();
+        let now = 100_000_000u64; // large enough to subtract years without overflow
+        let one_hour_ago = now - 1_800;          // 30 minutes old
+        let one_week_ago = now - 7 * 86_400;
+        let one_year_ago = now - 365 * 86_400;
+
+        let path = Path::new("file.txt");
+        let s_recent = p.score(path, 0, one_hour_ago, now);
+        let s_week   = p.score(path, 0, one_week_ago, now);
+        let s_year   = p.score(path, 0, one_year_ago, now);
+
+        assert!(s_recent > s_week, "recent > week-old");
+        assert!(s_week   > s_year, "week-old > year-old");
+    }
+
+    /// Double-extension filenames should receive the maximum filename score.
+    #[test]
+    fn test_prioritizer_double_extension() {
+        let p = ScanPrioritizer::new();
+        let now = 0u64;
+
+        // score_filename caps at 10; double-ext should hit that cap
+        let score_double = p.score(Path::new("invoice.pdf.exe"), 0, 0, now);
+        let score_single = p.score(Path::new("invoice.exe"), 0, 0, now);
+
+        // Both are exe so ext score is equal; the double-ext gets the filename bonus.
+        assert!(score_double > score_single, "double extension boosts score");
+    }
+
+    /// Suspicious stems (keywords like "dropper", "payload") score higher.
+    #[test]
+    fn test_prioritizer_suspicious_stem() {
+        let p = ScanPrioritizer::new();
+        let now = 0u64;
+
+        let score_suspicious = p.score(Path::new("payload.txt"), 0, 0, now);
+        let score_normal     = p.score(Path::new("readme.txt"), 0, 0, now);
+
+        assert!(score_suspicious > score_normal, "suspicious stem > normal stem");
+    }
+
+    /// sort() orders files highest-score first.
+    #[test]
+    fn test_prioritizer_sort_order() {
+        let p = ScanPrioritizer::new();
+        let now = 10_000_000u64;
+
+        let mut paths: Vec<(PathBuf, u64, u64)> = vec![
+            (PathBuf::from(r"C:\SomeDir\harmless.txt"), 0, 0),
+            (PathBuf::from(r"C:\Users\user\Downloads\payload.exe"), 0, now - 60),
+            (PathBuf::from(r"C:\Windows\System32\legit.dll"), 0, now - 86_400),
+        ];
+
+        p.sort(&mut paths, now);
+
+        // The exe in Downloads modified 1 minute ago should be first.
+        assert!(
+            paths[0].0.to_string_lossy().contains("payload.exe"),
+            "highest-risk file should be first: {:?}", paths[0].0
+        );
+    }
+
+    // ── SystemScanner integration tests ───────────────────────────────────────
+
     #[test]
     fn test_scan_temp_dir() {
         let dir = std::env::temp_dir().join("aegis_scan_all_test");
@@ -937,13 +1120,12 @@ mod tests {
         let scanner = SystemScanner::with_config(config);
         let result = scanner.scan(None);
 
-        assert!(result.stats.total_files >= 1, "should have scanned at least one file");
-        assert_eq!(result.stats.malicious_files, 0, "clean txt should not be malicious");
+        assert!(result.stats.total_files >= 1);
+        assert_eq!(result.stats.malicious_files, 0);
 
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Verify that EICAR planted in a temp dir is detected.
     #[test]
     fn test_scan_detects_eicar() {
         let dir = std::env::temp_dir().join("aegis_eicar_all_test");
@@ -951,8 +1133,7 @@ mod tests {
         fs::write(
             dir.join("eicar.com"),
             "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
-        )
-        .unwrap();
+        ).unwrap();
 
         let config = SystemScanConfig {
             roots: vec![dir.clone()],
@@ -967,7 +1148,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Verify that media files are skipped.
     #[test]
     fn test_skip_media_files() {
         let dir = std::env::temp_dir().join("aegis_skip_test");
@@ -982,36 +1162,31 @@ mod tests {
         let scanner = SystemScanner::with_config(config);
         let result = scanner.scan(None);
 
-        // Both files should be skipped, not scanned.
-        assert_eq!(result.stats.total_files, 0, "media files should be skipped");
+        assert_eq!(result.stats.total_files, 0);
         assert!(result.skipped_files >= 2);
 
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Verify that large files beyond the size limit are skipped.
     #[test]
     fn test_skip_large_files() {
         let dir = std::env::temp_dir().join("aegis_large_test");
         fs::create_dir_all(&dir).unwrap();
-        let large_file = dir.join("bigfile.bin");
-        // Write 5 bytes — but configure the limit to 0 bytes so it counts as "large"
-        fs::write(&large_file, b"hello").unwrap();
+        fs::write(dir.join("bigfile.bin"), b"hello").unwrap();
 
         let config = SystemScanConfig {
             roots: vec![dir.clone()],
-            max_file_bytes: 0, // everything is "too large"
+            max_file_bytes: 0,
             ..SystemScanConfig::default()
         };
         let scanner = SystemScanner::with_config(config);
         let result = scanner.scan(None);
 
-        assert_eq!(result.stats.total_files, 0, "file over size limit should be skipped");
+        assert_eq!(result.stats.total_files, 0);
 
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Verify that the incremental cache skips unchanged clean files on re-scan.
     #[test]
     fn test_incremental_cache() {
         let dir = std::env::temp_dir().join("aegis_cache_test");
@@ -1026,18 +1201,15 @@ mod tests {
         };
         let scanner = SystemScanner::with_config(config);
 
-        // First scan — no cache hits.
         let r1 = scanner.scan(None);
-        assert_eq!(r1.cached_hits, 0, "first scan should have no cache hits");
+        assert_eq!(r1.cached_hits, 0);
 
-        // Second scan — unchanged file should be served from cache.
         let r2 = scanner.scan(None);
-        assert!(r2.cached_hits >= 1, "unchanged clean file should be a cache hit");
+        assert!(r2.cached_hits >= 1);
 
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Smoke-test the scheduler builder and immediate trigger.
     #[test]
     fn test_scheduler_trigger_now() {
         let dir = std::env::temp_dir().join("aegis_sched_test");

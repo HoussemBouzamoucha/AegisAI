@@ -20,6 +20,15 @@ pub struct NetworkConnection {
     pub threat_level:      ThreatLevel,
     pub is_threat:         bool,
     pub detection_signals: Vec<DetectionSignal>,
+
+    /// ML probability score set by the external pipeline after `run_ml_and_patch_scores`.
+    /// `None` when the ML model has not yet scored this connection.
+    /// Used (alongside `threat_score`) as a second DPI trigger condition.
+    pub ml_score: Option<f32>,
+
+    /// Set to `true` when the DPI engine was invoked on this connection's payload.
+    /// Exposed to the UI so analysts can see which connections received deep inspection.
+    pub dpi_triggered: bool,
 }
 
 impl NetworkConnection {
@@ -42,6 +51,8 @@ impl NetworkConnection {
             threat_level: ThreatLevel::Clean,
             is_threat: false,
             detection_signals: Vec::new(),
+            ml_score: None,
+            dpi_triggered: false,
         }
     }
 

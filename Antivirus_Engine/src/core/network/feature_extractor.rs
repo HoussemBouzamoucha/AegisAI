@@ -80,6 +80,11 @@ const PCAP_TIMEOUT_MS: i32 = 500;
 /// Sleep duration when pcap returns TimeoutExpired to prevent busy-wait spin.
 const PCAP_IDLE_SLEEP_MS: u64 = 10;
 
+/// Maximum payload bytes captured per direction for DPI inspection.
+/// Enough to detect protocol headers, shellcode sleds, and mining JSON without
+/// storing full connection payloads in memory.
+const DPI_SAMPLE_BYTES: usize = 512;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Flow key — canonical bidirectional 5-tuple
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +157,10 @@ struct FlowAcc {
     http_response_body_max:  u32,
     ftp_cmd_count:           u32,
     ftp_logged_in:           bool,
+    // DPI payload samples — first DPI_SAMPLE_BYTES per direction.
+    // Populated by push(); read by FeatureExtractor::get_payload_for_connection().
+    pub src_payload_sample:  Vec<u8>,
+    pub dst_payload_sample:  Vec<u8>,
     // Running counters — accurate for ALL packets (not capped by MAX_PKTS)
     src_pkt_count:  u32,
     dst_pkt_count:  u32,
@@ -172,13 +181,30 @@ impl FlowAcc {
             last_src_seq: 0, last_dst_seq: 0,
             http_req_count: 0, http_response_body_max: 0,
             ftp_cmd_count: 0, ftp_logged_in: false,
+            src_payload_sample: Vec::new(),
+            dst_payload_sample: Vec::new(),
             src_pkt_count: 0, dst_pkt_count: 0,
             src_byte_count: 0, dst_byte_count: 0,
             last_src_win: 0, last_dst_win: 0,
         }
     }
 
-    fn push(&mut self, p: PktSummary) {
+    fn push(&mut self, p: PktSummary, payload: &[u8]) {
+        // ── DPI sample — captured before any other accounting ─────────────────
+        // Store the first DPI_SAMPLE_BYTES of payload per direction.  We only
+        // grow the buffer while it is under the cap, so this is at most one
+        // bounded extend_from_slice per packet and zero cost once full.
+        if !payload.is_empty() {
+            let sample = if p.from_src {
+                &mut self.src_payload_sample
+            } else {
+                &mut self.dst_payload_sample
+            };
+            if sample.len() < DPI_SAMPLE_BYTES {
+                let remaining = DPI_SAMPLE_BYTES - sample.len();
+                sample.extend_from_slice(&payload[..payload.len().min(remaining)]);
+            }
+        }
         // TCP state machine
         if p.tcp_syn && !p.tcp_ack_flag {
             self.syn_ts = Some(p.ts);
@@ -420,9 +446,14 @@ fn classify_ftp(payload: &[u8]) -> (bool, bool) {
 // Packet parser
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parse a raw captured frame into (FlowKey, PktSummary).
+/// Parse a raw captured frame into `(FlowKey, PktSummary, payload_bytes)`.
+///
+/// The returned `payload_bytes` are the raw transport-layer payload.  The
+/// capture thread passes them to `FlowAcc::push` so the DPI sample buffer can
+/// be populated without re-parsing the packet a second time.
+///
 /// Accepts Ethernet II or raw IP (loopback / null link-type).
-fn parse_packet(data: &[u8], ts: f64, wire_len: u32) -> Option<(FlowKey, PktSummary)> {
+fn parse_packet(data: &[u8], ts: f64, wire_len: u32) -> Option<(FlowKey, PktSummary, Vec<u8>)> {
     let sliced = SlicedPacket::from_ethernet(data)
         .or_else(|_| SlicedPacket::from_ip(data))
         .ok()?;
@@ -492,7 +523,7 @@ fn parse_packet(data: &[u8], ts: f64, wire_len: u32) -> Option<(FlowKey, PktSumm
         http_response_body,
         is_ftp_cmd,
         ftp_logged_in,
-    }))
+    }, payload_bytes))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -766,11 +797,11 @@ fn spawn_capture_threads(
                                + pkt.header.ts.tv_usec as f64 * 1e-6;
                         let wlen = pkt.header.len;
 
-                        if let Some((key, summary)) = parse_packet(pkt.data, ts, wlen) {
+                        if let Some((key, summary, payload)) = parse_packet(pkt.data, ts, wlen) {
                             let svc = best_service(key.dport, key.sport);
                             table.entry(key)
                                 .or_insert_with(|| FlowAcc::new(svc))
-                                .push(summary);
+                                .push(summary, &payload);
                         }
                     }
                     // Yield CPU instead of spinning when the interface is quiet.
@@ -1121,6 +1152,33 @@ impl FeatureExtractor {
 
     pub fn csv_path(&self) -> &std::path::Path { &self.output_path }
 
+    /// Return the captured DPI payload sample for a given connection.
+    ///
+    /// Returns `(src_sample, dst_sample)` where `src`/`dst` follow the
+    /// canonical [`FlowKey`] direction (smaller address is canonical src).
+    /// Returns `None` when:
+    /// - the connection has no corresponding pcap flow (no packets captured yet), or
+    /// - the address cannot be parsed (listener with `remote = "*"`).
+    pub fn get_payload_for_connection(
+        &self,
+        conn: &NetworkConnection,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let (src, sp) = split_endpoint(&conn.local_address);
+        let (dst, dp) = split_endpoint(&conn.remote_address);
+        let sport = sp?;
+        let dport = dp?;
+        let proto: u8 = match conn.protocol.to_lowercase().as_str() {
+            "tcp"  => 6,
+            "udp"  => 17,
+            "icmp" => 1,
+            _      => return None,
+        };
+        let key = FlowKey::new(src, dst, sport, dport, proto);
+        self.flow_table.get(&key).map(|flow| {
+            (flow.src_payload_sample.clone(), flow.dst_payload_sample.clone())
+        })
+    }
+
     /// Truncate and rewrite the CSV from scratch: header + current rows only.
     fn write_snapshot(&self, lines: &[String]) -> Result<()> {
         let file = File::create(&self.output_path)
@@ -1257,7 +1315,7 @@ mod tests {
             [192,168,1,1], [93,184,216,34], 54321, 80,
             1000, 65535, 0x02, b"",
         );
-        let (key, pkt) = parse_packet(&raw, 1.0, raw.len() as u32).unwrap();
+        let (key, pkt, _payload) = parse_packet(&raw, 1.0, raw.len() as u32).unwrap();
         assert_eq!(key.dport, 80);
         assert!(pkt.tcp_syn);
         assert!(!pkt.tcp_ack_flag);
@@ -1272,7 +1330,7 @@ mod tests {
             [10,0,0,1], [10,0,0,2], 44444, 80, 5000, 8192, 0x18,
             b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n",
         );
-        let (_, pkt) = parse_packet(&raw, 2.0, raw.len() as u32).unwrap();
+        let (_, pkt, _payload) = parse_packet(&raw, 2.0, raw.len() as u32).unwrap();
         assert!(pkt.http_method);
     }
 
@@ -1282,7 +1340,7 @@ mod tests {
             [10,0,0,2], [10,0,0,1], 80, 44444, 9000, 8192, 0x18,
             b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n",
         );
-        let (_, pkt) = parse_packet(&raw, 3.0, raw.len() as u32).unwrap();
+        let (_, pkt, _payload) = parse_packet(&raw, 3.0, raw.len() as u32).unwrap();
         assert_eq!(pkt.http_response_body, 4096);
     }
 
@@ -1299,11 +1357,11 @@ mod tests {
         };
 
         // SYN
-        acc.push(PktSummary { ts: 1.000, tcp_syn: true, ..base.clone() });
+        acc.push(PktSummary { ts: 1.000, tcp_syn: true, ..base.clone() }, &[]);
         // SYN-ACK
-        acc.push(PktSummary { ts: 1.010, from_src: false, tcp_syn: true, tcp_ack_flag: true, ttl: 128, ..base.clone() });
+        acc.push(PktSummary { ts: 1.010, from_src: false, tcp_syn: true, tcp_ack_flag: true, ttl: 128, ..base.clone() }, &[]);
         // ACK
-        acc.push(PktSummary { ts: 1.012, tcp_ack_flag: true, ..base.clone() });
+        acc.push(PktSummary { ts: 1.012, tcp_ack_flag: true, ..base.clone() }, &[]);
 
         assert!((acc.synack() - 0.010).abs() < 1e-9);
         assert!((acc.ackdat() - 0.002).abs() < 1e-9);
@@ -1323,9 +1381,9 @@ mod tests {
             payload_len: 50, http_method: false, http_response_body: 0,
             is_ftp_cmd: false, ftp_logged_in: false,
         };
-        acc.push(base.clone());
-        acc.push(PktSummary { ts: 0.1, ..base.clone() }); // same seq = retransmit
-        acc.push(PktSummary { ts: 0.2, tcp_seq: 550, ..base });
+        acc.push(base.clone(), &[]);
+        acc.push(PktSummary { ts: 0.1, ..base.clone() }, &[]); // same seq = retransmit
+        acc.push(PktSummary { ts: 0.2, tcp_seq: 550, ..base }, &[]);
         assert_eq!(acc.sloss(), 1);
         assert_eq!(acc.dloss(), 0);
     }
@@ -1359,8 +1417,11 @@ mod tests {
             ct_srv_src: 3, ct_srv_dst: 5, ct_dst_ltm: 8, ct_src_ltm: 4,
             ct_src_dport_ltm: 2, ct_dst_sport_ltm: 1, ct_dst_src_ltm: 6,
         };
-        let line = row.to_csv_line();
-        let data_cols   = line.split(',').count();
+        // `to_csv_line()` produces 47 columns; the caller appends `pcap_data`
+        // (0 or 1) as the 48th column before writing to the CSV.  Test the full
+        // row (with pcap_data appended) against the header.
+        let full_line   = format!("{},1", row.to_csv_line()); // pcap_data = 1
+        let data_cols   = full_line.split(',').count();
         let header_cols = CSV_HEADER.split(',').count();
         assert_eq!(data_cols, header_cols,
             "row has {data_cols} cols, header has {header_cols}");
