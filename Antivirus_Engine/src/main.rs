@@ -104,6 +104,16 @@ fn run_daemon() {
 
     let scanner         = FileSystemScanner::new();
     let system_scanner  = SystemScanner::new();
+    let quick_scanner   = SystemScanner::with_config(
+        core::file_system::scan_all::SystemScanConfig {
+            roots:      SystemScanner::quick_roots(),
+            num_threads: 4,
+            // Cap walk depth at 3 — keeps Temp surface-level while still
+            // reaching tasks nested under System32\Tasks\Microsoft\Windows\*
+            max_depth:  Some(3),
+            ..core::file_system::scan_all::SystemScanConfig::default()
+        },
+    );
     let process_scanner = ProcessScanner::new();
     let network_scanner = NetworkScanner::new();
     // FIX: MemoryScanner is now created once here instead of being
@@ -139,6 +149,7 @@ fn run_daemon() {
                 daemon_scan_file(&scanner, Path::new(path), &id)
             }
             "scan-all"       => daemon_scan_all(&system_scanner, &id),
+            "quick-scan"     => daemon_scan_all(&quick_scanner, &id),
             "scan-dir"       => {
                 let path = request["path"].as_str().unwrap_or("");
                 daemon_scan_dir(&scanner, Path::new(path), &id)

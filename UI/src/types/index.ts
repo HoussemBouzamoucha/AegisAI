@@ -213,7 +213,7 @@ export interface ScanHistoryEntry {
   id: string;
   timestamp: Date;
   path: string;
-  type: 'file' | 'directory';
+  type: 'file' | 'directory' | 'full-scan' | 'quick-scan';
   stats: {
     total: number;
     clean: number;

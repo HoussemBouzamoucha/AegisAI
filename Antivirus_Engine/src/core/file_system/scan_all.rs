@@ -339,6 +339,11 @@ pub struct SystemScanConfig {
 
     /// Optional directory containing custom `.yar` / `.yara` rules.
     pub yara_rules_dir: Option<PathBuf>,
+
+    /// Maximum directory walk depth.  `None` = unlimited (default for full
+    /// scan).  Set to a small value (e.g. `Some(3)`) for quick scan so that
+    /// large temp trees are only surface-scanned.
+    pub max_depth: Option<usize>,
 }
 
 impl Default for SystemScanConfig {
@@ -357,6 +362,7 @@ impl Default for SystemScanConfig {
             num_threads: DEFAULT_THREAD_COUNT,
             incremental: true,
             yara_rules_dir: None,
+            max_depth: None,
         }
     }
 }
@@ -556,6 +562,72 @@ impl SystemScanner {
         roots
     }
 
+    /// Roots for the quick scan — 7 bounded, high-signal directories only.
+    ///
+    /// | Directory | Rationale |
+    /// |-----------|-----------|
+    /// | Downloads | Primary malware landing zone |
+    /// | Desktop   | Common user-run location |
+    /// | TEMP (depth-limited) | Dropper staging; walk capped at 3 levels |
+    /// | User Startup folder | Per-user autorun persistence |
+    /// | All-users Startup folder | System-wide autorun persistence |
+    /// | System32\Tasks | Scheduled-task XML persistence |
+    /// | System32\drivers | Kernel-driver / rootkit drop target |
+    pub fn quick_roots() -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+
+        #[cfg(windows)]
+        {
+            // Landing zones
+            if let Ok(profile) = std::env::var("USERPROFILE") {
+                let base = PathBuf::from(&profile);
+                for sub in &["Downloads", "Desktop"] {
+                    let p = base.join(sub);
+                    if p.exists() { roots.push(p); }
+                }
+            }
+
+            // Dropper staging (depth is capped by the quick scan config)
+            for var in &["TEMP", "TMP"] {
+                if let Ok(p) = std::env::var(var) {
+                    let pb = PathBuf::from(p);
+                    if pb.exists() && !roots.contains(&pb) { roots.push(pb); }
+                }
+            }
+
+            // Persistence — autorun startup folders
+            if let Ok(profile) = std::env::var("USERPROFILE") {
+                let p = PathBuf::from(profile)
+                    .join("AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+                if p.exists() { roots.push(p); }
+            }
+            if let Ok(pd) = std::env::var("ProgramData") {
+                let p = PathBuf::from(pd)
+                    .join("Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+                if p.exists() { roots.push(p); }
+            }
+
+            // Persistence — scheduled tasks + kernel drivers
+            if let Ok(sys) = std::env::var("SystemRoot") {
+                let base = PathBuf::from(sys);
+                for sub in &["System32\\Tasks", "System32\\drivers"] {
+                    let p = base.join(sub);
+                    if p.exists() { roots.push(p); }
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            for p in &["/tmp", "/var/tmp"] {
+                let pb = PathBuf::from(p);
+                if pb.exists() { roots.push(pb); }
+            }
+        }
+
+        roots
+    }
+
     // ── Path collection ───────────────────────────────────────────────────────
 
     /// Walks all configured roots and returns two sorted path lists with
@@ -571,8 +643,11 @@ impl SystemScanner {
         for root in &self.config.roots {
             if !root.exists() { continue; }
 
-            for entry in WalkDir::new(root)
-                .follow_links(false)
+            let walker = {
+                let w = WalkDir::new(root).follow_links(false);
+                if let Some(d) = self.config.max_depth { w.max_depth(d) } else { w }
+            };
+            for entry in walker
                 .into_iter()
                 .filter_entry(|e| {
                     if e.file_type().is_dir() {

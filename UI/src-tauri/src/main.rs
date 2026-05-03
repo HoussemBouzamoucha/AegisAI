@@ -806,6 +806,45 @@ async fn get_engine_status(
     }))
 }
 
+// ─── Quick scan ───────────────────────────────────────────────────────────────
+
+/// Quick scan — delegates to the daemon's `quick-scan` command, which uses
+/// `SystemScanner::quick_roots()`: Downloads, Desktop, AppData Temp/Roaming,
+/// ProgramData, Startup folder, System32\Tasks + drivers.
+/// Typically completes in 1–5 minutes vs 30–120 min for a full scan.
+#[tauri::command]
+async fn quick_scan(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<ScanOutput, String> {
+    eprintln!("quick_scan: delegating to daemon quick-scan command");
+
+    let request = serde_json::json!({ "id": next_id(), "cmd": "quick-scan" });
+
+    let json = daemon_request(&state, request, Duration::from_secs(900))
+        .map_err(|e| format!("quick-scan daemon error: {}", e))?;
+
+    if let Some(err) = json["error"].as_str() {
+        return Err(format!("quick-scan: {}", err));
+    }
+
+    let files: Vec<ScanResult> = json["files"]
+        .as_array()
+        .map(|arr| arr.iter().map(|f| parse_scan_result(f, "")).collect())
+        .unwrap_or_default();
+
+    let s = &json["statistics"];
+    let statistics = ScanStats {
+        total_files:      s["total_files"].as_u64().unwrap_or(0),
+        clean_files:      s["clean_files"].as_u64().unwrap_or(0),
+        suspicious_files: s["suspicious_files"].as_u64().unwrap_or(0),
+        malicious_files:  s["malicious_files"].as_u64().unwrap_or(0),
+        error_files:      s["error_files"].as_u64().unwrap_or(0),
+        total_size_mb:    s["total_size_mb"].as_f64().unwrap_or(0.0),
+    };
+
+    Ok(ScanOutput { success: true, files, statistics, error: None })
+}
+
 // ─── Full system scan ─────────────────────────────────────────────────────────
 
 /// Full-system scan delegated entirely to the daemon's `scan-all` command,
@@ -829,7 +868,7 @@ async fn scan_all(
     // SystemScanner uses a thread pool and incremental cache so the wall-clock
     // time is a fraction of a serial walk.  30 minutes is a generous ceiling
     // that covers a cold (no-cache) first run over tens of thousands of files.
-    let json = daemon_request(&state, request, Duration::from_secs(1800))
+    let json = daemon_request(&state, request, Duration::from_secs(7200))
         .map_err(|e| format!("scan-all daemon error: {}", e))?;
 
     if let Some(err) = json["error"].as_str() {
@@ -884,6 +923,7 @@ fn main() {
             scan_file,
             scan_directory,
             scan_all,
+            quick_scan,
             scan_processes,
             scan_network,
             scan_memory,

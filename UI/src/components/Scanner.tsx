@@ -318,13 +318,13 @@ export default function Scanner() {
   const {
     scanning, scanResults, scanStats, scanError,
     lastScanDurationMs,
-    scanFile, scanDirectory, scanAll, clearScan,
+    scanFile, scanDirectory, scanAll, quickScan, clearScan,
   } = useStore();
 
   const [tab, setTab] = useState<'threats' | 'all'>('threats');
   const [pathInput, setPathInput] = useState('');
   // Track which kind of scan is running so the spinner label is accurate.
-  const [scanMode, setScanMode] = useState<'file' | 'directory' | 'all' | null>(null);
+  const [scanMode, setScanMode] = useState<'file' | 'directory' | 'all' | 'quick' | null>(null);
 
   // ── Live elapsed timer ───────────────────────────────────────────────────────
   const [elapsedSecs, setElapsedSecs] = useState(0);
@@ -363,6 +363,12 @@ export default function Scanner() {
     setScanMode('all');
     clearScan();
     scanAll();
+  };
+
+  const handleQuickScan = () => {
+    setScanMode('quick');
+    clearScan();
+    quickScan();
   };
 
   const handleBrowse = async () => {
@@ -502,88 +508,159 @@ export default function Scanner() {
           ))}
         </div>
 
-        {/* ── SCAN ALL button — separate row, distinct style ─────────────── */}
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 12,
-          padding: '10px 14px',
-          background: scanning && scanMode === 'all'
-            ? 'rgba(0,200,255,0.05)'
-            : 'var(--surface)',
-          border: `1px solid ${scanning && scanMode === 'all' ? 'var(--cyan)' : 'var(--border)'}`,
-          borderRadius: 6,
-          transition: 'border-color 0.2s, background 0.2s',
-        }}>
-          <button
-            onClick={handleScanAll}
-            disabled={scanning}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              padding: '8px 20px',
-              background: 'rgba(0,200,255,0.1)',
-              border: '1px solid var(--cyan)',
-              borderRadius: 6,
-              color: 'var(--cyan)',
-              fontFamily: 'var(--font-hud)', fontSize: 11,
-              letterSpacing: '0.12em', fontWeight: 700,
-              cursor: scanning ? 'not-allowed' : 'pointer',
-              opacity: scanning ? 0.5 : 1,
-              transition: 'all 0.15s',
-            }}
-            onMouseEnter={e => {
-              if (!scanning) {
-                const el = e.currentTarget as HTMLButtonElement;
-                el.style.background = 'rgba(0,200,255,0.18)';
-                el.style.boxShadow = '0 0 12px rgba(0,200,255,0.2)';
-              }
-            }}
-            onMouseLeave={e => {
-              const el = e.currentTarget as HTMLButtonElement;
-              el.style.background = 'rgba(0,200,255,0.1)';
-              el.style.boxShadow = 'none';
-            }}
-          >
-            <HardDrive size={16} />
-            SCAN ALL
-          </button>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            <span style={{
-              fontFamily: 'var(--font-mono)', fontSize: 10,
-              color: 'var(--text-dim)',
-            }}>
-              Scans: User Profile · System Temp · ProgramData · System32
-            </span>
-            <span style={{
-              fontFamily: 'var(--font-mono)', fontSize: 9,
-              color: 'var(--text-dim)', opacity: 0.6,
-            }}>
-              Covers the highest-risk locations — may take several minutes
-            </span>
-          </div>
+        {/* ── QUICK SCAN + SCAN ALL row ──────────────────────────────────── */}
+        <div style={{ display: 'flex', gap: 8 }}>
 
-          {/* Live elapsed timer — only visible while a full scan runs */}
-          {scanning && scanMode === 'all' && (
-            <div style={{
-              marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6,
-              padding: '4px 10px',
-              background: 'rgba(0,200,255,0.08)',
-              border: '1px solid rgba(0,200,255,0.3)',
-              borderRadius: 4,
-              flexShrink: 0,
-            }}>
-              <div style={{
-                width: 6, height: 6, borderRadius: '50%',
-                background: 'var(--cyan)',
-                animation: 'pulse 1s ease-in-out infinite',
-              }} />
-              <span style={{
-                fontFamily: 'var(--font-mono)', fontSize: 13,
-                color: 'var(--cyan)', fontWeight: 600,
-                minWidth: 52,
-              }}>
-                {formatElapsed(elapsedSecs)}
+          {/* Quick Scan */}
+          <div style={{
+            flex: 1, display: 'flex', alignItems: 'center', gap: 12,
+            padding: '10px 14px',
+            background: scanning && scanMode === 'quick'
+              ? 'rgba(255,180,0,0.05)'
+              : 'var(--surface)',
+            border: `1px solid ${scanning && scanMode === 'quick' ? 'var(--amber)' : 'var(--border)'}`,
+            borderRadius: 6,
+            transition: 'border-color 0.2s, background 0.2s',
+          }}>
+            <button
+              onClick={handleQuickScan}
+              disabled={scanning}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '8px 18px',
+                background: 'rgba(255,180,0,0.1)',
+                border: '1px solid var(--amber)',
+                borderRadius: 6,
+                color: 'var(--amber)',
+                fontFamily: 'var(--font-hud)', fontSize: 11,
+                letterSpacing: '0.12em', fontWeight: 700,
+                cursor: scanning ? 'not-allowed' : 'pointer',
+                opacity: scanning ? 0.5 : 1,
+                transition: 'all 0.15s',
+                flexShrink: 0,
+              }}
+              onMouseEnter={e => {
+                if (!scanning) {
+                  const el = e.currentTarget as HTMLButtonElement;
+                  el.style.background = 'rgba(255,180,0,0.18)';
+                  el.style.boxShadow = '0 0 12px rgba(255,180,0,0.2)';
+                }
+              }}
+              onMouseLeave={e => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.background = 'rgba(255,180,0,0.1)';
+                el.style.boxShadow = 'none';
+              }}
+            >
+              <Zap size={15} />
+              QUICK SCAN
+            </button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                Downloads · Desktop · AppData · Temp · Tasks · Drivers
+              </span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', opacity: 0.6 }}>
+                High-risk locations only — typically 1–5 minutes
               </span>
             </div>
-          )}
+            {scanning && scanMode === 'quick' && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '4px 10px',
+                background: 'rgba(255,180,0,0.08)',
+                border: '1px solid rgba(255,180,0,0.3)',
+                borderRadius: 4, flexShrink: 0,
+              }}>
+                <div style={{
+                  width: 6, height: 6, borderRadius: '50%',
+                  background: 'var(--amber)',
+                  animation: 'pulse 1s ease-in-out infinite',
+                }} />
+                <span style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 13,
+                  color: 'var(--amber)', fontWeight: 600, minWidth: 52,
+                }}>
+                  {formatElapsed(elapsedSecs)}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Full Scan All */}
+          <div style={{
+            flex: 1, display: 'flex', alignItems: 'center', gap: 12,
+            padding: '10px 14px',
+            background: scanning && scanMode === 'all'
+              ? 'rgba(0,200,255,0.05)'
+              : 'var(--surface)',
+            border: `1px solid ${scanning && scanMode === 'all' ? 'var(--cyan)' : 'var(--border)'}`,
+            borderRadius: 6,
+            transition: 'border-color 0.2s, background 0.2s',
+          }}>
+            <button
+              onClick={handleScanAll}
+              disabled={scanning}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '8px 18px',
+                background: 'rgba(0,200,255,0.1)',
+                border: '1px solid var(--cyan)',
+                borderRadius: 6,
+                color: 'var(--cyan)',
+                fontFamily: 'var(--font-hud)', fontSize: 11,
+                letterSpacing: '0.12em', fontWeight: 700,
+                cursor: scanning ? 'not-allowed' : 'pointer',
+                opacity: scanning ? 0.5 : 1,
+                transition: 'all 0.15s',
+                flexShrink: 0,
+              }}
+              onMouseEnter={e => {
+                if (!scanning) {
+                  const el = e.currentTarget as HTMLButtonElement;
+                  el.style.background = 'rgba(0,200,255,0.18)';
+                  el.style.boxShadow = '0 0 12px rgba(0,200,255,0.2)';
+                }
+              }}
+              onMouseLeave={e => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.background = 'rgba(0,200,255,0.1)';
+                el.style.boxShadow = 'none';
+              }}
+            >
+              <HardDrive size={15} />
+              SCAN ALL
+            </button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                Full system — Users · Windows · Program Files · ProgramData
+              </span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', opacity: 0.6 }}>
+                Complete coverage — up to 2 hours on first run
+              </span>
+            </div>
+            {scanning && scanMode === 'all' && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '4px 10px',
+                background: 'rgba(0,200,255,0.08)',
+                border: '1px solid rgba(0,200,255,0.3)',
+                borderRadius: 4, flexShrink: 0,
+              }}>
+                <div style={{
+                  width: 6, height: 6, borderRadius: '50%',
+                  background: 'var(--cyan)',
+                  animation: 'pulse 1s ease-in-out infinite',
+                }} />
+                <span style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 13,
+                  color: 'var(--cyan)', fontWeight: 600, minWidth: 52,
+                }}>
+                  {formatElapsed(elapsedSecs)}
+                </span>
+              </div>
+            )}
+          </div>
+
         </div>
       </div>
 
@@ -699,14 +776,18 @@ export default function Scanner() {
             alignItems: 'center', justifyContent: 'center', gap: 16,
           }}>
             <div style={{ animation: 'spin 1s linear infinite' }}>
-              <Loader size={28} color={scanMode === 'all' ? 'var(--cyan)' : 'var(--green)'} />
+              <Loader size={28} color={
+                scanMode === 'all' ? 'var(--cyan)' :
+                scanMode === 'quick' ? 'var(--amber)' :
+                'var(--green)'
+              } />
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
               <div style={{
                 fontFamily: 'var(--font-mono)', fontSize: 12,
-                color: scanMode === 'all' ? 'var(--cyan)' : 'var(--green)',
+                color: scanMode === 'all' ? 'var(--cyan)' : scanMode === 'quick' ? 'var(--amber)' : 'var(--green)',
               }}>
-                {scanMode === 'all' ? 'SCANNING ALL...' : 'SCANNING...'}
+                {scanMode === 'all' ? 'SCANNING ALL...' : scanMode === 'quick' ? 'QUICK SCAN...' : 'SCANNING...'}
               </div>
               {/* Elapsed timer — visible for all scan modes */}
               <div style={{
@@ -725,12 +806,14 @@ export default function Scanner() {
                   {formatElapsed(elapsedSecs)}
                 </span>
               </div>
-              {scanMode === 'all' && (
+              {(scanMode === 'all' || scanMode === 'quick') && (
                 <div style={{
                   fontFamily: 'var(--font-mono)', fontSize: 10,
-                  color: 'var(--text-dim)', maxWidth: 320, textAlign: 'center',
+                  color: 'var(--text-dim)', maxWidth: 360, textAlign: 'center',
                 }}>
-                  Scanning User Profile · System Temp · ProgramData · System32
+                  {scanMode === 'quick'
+                    ? 'Scanning Downloads · Desktop · AppData · Temp · Tasks · Drivers'
+                    : 'Scanning Users · Windows · Program Files · ProgramData'}
                 </div>
               )}
             </div>

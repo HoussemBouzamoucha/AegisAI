@@ -25,6 +25,7 @@ interface AppState {
   scanFile: (path: string) => Promise<void>;
   scanDirectory: (path: string) => Promise<void>;
   scanAll: () => Promise<void>;
+  quickScan: () => Promise<void>;
   clearScan: () => void;
 
   processScanning: boolean;
@@ -244,6 +245,36 @@ export const useStore = create<AppState>((set, get) => ({
         timestamp: new Date(),
         path: '[FULL SYSTEM SCAN]',
         type: 'directory',
+        stats: {
+          total:      s.total_files,
+          clean:      s.clean_files,
+          suspicious: s.suspicious_files,
+          malicious:  s.malicious_files,
+        },
+        durationMs,
+      });
+    } catch (e: any) {
+      set({ scanError: String(e) });
+    } finally {
+      set({ scanning: false });
+    }
+  },
+
+  quickScan: async () => {
+    set({ scanning: true, scanResults: [], scanStats: null, scanError: null, lastScanDurationMs: null });
+    const t0 = Date.now();
+    try {
+      const result = await invoke<ScanOutput>('quick_scan');
+      if (!result.success) throw new Error(result.error ?? 'Quick scan failed');
+      const files = (result.files ?? []).map(normalizeScanResult);
+      const durationMs = Date.now() - t0;
+      set({ scanResults: files, scanStats: result.statistics, lastScanDurationMs: durationMs });
+      const s = result.statistics;
+      get().addHistory({
+        id: crypto.randomUUID(),
+        timestamp: new Date(),
+        path: '[QUICK SCAN]',
+        type: 'quick-scan',
         stats: {
           total:      s.total_files,
           clean:      s.clean_files,
