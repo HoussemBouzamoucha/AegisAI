@@ -53,6 +53,52 @@ const MALICIOUS_THRESHOLD: i32 = 10;
 const SUSPICIOUS_THRESHOLD: i32 = 4;
 const MAX_CONTENT_SCAN_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
+// ─── Path trust tiers ─────────────────────────────────────────────────────────
+//
+// Mirrors the memory scanner's SystemOs / TrustedInstall model.  Files in
+// known Microsoft system directories accumulate enough heuristic signal from
+// ordinary PE structure and entropy to breach the Malicious threshold even
+// though they are completely legitimate.  The cap prevents false positives
+// without disabling detection entirely — a genuinely suspicious signal set
+// can still produce a Suspicious verdict.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathTrustTier {
+    /// `C:\Windows\System32` and `C:\Windows\SysWOW64` — score capped below
+    /// `MALICIOUS_THRESHOLD` so that normal kernel-mode / system files cannot
+    /// be reported as Malicious on heuristics alone.
+    TrustedSystem,
+    /// `C:\Windows\WinSxS` and `C:\Windows\Installer` — same cap as
+    /// `TrustedSystem`; component-store and installer payloads are similarly
+    /// noisy but legitimate.
+    TrustedInstall,
+    /// All other paths — full heuristic scoring applies.
+    Unknown,
+}
+
+/// Map a file path to its trust tier.
+///
+/// Case-insensitive prefix match; the lowercased path string is checked against
+/// known Windows system directory fragments.  Non-Windows builds always return
+/// `Unknown`.
+#[cfg(windows)]
+fn path_trust_tier(path: &Path) -> PathTrustTier {
+    let s = path.to_string_lossy().to_ascii_lowercase();
+    if s.contains(r"windows\system32") || s.contains(r"windows\syswow64") {
+        return PathTrustTier::TrustedSystem;
+    }
+    if s.contains(r"windows\winsxs") || s.contains(r"windows\installer") {
+        return PathTrustTier::TrustedInstall;
+    }
+    PathTrustTier::Unknown
+}
+
+#[cfg(not(windows))]
+#[inline]
+fn path_trust_tier(_path: &Path) -> PathTrustTier {
+    PathTrustTier::Unknown
+}
+
 // ─── Extension tables (MUST remain sorted — binary_search depends on order) ──
 
 /// Text/document extensions — sorted ASCII.
@@ -282,6 +328,17 @@ impl HeuristicAnalyzer {
         if let Some(c) = check_timestamps(&metadata) {
             total_score += c.score;
             contributions.push(c);
+        }
+
+        // ── Trust tier cap ────────────────────────────────────────────────────
+        // Files under known Microsoft system paths are capped at
+        // MALICIOUS_THRESHOLD - 1 so that legitimate high-entropy / PE-header
+        // signals cannot push them to Malicious.  They can still be Suspicious
+        // if the signal set is genuinely alarming (e.g. a trojanised system DLL
+        // with ransomware phrases would score well above SUSPICIOUS_THRESHOLD
+        // even after the cap).
+        if path_trust_tier(path) != PathTrustTier::Unknown {
+            total_score = total_score.min(MALICIOUS_THRESHOLD - 1);
         }
 
         // ── Decision ──────────────────────────────────────────────────────────

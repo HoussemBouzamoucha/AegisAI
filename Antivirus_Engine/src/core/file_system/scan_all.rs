@@ -562,7 +562,7 @@ impl SystemScanner {
         roots
     }
 
-    /// Roots for the quick scan — 7 bounded, high-signal directories only.
+    /// Roots for the quick scan — 6 bounded, high-signal directories only.
     ///
     /// | Directory | Rationale |
     /// |-----------|-----------|
@@ -572,7 +572,13 @@ impl SystemScanner {
     /// | User Startup folder | Per-user autorun persistence |
     /// | All-users Startup folder | System-wide autorun persistence |
     /// | System32\Tasks | Scheduled-task XML persistence |
-    /// | System32\drivers | Kernel-driver / rootkit drop target |
+    ///
+    /// **System32\drivers is intentionally excluded.** Every legitimate kernel
+    /// driver (.sys) accumulates enough heuristic signal (PE header + high
+    /// entropy + imported API strings) to cross the Malicious threshold, producing
+    /// ~50 % false-positive rates with no real gain — rootkit drivers are caught
+    /// by the process scanner when they load.  A path-trust-tier cap in
+    /// `heuristics.rs` suppresses the same class of FPs for full scans.
     pub fn quick_roots() -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
 
@@ -607,13 +613,10 @@ impl SystemScanner {
                 if p.exists() { roots.push(p); }
             }
 
-            // Persistence — scheduled tasks + kernel drivers
+            // Persistence — scheduled tasks
             if let Ok(sys) = std::env::var("SystemRoot") {
-                let base = PathBuf::from(sys);
-                for sub in &["System32\\Tasks", "System32\\drivers"] {
-                    let p = base.join(sub);
-                    if p.exists() { roots.push(p); }
-                }
+                let p = PathBuf::from(sys).join("System32\\Tasks");
+                if p.exists() { roots.push(p); }
             }
         }
 

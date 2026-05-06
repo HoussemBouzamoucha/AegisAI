@@ -1,0 +1,55 @@
+FALSE POSITIVES — System32\drivers in Quick Scan
+==================================================
+
+SYMPTOM
+-------
+Quick scan reports ~1382 MALICIOUS threats out of 2807 files.
+All flagged files are legitimate Microsoft Windows kernel drivers
+(ntfs.sys, portcls.sys, processr.sys, rdbss.sys, refsv1.sys, etc.)
+located in C:\Windows\System32\drivers\.
+
+ROOT CAUSE
+----------
+Every .sys file in System32\drivers hits multiple heuristic signals at once:
+
+  - Extension score  : +40  (.sys is in the executable/driver tier)
+  - Location score   : +15  (System32 path = medium-risk)
+  - Entropy score    : high  (kernel drivers have compressed/packed sections)
+  - PE structure     : triggers import-table and code-section patterns
+
+Combined, virtually every legitimate driver clears the Malicious threshold.
+The file heuristics engine has no trust model for known Microsoft system files,
+unlike the memory scanner which has a SystemOs / JitRuntime / TrustedInstall
+trust tier to suppress these false positives.
+
+IMMEDIATE FIX (done / pending)
+--------------------------------
+Remove System32\drivers from quick_roots() entirely.
+Rationale: a real rootkit driver would appear as a running process that the
+process scanner already catches — the file scanner adds no signal here without
+a signature trust model, and only produces noise.
+
+LONG-TERM FIX (pending)
+------------------------
+Implement a path-based trust tier in the heuristics engine:
+
+  Files located under known Microsoft system paths
+  (System32\drivers, System32, SysWOW64, Windows\WinSxS, etc.)
+  that carry a valid Microsoft Authenticode signature should receive
+  a score ceiling cap — similar to how MemoryScanner's SystemOs tier
+  prevents the same class of false positives in memory scanning.
+
+  Suggested tiers (mirrors memory scanner):
+    TrustedSystem  — C:\Windows\System32\drivers, C:\Windows\System32
+    TrustedInstall — C:\Windows\WinSxS, C:\Windows\Installer
+    Unknown        — everything else (full heuristic scoring applies)
+
+  Implementation surface:
+    Antivirus_Engine/src/core/file_system/heuristics.rs
+    Add a path_trust_tier() helper that maps the file path to a tier,
+    then cap combined_score before returning the final ThreatLevel.
+
+AFFECTED FILES
+--------------
+  Antivirus_Engine/src/core/file_system/scan_all.rs   (quick_roots)
+  Antivirus_Engine/src/core/file_system/heuristics.rs (long-term fix)
