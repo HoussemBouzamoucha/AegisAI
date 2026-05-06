@@ -250,7 +250,9 @@ pub struct HeuristicAnalyzer;
 impl HeuristicAnalyzer {
     pub fn new() -> Self { Self }
 
-    pub fn analyze(&self, path: &Path) -> Result<ScanResult> {
+    /// Returns `(ScanResult, total_score)` so callers can add the score into a
+    /// unified multi-layer total without re-parsing the reason string.
+    pub fn analyze(&self, path: &Path) -> Result<(ScanResult, i32)> {
         let metadata  = fs::metadata(path)?;
         let file_size = metadata.len();
         let file_category = FileCategory::from_path(path);
@@ -389,7 +391,7 @@ impl HeuristicAnalyzer {
             compute_sha256(path).ok()
         };
 
-        Ok(ScanResult {
+        Ok((ScanResult {
             path: path.to_path_buf(),
             level,
             reason,
@@ -399,7 +401,7 @@ impl HeuristicAnalyzer {
             detection_signals,
             file_category,
             context_flags: vec![],
-        })
+        }, total_score))
     }
 }
 
@@ -744,7 +746,7 @@ mod tests {
         writeln!(f, "All your files have been encrypted.").unwrap();
         writeln!(f, "Pay bitcoin to recover your files.").unwrap();
         writeln!(f, "Your decryption key will be deleted.").unwrap();
-        let result = HeuristicAnalyzer::new().analyze(&path).unwrap();
+        let (result, _score) = HeuristicAnalyzer::new().analyze(&path).unwrap();
         assert!(result.level != ThreatLevel::Clean,
             "Ransomware note should be flagged. Reason: {}", result.reason);
         assert!(!result.detection_signals.is_empty());
@@ -759,7 +761,7 @@ mod tests {
              Not strictly a regularizer, but often has a regularization effect. \
              Neural network-HowTo: gradient descent optimizer learning rate epoch."
         ).unwrap();
-        let result = HeuristicAnalyzer::new().analyze(&path).unwrap();
+        let (result, _score) = HeuristicAnalyzer::new().analyze(&path).unwrap();
         assert_eq!(result.level, ThreatLevel::Clean,
             "ML notes wrongly flagged: {}", result.reason);
         assert_eq!(result.file_category, FileCategory::Document);
@@ -770,7 +772,7 @@ mod tests {
     fn test_howto_filename_clean() {
         let path = std::env::temp_dir().join("Neural network-HowTo.txt");
         std::fs::write(&path, "Tutorial on neural networks.").unwrap();
-        let result = HeuristicAnalyzer::new().analyze(&path).unwrap();
+        let (result, _score) = HeuristicAnalyzer::new().analyze(&path).unwrap();
         assert_eq!(result.level, ThreatLevel::Clean,
             "HowTo filename wrongly flagged: {}", result.reason);
         std::fs::remove_file(path).ok();
@@ -780,7 +782,7 @@ mod tests {
     fn test_signals_populated() {
         let path = std::env::temp_dir().join("signal_test_ransom.txt");
         std::fs::write(&path, "pay bitcoin to decrypt your files ransom demand").unwrap();
-        let result = HeuristicAnalyzer::new().analyze(&path).unwrap();
+        let (result, _score) = HeuristicAnalyzer::new().analyze(&path).unwrap();
         if result.level != ThreatLevel::Clean {
             assert!(!result.detection_signals.is_empty(),
                 "Flagged file should have detection signals");
@@ -792,7 +794,7 @@ mod tests {
     fn test_confidence_score_range() {
         let path = std::env::temp_dir().join("confidence_test.txt");
         std::fs::write(&path, "normal content").unwrap();
-        let result = HeuristicAnalyzer::new().analyze(&path).unwrap();
+        let (result, _score) = HeuristicAnalyzer::new().analyze(&path).unwrap();
         assert!(result.confidence_score >= 0.0 && result.confidence_score <= 1.0);
         std::fs::remove_file(path).ok();
     }
@@ -801,7 +803,7 @@ mod tests {
     fn test_zero_byte_exe() {
         let path = std::env::temp_dir().join("zero_heuristic2.exe");
         std::fs::write(&path, "").unwrap();
-        let result = HeuristicAnalyzer::new().analyze(&path).unwrap();
+        let (result, _score) = HeuristicAnalyzer::new().analyze(&path).unwrap();
         assert!(result.level != ThreatLevel::Clean);
         assert_eq!(result.file_category, FileCategory::Executable);
         std::fs::remove_file(path).ok();
@@ -811,7 +813,7 @@ mod tests {
     fn test_timestamp_alone_not_suspicious() {
         let path = std::env::temp_dir().join("timestamp_alone.txt");
         std::fs::write(&path, "Clean content.").unwrap();
-        let result = HeuristicAnalyzer::new().analyze(&path).unwrap();
+        let (result, _score) = HeuristicAnalyzer::new().analyze(&path).unwrap();
         assert_eq!(result.level, ThreatLevel::Clean,
             "Timestamp alone should not flag: {}", result.reason);
         std::fs::remove_file(path).ok();

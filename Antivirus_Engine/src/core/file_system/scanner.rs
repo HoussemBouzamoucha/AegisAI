@@ -18,10 +18,11 @@ use crate::core::file_system::heuristics::HeuristicAnalyzer;
 use crate::core::file_system::signature::SignatureDatabase;
 use crate::core::file_system::yara_engine::YaraEngine;
 use crate::core::types::{DetectionSignal, FileCategory, ScanResult, ThreatLevel};
+use crate::core::utils::{compute_sha256, compute_sha256_from_bytes};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use anyhow::Result;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use hex;
 
 // ─── Score thresholds ─────────────────────────────────────────────────────────
@@ -43,9 +44,9 @@ const YARA_WEAK_RULES: &[&str] = &[
     "BigFiles",
     "suspicious_strings",
     "generic",
-    // Network indicator rules — belong in network scanner (not built yet)
-    // Kept as weak (+1) to avoid false positives on scripts with URLs/IPs
-    // TODO: move to network_scanner::yara_policy when network module is built
+    // Network indicator rules — kept as weak (+1) here because scripts can
+    // legitimately embed URLs/IPs.  The network scanner uses pcap + ML and
+    // does not have a YARA layer yet; these stay until that is added.
     // Tool name rules — too generic, fire on any script calling the tool
     "powershell",
     "cmd",
@@ -188,7 +189,7 @@ impl FileSystemScanner {
         } else {
             FileHashes {
                 md5: String::new(),
-                sha256: self.calculate_sha256(path)?,
+                sha256: compute_sha256(path)?,
                 sha512: String::new(),
             }
         };
@@ -248,9 +249,8 @@ impl FileSystemScanner {
         // ── Layer 3: Heuristics ───────────────────────────────────────────────
         if self.enable_deep_scan {
             match self.heuristics.analyze(path) {
-                Ok(heuristic_result) => {
+                Ok((heuristic_result, h_score)) => {
                     if heuristic_result.level != ThreatLevel::Clean {
-                        let h_score = Self::extract_heuristic_score(&heuristic_result.reason);
                         total_score += h_score;
                         score_reasons.push(heuristic_result.reason.clone());
                         all_signals.extend(heuristic_result.detection_signals.clone());
@@ -394,31 +394,13 @@ impl FileSystemScanner {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn extract_heuristic_score(reason: &str) -> i32 {
-        reason
-            .find("score: ")
-            .and_then(|i| {
-                let rest = &reason[i + 7..];
-                let end = rest.find(')').unwrap_or(rest.len());
-                rest[..end].trim().parse::<i32>().ok()
-            })
-            .unwrap_or(0)
-    }
-
     fn calculate_all_hashes(&self, path: &Path) -> Result<FileHashes> {
         let data = std::fs::read(path)?;
-        let md5 = format!("{:x}", md5::compute(&data));
-        let mut h256 = Sha256::new(); h256.update(&data);
-        let sha256 = hex::encode(h256.finalize());
+        let md5    = format!("{:x}", md5::compute(&data));
+        let sha256 = compute_sha256_from_bytes(&data);
         let mut h512 = Sha512::new(); h512.update(&data);
         let sha512 = hex::encode(h512.finalize());
         Ok(FileHashes { md5, sha256, sha512 })
-    }
-
-    fn calculate_sha256(&self, path: &Path) -> Result<String> {
-        let data = std::fs::read(path)?;
-        let mut h = Sha256::new(); h.update(&data);
-        Ok(hex::encode(h.finalize()))
     }
 
     fn check_all_hashes(&self, hashes: &FileHashes) -> Option<&str> {
@@ -521,11 +503,4 @@ mod tests {
         assert_eq!(yara_rule_score("RAT_PlugX"), 10);
     }
 
-    #[test]
-    fn test_extract_heuristic_score() {
-        assert_eq!(FileSystemScanner::extract_heuristic_score(
-            "Dynamic analysis (score: 7): something bad"), 7);
-        assert_eq!(FileSystemScanner::extract_heuristic_score(
-            "No threats detected"), 0);
-    }
 }

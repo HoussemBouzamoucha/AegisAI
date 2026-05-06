@@ -221,7 +221,7 @@ impl MemoryScanner {
                 let is_private    = info.Type == MEM_PRIVATE;
 
                 let trusted_jit    = is_trusted_jit(&process_name, process_path.as_deref());
-                let system_proc    = is_system_process(process_path.as_deref());
+                let system_proc    = is_system_process(process_path.as_deref(), &process_name);
                 let trusted_install = is_trusted_install_path(process_path.as_deref());
 
                 let (mut threat_score, mut detection_signals) = score_region(
@@ -617,6 +617,12 @@ const KNOWN_JIT_PROCESSES: &[&str] = &[
 ///
 /// Safety guard: if the binary is located inside a temp directory, we do NOT
 /// trust it — a JIT process spawned from %TEMP% is itself a red flag.
+///
+/// **Path-unknown case**: if `sysinfo` cannot resolve the process path (handle
+/// restrictions, race with process exit) we still apply JIT trust based on the
+/// name alone.  The temp-directory guard cannot fire, but the alternative —
+/// scoring every Chrome / VS Code / Node page at the "Unknown" tier — produces
+/// thousands of false-positive alerts from normal browser and IDE operation.
 #[cfg(windows)]
 fn is_trusted_jit(name: &str, path: Option<&str>) -> bool {
     let name_lc = name.to_lowercase();
@@ -633,23 +639,69 @@ fn is_trusted_jit(name: &str, path: Option<&str>) -> bool {
                 && !pl.ends_with("/tmp")
                 && !pl.contains("/appdata/local/temp")
         }
-        // Unknown path → be conservative.
-        None => false,
+        // Path unreadable — trust by name.  The RWX base score for known JIT
+        // processes is only 5 so content analysis must still confirm before
+        // a region is reported.
+        None => true,
     }
 }
+
+/// Well-known Windows OS process names used as a fallback when the process
+/// path is unreadable (restricted handle, race with process exit, etc.).
+///
+/// Kept intentionally short — only processes that are *always* OS components
+/// and whose names cannot plausibly be spoofed by malware running at the
+/// same privilege level as the scanner.
+const KNOWN_SYSTEM_PROCESS_NAMES: &[&str] = &[
+    "system",
+    "registry",
+    "memory compression",
+    "secure system",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "lsaiso.exe",
+    "svchost.exe",
+    "fontdrvhost.exe",
+    "dwm.exe",
+    "audiodg.exe",
+    "werfault.exe",
+    "werfaultsecure.exe",
+    "conhost.exe",
+    "dllhost.exe",
+    "taskhostw.exe",
+    "sihost.exe",
+    "ctfmon.exe",
+    "spoolsv.exe",
+    "ntoskrnl.exe",
+    "hal.dll",
+];
 
 /// Returns true when the process executable lives in a Windows system
 /// directory.  OS components (svchost, lsass, services, werfault, etc.) are
 /// trusted and must not be flagged for normal memory layouts.
 ///
-/// Coverage is intentionally broad — everything under C:\Windows\ is signed
-/// Microsoft code and should never generate false-positive alerts.
+/// Two-stage check:
+/// 1. **Path-based** (primary) — drive-letter-agnostic fragment match so that
+///    Windows installations on drives other than C: are handled correctly.
+/// 2. **Name-based fallback** — for processes whose path is unreadable due to
+///    handle restrictions (lsass, csrss, etc.).
 #[cfg(windows)]
-fn is_system_process(path: Option<&str>) -> bool {
-    let Some(p) = path else { return false };
-    let pl = p.to_lowercase().replace('\\', "/");
-    // Everything under C:\Windows\ is a Microsoft OS component.
-    pl.starts_with("c:/windows/")
+fn is_system_process(path: Option<&str>, name: &str) -> bool {
+    if let Some(p) = path {
+        let pl = p.to_lowercase().replace('\\', "/");
+        // Drive-letter-agnostic: match the canonical Windows subdirectory
+        // structure without assuming the OS lives on C:.
+        if pl.contains("/windows/") {
+            return true;
+        }
+    }
+    // Name fallback — covers restricted-access OS processes.
+    let name_lc = name.to_lowercase();
+    KNOWN_SYSTEM_PROCESS_NAMES.contains(&name_lc.as_str())
 }
 
 /// Returns true when the process binary lives in a standard software
@@ -691,17 +743,24 @@ fn is_trusted_install_path(path: Option<&str>) -> bool {
 /// # Trust tiers
 ///
 /// ```text
-/// SystemOs       (C:\Windows\*)          → score 0  — never flag OS components
-/// JitRuntime     (known JIT, non-temp)   → RWX: +5  — content analysis still runs
-/// TrustedInstall (Program Files / PData) → RWX: +12 — content needed to cross threshold
-/// Unknown        (everything else)       → RWX: +18 — content needed to cross threshold
+/// SystemOs       (C:\Windows\* or known OS name)  → score 0  — never flag OS components
+/// JitRuntime     (known JIT, non-temp path)        → RWX: +5  — content analysis still runs
+/// TrustedInstall (Program Files / PData)           → RWX: +8  — strong content needed
+/// Unknown        (everything else)                 → RWX: +18 — any content indicator reports
 /// ```
 ///
-/// The reporting threshold is 20.  Setting the unknown-RWX base score to 18
-/// (below the threshold) means **bare RWX without a content confirmation
-/// never generates a false positive**.  Only regions where `analyze_content`
-/// also finds a payload indicator (PE header +20, high entropy +15, NOP sled
-/// +15…) will be reported.
+/// The reporting threshold is 20.
+///
+/// **Why TrustedInstall was reduced from 12 → 8**: at 12 the minimum entropy
+/// bonus (+8 for entropy 6.8–7.2) was enough to reach the threshold, causing
+/// DRM-protected and installer-packed binaries in Program Files to be reported
+/// as Suspicious on entropy alone.  At 8 a single content signal is no longer
+/// sufficient; a PE header in anonymous memory (+20 → 28) or a known shellcode
+/// sequence (+20 → 28) still reports correctly.
+///
+/// **Unknown-tier RWX at 18**: bare RWX without any content confirmation never
+/// crosses the threshold, so a one-off RWX page from a non-JIT, non-system app
+/// does not generate noise by itself.
 ///
 /// # Anonymous executable regions (MEM_PRIVATE + exec, no writable flag)
 ///
@@ -744,12 +803,14 @@ fn score_region(
             score += 5;
         } else if trusted_install {
             // Program Files / ProgramData — legitimately installed software.
-            // Score 12 (below threshold); content analysis needed to report.
-            score += 12;
+            // Score 8 (well below threshold); strong content evidence needed.
+            // Reduced from 12: at 12, the minimum entropy bonus (+8) already
+            // reached the threshold, generating FPs from DRM / packed installers.
+            score += 8;
             signals.push(DetectionSignal::new(
                 "memory",
                 "Executable + writable region (RWX) in installed application — verify with content",
-                12,
+                8,
             ));
         } else {
             // No trust — score 18 (still below threshold).
