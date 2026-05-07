@@ -344,6 +344,18 @@ pub struct SystemScanConfig {
     /// scan).  Set to a small value (e.g. `Some(3)`) for quick scan so that
     /// large temp trees are only surface-scanned.
     pub max_depth: Option<usize>,
+
+    /// Hard cap on the total number of files passed to the scan thread pool.
+    /// Applied **after** `ScanPrioritizer` sorts the queue, so the first N
+    /// files are always the highest-risk ones.  `None` = no cap (default for
+    /// full scan).  Set to a few thousand for quick scans so that even a
+    /// bloated `%TEMP%` directory cannot make the scan run indefinitely.
+    pub max_files: Option<usize>,
+
+    /// When `false`, worker threads use SHA-256 only (skipping MD5 and
+    /// SHA-512).  Halves the per-file I/O for quick scans where full
+    /// multi-hash is unnecessary.  `true` by default (full scan).
+    pub enable_multi_hash: bool,
 }
 
 impl Default for SystemScanConfig {
@@ -363,6 +375,8 @@ impl Default for SystemScanConfig {
             incremental: true,
             yara_rules_dir: None,
             max_depth: None,
+            max_files: None,
+            enable_multi_hash: true,
         }
     }
 }
@@ -730,8 +744,9 @@ impl SystemScanner {
         if paths.is_empty() { return Vec::new(); }
 
         let total = paths.len();
-        let num_threads = self.config.num_threads.clamp(1, MAX_THREADS);
-        let yara_dir = self.config.yara_rules_dir.clone();
+        let num_threads      = self.config.num_threads.clamp(1, MAX_THREADS);
+        let yara_dir         = self.config.yara_rules_dir.clone();
+        let enable_multi_hash = self.config.enable_multi_hash;
 
         let (work_tx, work_rx) = mpsc::channel::<PathBuf>();
         let work_rx = Arc::new(Mutex::new(work_rx));
@@ -740,12 +755,16 @@ impl SystemScanner {
 
         let handles: Vec<_> = (0..num_threads)
             .map(|_| {
-                let rx = Arc::clone(&work_rx);
-                let tx = result_tx.clone();
+                let rx   = Arc::clone(&work_rx);
+                let tx   = result_tx.clone();
                 let yara = yara_dir.clone();
 
                 thread::spawn(move || {
-                    let mut scanner = FileSystemScanner::new();
+                    let mut scanner = FileSystemScanner::with_options(
+                        enable_multi_hash, // MD5+SHA512 only when explicitly requested
+                        true,              // deep scan (heuristics) always on
+                        true,              // YARA always on
+                    );
                     if let Some(ref dir) = yara {
                         scanner.load_yara_rules(dir).ok();
                     }
@@ -822,6 +841,16 @@ impl SystemScanner {
         // Equal-score files preserve the coarse order (priority bucket before
         // normal bucket) because sort_by is stable.
         self.prioritizer.sort(&mut all_paths, now_secs);
+
+        // ── Step 2b: max_files cap ────────────────────────────────────────────
+        // Applied after sorting so the truncated slice always contains the
+        // highest-risk files.  Excess paths are counted as skipped.
+        if let Some(cap) = self.config.max_files {
+            if all_paths.len() > cap {
+                skipped_files += all_paths.len() - cap;
+                all_paths.truncate(cap);
+            }
+        }
 
         // ── Step 3: incremental cache filter ──────────────────────────────────
         let (paths_to_scan, mut results, cached_hits) = if self.config.incremental {

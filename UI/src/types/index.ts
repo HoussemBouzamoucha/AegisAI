@@ -462,6 +462,40 @@ export const CONTEXT_FLAG_LABEL: Record<ContextFlag, string> = {
   high_ransomware_extension_ratio: 'High ransomware extension ratio',
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent Round 1 — AI analysis output types
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface RankedAction {
+  /** Action name matching the available-actions table in agent.rs */
+  action:           string;
+  /** Human-readable target: process label, IP address, or file path */
+  target:           string;
+  /** entity_id from the correlate graph (e.g. "entity:4821") */
+  entity_id:        string;
+  pid:              number | null;
+  /** One sentence explaining which chain/pattern drove this recommendation */
+  justification:    string;
+  /** Whether the action can be undone (block_ip, quarantine_file = true; kill_process = false) */
+  reversible:       boolean;
+  /** Whether the entity's combined_score met the action's minimum threshold */
+  min_score_met:    boolean;
+  /** True for kill_process and isolate_network — UI must show a confirm gate */
+  confirm_required: boolean;
+}
+
+export interface AgentVerdict {
+  /** 3–5 actions ordered from most reversible to least reversible */
+  ranked_actions:    RankedAction[];
+  /** 2–4 sentence overall threat assessment and action justification */
+  rationale:         string;
+  risk_level:        'Low' | 'Medium' | 'High' | 'Critical';
+  /** Derived from the highest-confidence attack chain [0, 1] */
+  confidence:        number;
+  /** 0–3 suggested follow-up targeted scans */
+  pivot_suggestions: string[];
+}
+
 export const CONTEXT_FLAG_SEVERITY: Record<
   ContextFlag,
   'critical' | 'high' | 'medium'

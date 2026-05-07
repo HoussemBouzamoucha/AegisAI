@@ -7,7 +7,7 @@ import type {
   ProcessInfo, ProcessScanResult, ScanHistoryEntry,
   NetworkConnection, NetworkStats, NetworkScanResult,
   MemoryRegion, MemoryStats, MemoryScanResult as MemoryScanResultType,
-  MlIdsResult, CorrelateResult,
+  MlIdsResult, CorrelateResult, AgentVerdict,
 } from '../types';
 
 interface AppState {
@@ -59,6 +59,13 @@ interface AppState {
   correlateFromStore: () => void;
   clearCorrelate:   () => void;
   abortCorrelate:   () => void;
+
+  // ── Agent Round 1 ──────────────────────────────────────────────────────────
+  agentVerdict:      AgentVerdict | null;
+  agentLoading:      boolean;
+  agentError:        string | null;
+  runAgentAnalysis:  () => Promise<void>;
+  clearAgentVerdict: () => void;
 
   history: ScanHistoryEntry[];
   addHistory: (entry: ScanHistoryEntry) => void;
@@ -436,6 +443,30 @@ export const useStore = create<AppState>((set, get) => ({
     correlateToken++; // invalidate the in-flight invocation
     set({ correlating: false, correlateError: null });
   },
+
+  // ── Agent Round 1 ──────────────────────────────────────────────────────────
+  agentVerdict:  null,
+  agentLoading:  false,
+  agentError:    null,
+
+  runAgentAnalysis: async () => {
+    const { correlateResult } = get();
+    if (!correlateResult) {
+      set({ agentError: 'No correlate result available. Run Correlate first.' });
+      return;
+    }
+    set({ agentLoading: true, agentError: null, agentVerdict: null });
+    try {
+      const verdict = await invoke<AgentVerdict>('run_agent_analysis', {
+        correlateResult,
+      });
+      set({ agentVerdict: verdict, agentLoading: false });
+    } catch (e: any) {
+      set({ agentError: String(e), agentLoading: false });
+    }
+  },
+
+  clearAgentVerdict: () => set({ agentVerdict: null, agentError: null }),
 
   history: [],
   addHistory: (entry) =>

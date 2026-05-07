@@ -4,6 +4,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -672,6 +674,25 @@ async fn restore_network(
     Ok(json)
 }
 
+/// Round 1 agent analysis — take a correlate result and return a ranked action plan.
+///
+/// `correlate_result` is the full JSON object returned by `correlate_entities`.
+/// The ANTHROPIC_API_KEY environment variable must be set; an error string is
+/// returned if it is missing or the Claude API call fails.
+///
+/// This command is intentionally separate from `correlate_entities` so that:
+///   (a) The detection pipeline is never delayed by a Claude API call.
+///   (b) The analyst decides when to invoke AI reasoning (not automatic).
+///   (c) Future rounds can re-call this with an updated correlate result.
+#[tauri::command]
+async fn run_agent_analysis(
+    correlate_result: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let verdict = agent::run_analysis(&correlate_result).await?;
+    serde_json::to_value(&verdict)
+        .map_err(|e| format!("Serialization error: {e}"))
+}
+
 /// Export a structured incident report to disk.
 ///
 /// `correlate_result` — the full JSON object returned by the last
@@ -919,6 +940,8 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // ── AI agent ──────────────────────────────────────────────────
+            run_agent_analysis,
             // ── Scanning ──────────────────────────────────────────────────
             scan_file,
             scan_directory,

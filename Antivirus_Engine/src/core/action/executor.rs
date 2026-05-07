@@ -88,6 +88,7 @@ pub struct QuarantineResult {
 ///
 /// Cross-volume moves fall back to copy + remove; the original is never
 /// left on disk.  Deletion of quarantined files requires explicit user action.
+/// 
 pub fn quarantine_file(path: &str) -> QuarantineResult {
     let src = Path::new(path);
 

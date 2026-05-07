@@ -10,6 +10,7 @@ import {
 import { buildProcessEntities, buildProcessEdges, orphanConnections, orphanFiles } from '../lib/entityUtils';
 import { useStore } from '../store';
 import type { GraphNodeData, GraphEdgeData, UnifiedThreat, CriticalPath } from '../types';
+import { AgentVerdictPanel } from './AgentVerdict';
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
 
@@ -1077,6 +1078,9 @@ function LegendPanel({ hasBackend, nodeCount, correlateResult, criticalPath }: {
           ))}
         </div>
       )}
+
+      {/* ── AI Agent verdict panel ── */}
+      <AgentVerdictPanel />
 
       <div style={{
         background: 'var(--surface)', border: '1px solid var(--border)',

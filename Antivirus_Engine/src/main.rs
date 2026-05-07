@@ -106,11 +106,17 @@ fn run_daemon() {
     let system_scanner  = SystemScanner::new();
     let quick_scanner   = SystemScanner::with_config(
         core::file_system::scan_all::SystemScanConfig {
-            roots:      SystemScanner::quick_roots(),
-            num_threads: 4,
+            roots:           SystemScanner::quick_roots(),
+            num_threads:     4,
             // Cap walk depth at 3 — keeps Temp surface-level while still
             // reaching tasks nested under System32\Tasks\Microsoft\Windows\*
-            max_depth:  Some(3),
+            max_depth:       Some(3),
+            // After the prioritizer sorts highest-risk files first, discard
+            // everything beyond 2 000 candidates.  This bounds quick-scan
+            // time regardless of how many files are in %TEMP%.
+            max_files:       Some(2_000),
+            // SHA-256 only — no need for MD5 + SHA-512 on a quick pass.
+            enable_multi_hash: false,
             ..core::file_system::scan_all::SystemScanConfig::default()
         },
     );

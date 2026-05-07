@@ -8,3 +8,8 @@ tofix.txt
 .claude
 node_modules
 
+# API keys
+.env
+.env.local
+ai_agent/.env
+
