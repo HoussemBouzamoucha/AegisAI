@@ -107,16 +107,29 @@ fn run_daemon() {
     let quick_scanner   = SystemScanner::with_config(
         core::file_system::scan_all::SystemScanConfig {
             roots:           SystemScanner::quick_roots(),
-            num_threads:     4,
+            // 8 threads: quick scan roots are I/O-bound on small files; more
+            // threads keep the disk pipeline full without thrashing the CPU.
+            num_threads:     8,
             // Cap walk depth at 3 — keeps Temp surface-level while still
             // reaching tasks nested under System32\Tasks\Microsoft\Windows\*
             max_depth:       Some(3),
             // After the prioritizer sorts highest-risk files first, discard
-            // everything beyond 2 000 candidates.  This bounds quick-scan
-            // time regardless of how many files are in %TEMP%.
-            max_files:       Some(2_000),
+            // everything beyond 500 candidates.  Combined with the per-file
+            // caps below this keeps quick-scan wall-clock time well under
+            // the 900 s daemon timeout.
+            max_files:       Some(500),
             // SHA-256 only — no need for MD5 + SHA-512 on a quick pass.
             enable_multi_hash: false,
+            // Skip hash-DB lookup entirely — heuristics catch the same threats faster.
+            enable_hash_db:  false,
+            // Disable YARA: each worker compiles all rules via wasmtime JIT.
+            // 8 concurrent compilations race on wasmtime's global engine singleton
+            // and cause a non-recoverable process abort (not catchable by
+            // catch_unwind).  Heuristics alone provide sufficient detection quality
+            // for a surface-level quick scan.
+            enable_yara:     false,
+            // Hard cap at 10 MiB — same ceiling as the YARA scanner.
+            max_file_bytes:  10 * 1024 * 1024,
             ..core::file_system::scan_all::SystemScanConfig::default()
         },
     );
@@ -333,7 +346,20 @@ fn daemon_scan_dir(scanner: &FileSystemScanner, path: &Path, id: &str) -> serde_
 /// - Sorts the queue by risk score before dispatching, so threats surface first.
 fn daemon_scan_all(scanner: &SystemScanner, id: &str) -> serde_json::Value {
     eprintln!("DAEMON scan-all: starting system scan (thread pool + cache)");
-    let result = scanner.scan(None);
+
+    // Wrap in catch_unwind so a panic in the scan pipeline returns a JSON error
+    // instead of killing the daemon process.  The panic message is captured and
+    // forwarded to the UI, making crashes debuggable without inspecting stderr.
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scanner.scan(None))) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic in scan engine".to_string());
+            eprintln!("DAEMON scan-all PANIC: {}", msg);
+            return json!({ "id": id, "success": false, "error": format!("scan engine panic: {}", msg) });
+        }
+    };
 
     let files: Vec<serde_json::Value> = result.results.iter()
         .map(serialize_result)

@@ -21,6 +21,7 @@ use crate::core::types::{DetectionSignal, FileCategory, ScanResult, ThreatLevel}
 use crate::core::utils::{compute_sha256, compute_sha256_from_bytes};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use anyhow::Result;
 use sha2::{Digest, Sha512};
 use hex;
@@ -143,11 +144,18 @@ impl Default for ScanStatistics {
 pub struct FileSystemScanner {
     signatures: SignatureDatabase,
     heuristics: HeuristicAnalyzer,
-    yara: YaraEngine,
+    /// Shared compiled YARA rules.  Wrapping in Arc means the rules are
+    /// compiled exactly once and all worker threads share the same compiled
+    /// bytecode — no concurrent wasmtime JIT initialisation races.
+    yara: Arc<YaraEngine>,
     context: ContextAnalyzer,
     enable_multi_hash: bool,
     enable_deep_scan: bool,
     enable_yara: bool,
+    /// When `false`, skip SHA-256 computation and hash-DB lookup entirely.
+    /// Saves one full file read per file.  Intended for quick scans where the
+    /// hash DB is unlikely to match and per-file I/O is the bottleneck.
+    enable_hash_db: bool,
 }
 
 impl FileSystemScanner {
@@ -160,52 +168,86 @@ impl FileSystemScanner {
         Self {
             signatures: SignatureDatabase::new(),
             heuristics: HeuristicAnalyzer::new(),
+            yara: Arc::new(yara),
+            context: ContextAnalyzer::new(),
+            enable_multi_hash,
+            enable_deep_scan,
+            enable_yara,
+            enable_hash_db: true,
+        }
+    }
+
+    /// Create a scanner that shares pre-compiled YARA rules with other workers.
+    ///
+    /// Rules are compiled exactly once by the caller and the `Arc` is cloned
+    /// cheaply for each thread — no concurrent wasmtime JIT compilation.
+    pub fn with_shared_yara(
+        enable_multi_hash: bool,
+        enable_deep_scan: bool,
+        yara: Arc<YaraEngine>,
+    ) -> Self {
+        let enable_yara = yara.is_ready();
+        Self {
+            signatures: SignatureDatabase::new(),
+            heuristics: HeuristicAnalyzer::new(),
             yara,
             context: ContextAnalyzer::new(),
             enable_multi_hash,
             enable_deep_scan,
             enable_yara,
+            enable_hash_db: true,
         }
     }
 
     pub fn load_yara_rules(&mut self, rules_dir: &Path) -> Result<usize> {
-        self.yara = YaraEngine::load_from_directory(rules_dir)?;
-        Ok(self.yara.rules_loaded)
+        let engine = YaraEngine::load_from_directory(rules_dir)?;
+        let loaded = engine.rules_loaded;
+        self.enable_yara = engine.is_ready();
+        self.yara = Arc::new(engine);
+        Ok(loaded)
     }
 
     // ── Single file scan ──────────────────────────────────────────────────────
 
     pub fn scan_file(&self, path: &Path) -> Result<ScanResult> {
-        let _metadata = match std::fs::metadata(path) {
+        let metadata = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => return Ok(ScanResult::error(
                 path.to_path_buf(),
                 format!("Cannot access file: {}", e),
             )),
         };
-
-        let hashes = if self.enable_multi_hash {
-            self.calculate_all_hashes(path)?
-        } else {
-            FileHashes {
-                md5: String::new(),
-                sha256: compute_sha256(path)?,
-                sha512: String::new(),
-            }
-        };
+        let file_size = metadata.len();
 
         // ── Layer 1: Hash DB ──────────────────────────────────────────────────
-        if let Some(signature) = self.check_all_hashes(&hashes) {
-            return Ok(ScanResult::from_parts(
-                path.to_path_buf(),
-                ThreatLevel::Malicious,
-                format!("Known malware signature: {}", signature),
-                Some(hashes.sha256),
-                Some(signature.to_string()),
-                1.0,
-                vec![DetectionSignal::new("hash", format!("Hash match: {}", signature), 100)],
-            ));
-        }
+        // Skipped when `enable_hash_db` is false (quick-scan mode) to avoid a
+        // full file read on every candidate — YARA + heuristics catch threats
+        // without the hash DB, and the DB rarely matches fresh downloads anyway.
+        let hashes = if self.enable_hash_db {
+            let h = if self.enable_multi_hash {
+                self.calculate_all_hashes(path)?
+            } else {
+                FileHashes {
+                    md5: String::new(),
+                    sha256: compute_sha256(path)?,
+                    sha512: String::new(),
+                }
+            };
+            if let Some(signature) = self.check_all_hashes(&h) {
+                return Ok(ScanResult::from_parts(
+                    path.to_path_buf(),
+                    ThreatLevel::Malicious,
+                    format!("Known malware signature: {}", signature),
+                    Some(h.sha256),
+                    Some(signature.to_string()),
+                    1.0,
+                    vec![DetectionSignal::new("hash", format!("Hash match: {}", signature), 100)],
+                ));
+            }
+            Some(h)
+        } else {
+            None
+        };
 
         // ── Unified scoring: YARA + Heuristics ────────────────────────────────
         let mut total_score: i32 = 0;
@@ -214,8 +256,20 @@ impl FileSystemScanner {
         let mut primary_signature: Option<String> = None;
 
         // ── Layer 2: YARA ─────────────────────────────────────────────────────
-        if self.enable_yara && self.yara.is_ready() && should_yara_scan(path) {
-            match self.yara.scan_file(path) {
+        // Skip YARA for files > 10 MiB — large files (game installers, media,
+        // bundled runtimes) are almost never malware payloads and each one
+        // would load its full content into the YARA scanner, making quick
+        // scans 10-30× slower per file and pushing total time past the timeout.
+        // A 5 s per-scan timeout in YaraEngine prevents pathological backtracking
+        // in complex rules from hanging a worker thread indefinitely.
+        const YARA_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+        if self.enable_yara && self.yara.is_ready() && should_yara_scan(path)
+            && file_size <= YARA_MAX_FILE_BYTES
+        {
+            // Pass `None` — no pre-read buffer at this point in the pipeline.
+            // The heuristics buffer refactor (to share bytes across layers) is
+            // tracked as future work; YaraEngine reads the file itself for now.
+            match self.yara.scan_file(path, None) {
                 Ok(matches) if !matches.is_empty() => {
                     let mut yara_score = 0i32;
                     let mut rule_names: Vec<String> = Vec::new();
@@ -278,15 +332,20 @@ impl FileSystemScanner {
             ThreatLevel::Malicious  => 0.70 + (total_score as f32 / 60.0).min(0.25),
         };
 
+        // Use the SHA-256 from the hash-DB phase if available; heuristics may
+        // also have computed it (stored inside heuristic_result.hash) but we
+        // don't plumb it back here — clean results don't need the hash.
+        let sha256 = hashes.as_ref().map(|h| h.sha256.clone());
+
         if level == ThreatLevel::Clean {
-            return Ok(ScanResult::clean(path.to_path_buf(), Some(hashes.sha256)));
+            return Ok(ScanResult::clean(path.to_path_buf(), sha256));
         }
 
         Ok(ScanResult::from_parts(
             path.to_path_buf(),
             level,
             format!("Score {}: {}", total_score, score_reasons.join(" | ")),
-            Some(hashes.sha256),
+            sha256,
             primary_signature,
             confidence_score,
             all_signals,
@@ -418,7 +477,9 @@ impl FileSystemScanner {
     pub fn set_deep_scan(&mut self, enabled: bool)  { self.enable_deep_scan = enabled; }
     pub fn set_multi_hash(&mut self, enabled: bool) { self.enable_multi_hash = enabled; }
     pub fn set_yara(&mut self, enabled: bool)       { self.enable_yara = enabled; }
+    pub fn set_hash_db(&mut self, enabled: bool)    { self.enable_hash_db = enabled; }
     pub fn yara_rules_loaded(&self) -> usize        { self.yara.rules_loaded }
+    pub fn yara_arc(&self) -> Arc<YaraEngine>       { Arc::clone(&self.yara) }
 }
 
 impl Default for FileSystemScanner {

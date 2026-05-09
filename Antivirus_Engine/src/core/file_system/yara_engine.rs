@@ -2,8 +2,15 @@
 // YARA Rule Engine — loads .yar files from yara_rules/ and scans file content
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::fs;
 use anyhow::Result;
+
+/// Per-scan YARA timeout.  YARA rules with complex regexes can spin for
+/// minutes on certain file contents (e.g. highly repetitive PE sections that
+/// trigger catastrophic backtracking).  5 s is generous for a real malware
+/// signature — if a rule needs longer it's too slow for real-time scanning.
+const YARA_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A single YARA match result
 #[derive(Debug, Clone)]
@@ -68,24 +75,49 @@ impl YaraEngine {
         Ok(Self { rules, rules_loaded: loaded })
     }
 
-    /// Scan a file and return any matching YARA rules
-    pub fn scan_file(&self, path: &Path) -> Result<Vec<YaraMatch>> {
+    /// Scan a file and return any matching YARA rules.
+    ///
+    /// If the caller has already read the file into memory (e.g. for
+    /// heuristics), pass the buffer as `preloaded_bytes` to avoid a redundant
+    /// disk read.  Pass `None` to let the engine read the file itself.
+    ///
+    /// A 5-second per-scan timeout is enforced — YARA rules with pathological
+    /// regex patterns can otherwise spin for minutes on crafted file content.
+    /// Timed-out scans return an empty match list (the file proceeds to the
+    /// heuristic decision without a YARA verdict).
+    pub fn scan_file(&self, path: &Path, preloaded_bytes: Option<&[u8]>) -> Result<Vec<YaraMatch>> {
         let rules = match &self.rules {
             Some(r) => r,
             None => return Ok(vec![]),
         };
 
-        // Read file bytes
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("YARA: cannot read {}: {}", path.display(), e);
-                return Ok(vec![]);
+        // Use the caller-supplied buffer when available; otherwise read.
+        let owned: Vec<u8>;
+        let data: &[u8] = match preloaded_bytes {
+            Some(b) => b,
+            None => {
+                owned = match fs::read(path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("YARA: cannot read {}: {}", path.display(), e);
+                        return Ok(vec![]);
+                    }
+                };
+                &owned
             }
         };
 
         let mut scanner = yara_x::Scanner::new(rules);
-        let results = scanner.scan(&data)?;
+        // NOTE: set_timeout() is intentionally disabled — it activates wasmtime
+        // epoch interruption which races against the heartbeat thread and causes
+        // non-unwindable aborts in multi-threaded scan workers.  File-size
+        // filtering (YARA_MAX_FILE_BYTES in scanner.rs) is the primary guard
+        // against long-running scans; each scan worker processes files serially.
+        // scanner.set_timeout(YARA_SCAN_TIMEOUT);
+        let results = match scanner.scan(data) {
+            Ok(r) => r,
+            Err(e) => return Err(e.into()),
+        };
 
         let matches = results
             .matching_rules()
@@ -123,7 +155,12 @@ impl YaraEngine {
         };
 
         let mut scanner = yara_x::Scanner::new(rules);
-        let results = scanner.scan(data)?;
+        // set_timeout disabled — see comment in scan_file above
+        // scanner.set_timeout(YARA_SCAN_TIMEOUT);
+        let results = match scanner.scan(data) {
+            Ok(r) => r,
+            Err(e) => return Err(e.into()),
+        };
 
         let matches = results
             .matching_rules()

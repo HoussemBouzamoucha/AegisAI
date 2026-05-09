@@ -266,8 +266,13 @@ fn daemon_request(
         if remaining.is_zero() {
             return Err(format!("Daemon response timeout for id={}", id));
         }
-        let line = rx.recv_timeout(remaining)
-            .map_err(|_| format!("Daemon response timeout for id={}", id))?;
+        let line = match rx.recv_timeout(remaining) {
+            Ok(l) => l,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) =>
+                return Err(format!("Daemon response timeout for id={} (scan still running after {}s — try again or restart the app)", id, timeout.as_secs())),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =>
+                return Err(format!("Daemon process died while handling id={} — check engine stderr for crash details", id)),
+        };
 
         let json: serde_json::Value = serde_json::from_str(&line)
             .map_err(|e| format!("Invalid JSON from daemon: {} — raw: {}", e, &line[..line.len().min(200)]))?;

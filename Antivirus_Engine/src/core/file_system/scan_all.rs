@@ -45,6 +45,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::core::file_system::scanner::{FileSystemScanner, ScanStatistics};
+use crate::core::file_system::yara_engine::YaraEngine;
 use crate::core::types::{ScanResult, ThreatLevel};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -356,6 +357,21 @@ pub struct SystemScanConfig {
     /// SHA-512).  Halves the per-file I/O for quick scans where full
     /// multi-hash is unnecessary.  `true` by default (full scan).
     pub enable_multi_hash: bool,
+
+    /// When `false`, worker threads skip SHA-256 computation and the hash-DB
+    /// lookup entirely.  Saves one full file read per file.  Use for quick
+    /// scans where the signature DB is unlikely to match fresh files and
+    /// per-file I/O is the dominant cost.  `true` by default (full scan).
+    pub enable_hash_db: bool,
+
+    /// When `false`, worker threads skip YARA rule compilation and scanning
+    /// entirely.  Each worker normally compiles all YARA rules fresh via
+    /// `YaraEngine::default()` which triggers a wasmtime JIT compilation pass.
+    /// Running 8+ concurrent compilations races on wasmtime's global engine
+    /// state and causes a non-recoverable abort.  For quick scans the heuristic
+    /// engine alone provides sufficient detection quality.  `true` by default
+    /// (full scan); set `false` for quick scan.
+    pub enable_yara: bool,
 }
 
 impl Default for SystemScanConfig {
@@ -377,6 +393,8 @@ impl Default for SystemScanConfig {
             max_depth: None,
             max_files: None,
             enable_multi_hash: true,
+            enable_hash_db: true,
+            enable_yara: true,
         }
     }
 }
@@ -744,9 +762,30 @@ impl SystemScanner {
         if paths.is_empty() { return Vec::new(); }
 
         let total = paths.len();
-        let num_threads      = self.config.num_threads.clamp(1, MAX_THREADS);
-        let yara_dir         = self.config.yara_rules_dir.clone();
+        let num_threads       = self.config.num_threads.clamp(1, MAX_THREADS);
+        let yara_dir          = self.config.yara_rules_dir.clone();
         let enable_multi_hash = self.config.enable_multi_hash;
+        let enable_hash_db    = self.config.enable_hash_db;
+        let enable_yara       = self.config.enable_yara;
+
+        // ── Compile YARA rules once in the calling thread ─────────────────────
+        // Each worker used to call YaraEngine::default() independently, which
+        // runs wasmtime JIT compilation for every thread simultaneously.
+        // Concurrent access to wasmtime's global engine singleton causes a
+        // non-recoverable process abort.  Compile once here, then share the
+        // Arc<YaraEngine> so workers do zero compilation work.
+        let shared_yara = if enable_yara {
+            eprintln!("SCAN: compiling YARA rules (once, shared across {} workers)…", num_threads);
+            let engine = match &yara_dir {
+                Some(dir) => YaraEngine::load_from_directory(dir)
+                    .unwrap_or_else(|_| YaraEngine::default()),
+                None      => YaraEngine::default(),
+            };
+            eprintln!("SCAN: YARA ready — {} rule file(s) compiled", engine.rules_loaded);
+            Arc::new(engine)
+        } else {
+            Arc::new(YaraEngine::disabled())
+        };
 
         let (work_tx, work_rx) = mpsc::channel::<PathBuf>();
         let work_rx = Arc::new(Mutex::new(work_rx));
@@ -755,19 +794,19 @@ impl SystemScanner {
 
         let handles: Vec<_> = (0..num_threads)
             .map(|_| {
-                let rx   = Arc::clone(&work_rx);
-                let tx   = result_tx.clone();
-                let yara = yara_dir.clone();
+                let rx         = Arc::clone(&work_rx);
+                let tx         = result_tx.clone();
+                let yara_share = Arc::clone(&shared_yara);
 
                 thread::spawn(move || {
-                    let mut scanner = FileSystemScanner::with_options(
-                        enable_multi_hash, // MD5+SHA512 only when explicitly requested
-                        true,              // deep scan (heuristics) always on
-                        true,              // YARA always on
+                    eprintln!("SCAN worker: initializing scanner (hash_db={}, yara={})", enable_hash_db, enable_yara);
+                    let mut scanner = FileSystemScanner::with_shared_yara(
+                        enable_multi_hash,
+                        true,       // deep scan (heuristics) always on
+                        yara_share, // pre-compiled rules, zero JIT in this thread
                     );
-                    if let Some(ref dir) = yara {
-                        scanner.load_yara_rules(dir).ok();
-                    }
+                    scanner.set_hash_db(enable_hash_db);
+                    eprintln!("SCAN worker: scanner ready");
 
                     loop {
                         let path = match rx.lock().unwrap().recv() {
@@ -819,6 +858,7 @@ impl SystemScanner {
     /// 6. Merge cache-hit results + freshly scanned results.
     /// 7. Update the incremental cache with new verdicts.
     pub fn scan(&self, progress: Option<ProgressFn>) -> ScanAllResult {
+        eprintln!("SCAN: step 1 — collecting paths (roots: {})", self.config.roots.len());
         let scan_time = SystemTime::now();
         let timer = Instant::now();
 
@@ -831,6 +871,8 @@ impl SystemScanner {
         // ── Step 1: collect paths ──────────────────────────────────────────────
         let (mut priority_paths, normal_paths, mut skipped_files) =
             self.collect_paths();
+        eprintln!("SCAN: step 1 done — priority={} normal={} skipped={}",
+            priority_paths.len(), normal_paths.len(), skipped_files);
 
         // Priority-location paths first; normal paths follow.
         priority_paths.extend(normal_paths);
@@ -864,7 +906,11 @@ impl SystemScanner {
         skipped_files += cached_hits;
 
         // ── Step 4: parallel scan ─────────────────────────────────────────────
+        eprintln!("SCAN: step 4 — parallel scan of {} files ({} threads, hash_db={}, yara={}, max_bytes={})",
+            paths_to_scan.len(), self.config.num_threads,
+            self.config.enable_hash_db, self.config.enable_yara, self.config.max_file_bytes);
         let fresh_results = self.parallel_scan(paths_to_scan, progress);
+        eprintln!("SCAN: step 4 done — {} results", fresh_results.len());
 
         // ── Step 5: update incremental cache ──────────────────────────────────
         {
