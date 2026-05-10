@@ -413,10 +413,16 @@ impl SystemScanConfig {
 
     fn should_skip_dir(&self, dir: &Path) -> bool {
         let dir_str = dir.to_string_lossy().to_lowercase();
-        self.skip_dirs.iter().any(|skip| {
+        if self.skip_dirs.iter().any(|skip| {
             let skip_str = skip.to_string_lossy().to_lowercase();
             dir_str.starts_with(&*skip_str)
-        })
+        }) {
+            return true;
+        }
+        // Rust compiler proc-macro staging dirs — created by cargo on-the-fly for
+        // proc-macro crates; always compiler internals, never user/malware files.
+        // Pattern: %TEMP%\proc-macro-srv<N>-<N>\  (random numeric suffixes)
+        dir_str.contains("proc-macro-srv")
     }
 
     /// Returns `true` if `path` contains any priority fragment (coarse split

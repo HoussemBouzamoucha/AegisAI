@@ -90,6 +90,11 @@ fn path_trust_tier(path: &Path) -> PathTrustTier {
     if s.contains(r"windows\winsxs") || s.contains(r"windows\installer") {
         return PathTrustTier::TrustedInstall;
     }
+    // Rust compiler proc-macro staging dirs — always compiler internals, never malware.
+    // Cargo creates %TEMP%\proc-macro-srv<N>-<N>\ on-the-fly for proc-macro crates.
+    if s.contains("proc-macro-srv") {
+        return PathTrustTier::TrustedInstall;
+    }
     PathTrustTier::Unknown
 }
 
@@ -156,7 +161,8 @@ const SUSPICIOUS_KEYWORDS: &[&str] = &[
     "cmd.exe",
     "createobject",
     "createremotethread",
-    "curl",
+    "curl_easy_setopt",
+    "curl_exec",
     "downloadfile",
     "downloadstring",
     "eval(",
@@ -582,10 +588,10 @@ fn check_content(
     }
 
     // ── Crypto wallet address ─────────────────────────────────────────────────
-    // Use the lossy UTF-8 view — wallet addresses are always ASCII so
-    // replacement characters can't produce a false match.
-    let text = String::from_utf8_lossy(bytes);
-    if contains_crypto_address(&text) {
+    // Entropy-gated: matches inside dense binary/crypto data (local entropy >6.5
+    // bits/byte in a ±128-byte window) are suppressed to avoid false positives on
+    // TLS / ASN.1 library DLLs whose DER byte sequences resemble wallet addresses.
+    if contains_crypto_address(bytes) {
         out.push(ScoreContribution::new(5, "Cryptocurrency wallet address detected", "content"));
     }
 
@@ -668,19 +674,48 @@ fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(nlen).any(|w| w == needle)
 }
 
-/// Detect a Bitcoin or Ethereum wallet address anywhere in the text.
-fn contains_crypto_address(text: &str) -> bool {
-    // BTC: 26–35 chars, starts with 1, 3, or bc1
-    if text.split_ascii_whitespace().any(|w| {
-        (26..=35).contains(&w.len())
-            && (w.starts_with('1') || w.starts_with('3') || w.starts_with("bc1"))
+/// Detect a Bitcoin or Ethereum wallet address in a raw byte buffer.
+///
+/// Entropy-gated: a candidate match is only reported when the local Shannon
+/// entropy of the ±128-byte window around the match is ≤ 6.5 bits/byte.
+/// Dense binary/crypto data (DER, ASN.1, compressed sections) always exceeds
+/// this threshold, so hex sequences that merely resemble addresses are silently
+/// suppressed, eliminating the class of false positives on TLS library DLLs.
+fn contains_crypto_address(bytes: &[u8]) -> bool {
+    // ETH: 0x followed by exactly 40 hex digits
+    if bytes.windows(42).enumerate().any(|(pos, w)| {
+        w.starts_with(b"0x")
+            && w[2..].iter().all(|b| b.is_ascii_hexdigit())
+            && local_entropy_around(bytes, pos, 42) <= 6.5f64
     }) {
         return true;
     }
-    // ETH: 0x followed by exactly 40 hex digits
-    text.as_bytes()
-        .windows(42)
-        .any(|w| w.starts_with(b"0x") && w[2..].iter().all(|b| b.is_ascii_hexdigit()))
+
+    // BTC: whitespace-delimited token, 26–35 bytes, starts with '1', '3', or "bc1"
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() { i += 1; }
+        let token = &bytes[start..i];
+        let len = token.len();
+        if (26..=35).contains(&len) {
+            let is_btc = token[0] == b'1' || token[0] == b'3' || token.starts_with(b"bc1");
+            if is_btc && local_entropy_around(bytes, start, len) <= 6.5f64 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Shannon entropy of a ±128-byte window centred on `bytes[pos .. pos+len]`.
+#[inline]
+fn local_entropy_around(bytes: &[u8], pos: usize, len: usize) -> f64 {
+    let window_start = pos.saturating_sub(128);
+    let window_end   = (pos + len + 128).min(bytes.len());
+    calculate_entropy(&bytes[window_start..window_end])
 }
 
 /// Single-pass Base64 payload detector operating directly on bytes.
