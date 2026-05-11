@@ -36,6 +36,7 @@
 //! | [`ScanScheduler`] | Fire [`SystemScanner::scan`] automatically on a configurable interval |
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
@@ -466,7 +467,19 @@ impl ScanAllResult {
 
 // ─── FileStateCache ───────────────────────────────────────────────────────────
 
+/// Absolute path to the on-disk cache file.
+///
+/// Mirrors `executor::aegisai_data_dir()`: prefers `%PROGRAMDATA%\AegisAI`,
+/// falls back to `%TEMP%\AegisAI` when running without elevation.
+fn cache_file_path() -> PathBuf {
+    let base = std::env::var("PROGRAMDATA")
+        .or_else(|_| std::env::var("TEMP"))
+        .unwrap_or_else(|_| "C:\\Temp".to_string());
+    PathBuf::from(base).join("AegisAI").join("scan_cache.json")
+}
+
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "json", derive(serde::Serialize, serde::Deserialize))]
 struct CachedFileState {
     mtime_secs: u64,
     file_size: u64,
@@ -477,6 +490,10 @@ struct CachedFileState {
 ///
 /// Non-clean entries are never cached — they are always re-evaluated so that
 /// remediated files are promptly reclassified.
+///
+/// The cache is persisted to `%PROGRAMDATA%\AegisAI\scan_cache.json` after
+/// every scan so the next session starts with a warm cache instead of
+/// re-scanning every unchanged file from scratch.
 pub struct FileStateCache {
     inner: HashMap<PathBuf, CachedFileState>,
 }
@@ -484,6 +501,66 @@ pub struct FileStateCache {
 impl FileStateCache {
     pub fn new() -> Self {
         Self { inner: HashMap::new() }
+    }
+
+    /// Load cache from disk.  Returns an empty cache on any error (missing
+    /// file, format mismatch after an upgrade, permissions) so startup is
+    /// never blocked by a stale or corrupt cache file.
+    pub fn load_from_disk(path: &Path) -> Self {
+        #[cfg(feature = "json")]
+        {
+            let data = match fs::read(path) {
+                Ok(d)  => d,
+                Err(_) => return Self::new(),   // file missing — fresh start
+            };
+            match serde_json::from_slice::<HashMap<PathBuf, CachedFileState>>(&data) {
+                Ok(inner) => {
+                    eprintln!("CACHE: loaded {} entries from {}", inner.len(), path.display());
+                    Self { inner }
+                }
+                Err(e) => {
+                    eprintln!("CACHE: ignoring corrupt cache ({}) — starting fresh", e);
+                    Self::new()
+                }
+            }
+        }
+        #[cfg(not(feature = "json"))]
+        { Self::new() }
+    }
+
+    /// Persist the cache to disk atomically (write to `.tmp`, then rename).
+    ///
+    /// Failures are logged but never propagate — a missing cache file only
+    /// means the next scan will be slightly slower, not incorrect.
+    pub fn save_to_disk(&self, path: &Path) {
+        #[cfg(feature = "json")]
+        {
+            let dir = match path.parent() {
+                Some(d) => d,
+                None    => return,
+            };
+            if let Err(e) = fs::create_dir_all(dir) {
+                eprintln!("CACHE: cannot create dir {}: {}", dir.display(), e);
+                return;
+            }
+            let tmp = path.with_extension("json.tmp");
+            let json = match serde_json::to_vec(&self.inner) {
+                Ok(j)  => j,
+                Err(e) => { eprintln!("CACHE: serialisation failed: {}", e); return; }
+            };
+            if let Err(e) = fs::write(&tmp, &json) {
+                eprintln!("CACHE: write to tmp failed: {}", e);
+                return;
+            }
+            if let Err(e) = fs::rename(&tmp, path) {
+                eprintln!("CACHE: rename failed: {}", e);
+                let _ = fs::remove_file(&tmp);
+                return;
+            }
+            eprintln!("CACHE: saved {} entries to {}", self.inner.len(), path.display());
+        }
+        #[cfg(not(feature = "json"))]
+        { let _ = (self, path); }
     }
 
     fn check(&self, path: &Path, mtime_secs: u64, file_size: u64) -> Option<ThreatLevel> {
@@ -516,6 +593,7 @@ impl Default for FileStateCache {
     fn default() -> Self { Self::new() }
 }
 
+
 // ─── SystemScanner ────────────────────────────────────────────────────────────
 
 /// Orchestrates a full-system scan over configurable root directories.
@@ -535,23 +613,30 @@ pub struct SystemScanner {
 
 impl SystemScanner {
     pub fn new() -> Self {
+        let cache = FileStateCache::load_from_disk(&cache_file_path());
         Self {
             config: SystemScanConfig::default(),
-            cache: Arc::new(Mutex::new(FileStateCache::new())),
+            cache: Arc::new(Mutex::new(cache)),
             prioritizer: ScanPrioritizer::new(),
         }
     }
 
     pub fn with_config(config: SystemScanConfig) -> Self {
+        let cache = FileStateCache::load_from_disk(&cache_file_path());
         Self {
             config,
-            cache: Arc::new(Mutex::new(FileStateCache::new())),
+            cache: Arc::new(Mutex::new(cache)),
             prioritizer: ScanPrioritizer::new(),
         }
     }
 
     pub fn clear_cache(&self) {
         self.cache.lock().unwrap().clear();
+    }
+
+    /// Flush the in-memory cache to disk so the next session starts warm.
+    fn save_cache(&self) {
+        self.cache.lock().unwrap().save_to_disk(&cache_file_path());
     }
 
     /// Returns a reference to the [`ScanPrioritizer`] used by this scanner.
@@ -922,8 +1007,8 @@ impl SystemScanner {
         {
             let mut cache = self.cache.lock().unwrap();
             for r in &fresh_results {
-                let size = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
-                let mtime_secs = std::fs::metadata(&r.path)
+                let size = fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
+                let mtime_secs = fs::metadata(&r.path)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -934,6 +1019,12 @@ impl SystemScanner {
         }
 
         results.extend(fresh_results);
+
+        // ── Step 5b: persist cache to disk ────────────────────────────────────
+        // Done after extending results so the warm cache is available immediately
+        // on the next daemon startup — even if the process is killed mid-flight
+        // the atomic rename in save_to_disk prevents a corrupt file.
+        self.save_cache();
 
         // ── Step 6: aggregate statistics ──────────────────────────────────────
         let mut stats = ScanStatistics::new();

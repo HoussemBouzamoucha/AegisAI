@@ -1,0 +1,172 @@
+reasoning.py — Design Document
+================================
+
+Purpose
+-------
+reasoning.py implements a self-correcting feedback loop that runs after analyst.py
+produces an initial AgentVerdict (Round 1).  The goal is to catch and fix structural
+errors, missed signals, and threshold violations before the verdict reaches the UI —
+without requiring human review on every scan.
+
+The loop is not about making the model "smarter" on each pass.  It is about applying
+deterministic validation rules that the model reliably violates in edge cases, then
+asking the model to fix only the specific violations found.  This is faster and more
+reliable than asking the model to self-critique in open-ended prose.
+
+
+Why a feedback loop, not just a second fixed pass
+--------------------------------------------------
+A single second pass would improve output on average but would not guarantee
+correctness — the model may introduce new violations while fixing old ones.  A loop
+with targeted re-prompting on detected violations is more principled:
+
+  - Each iteration is grounded in concrete, machine-checkable failures.
+  - The model is given a narrow correction task, not a vague "try again".
+  - Convergence is detectable: if no violations are found, the loop exits early.
+  - The iteration cap prevents infinite correction cycles on pathological outputs.
+
+
+Loop structure
+--------------
+
+  initial_verdict (from analyst.py)
+       │
+       ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  ITERATION (max 3)                                      │
+  │                                                         │
+  │  1. validate(verdict)  ──► violations[]                 │
+  │       │                                                 │
+  │       ├── violations empty?  ──► EXIT LOOP (success)    │
+  │       │                                                 │
+  │       └── violations present                            │
+  │                │                                        │
+  │  2. build_correction_prompt(verdict, violations)        │
+  │                │                                        │
+  │  3. LLM call  ──► corrected_verdict                     │
+  │                │                                        │
+  │  4. converged?  ──► EXIT LOOP (no improvement)          │
+  │       (corrected == previous)                           │
+  │                │                                        │
+  │       else: verdict = corrected_verdict                 │
+  └─────────────────────────────────────────────────────────┘
+       │
+       ▼
+  final_verdict  (returned to main.py, written to stdout)
+
+
+Break conditions (any one triggers exit)
+-----------------------------------------
+1. No violations found by the validator  — the verdict is structurally correct.
+   This is the "happy path" and should be hit on most runs after 1–2 iterations.
+
+2. Converged  — the corrected verdict is identical to the previous one (same
+   ranked_actions, rationale, risk_level, confidence).  The model has reached a
+   fixed point and further iterations will not help.
+
+3. Max iterations reached (cap = 3)  — a safety valve to prevent runaway loops
+   on adversarial or malformed correlate results.  The best verdict seen so far
+   (fewest violations) is returned with a warning flag so the UI can indicate
+   that the agent's output may be incomplete.
+
+Cap rationale: 3 iterations is sufficient because:
+  - Iteration 1 fixes the most common violations (ordering, missing fields).
+  - Iteration 2 fixes any violations introduced by the Round 1 fix.
+  - Iteration 3 is a final safety pass.  If violations persist after three
+    targeted corrections, the correlate input is likely too sparse or ambiguous
+    for the model to reason about correctly; returning the best-so-far is more
+    useful than looping further.
+
+
+Validation rules (deterministic, no LLM involved)
+---------------------------------------------------
+All rules are checked in Python against the Pydantic schema — the LLM is never
+asked to self-validate.  Rules:
+
+  R1. Score thresholds
+      Each action must only appear if its entity's combined_score meets the minimum:
+        block_ip >= 0.60
+        quarantine_file >= 0.70
+        dump_memory >= 0.75
+        kill_process >= 0.65
+        check_persistence >= 0.50
+        isolate_network >= 0.85
+
+  R2. Reversibility ordering
+      ranked_actions must be ordered most-reversible first.
+      Hardcoded order: block_ip < quarantine_file < dump_memory
+                       < check_persistence < kill_process < isolate_network
+      Any deviation is a violation.
+
+  R3. confirm_required integrity
+      kill_process and isolate_network must have confirm_required=True.
+      All other actions must have confirm_required=False.
+
+  R4. Coverage — no missed Malicious/Critical entities
+      Every entity with threat_level Malicious or Critical must appear in at
+      least one ranked_action.  If a Malicious entity has no corresponding
+      action, that is a violation (the model under-reacted).
+
+  R5. Hallucination guard — no invented entity IDs
+      Every entity_id in ranked_actions must exist in the correlate graph.
+      entity_ids not present in graph.nodes are a violation (the model made up a target).
+
+  R6. LOLBin coverage
+      If any node has is_lolbin=True and is_vector=True, a check_persistence
+      action targeting that node must be present.  LOLBin vectors are a strong
+      persistence indicator and should never be silently dropped.
+
+  R7. risk_level consistency
+      risk_level must be at least as severe as the highest severity attack chain.
+        Malicious chain  → risk_level must be High or Critical
+        Suspicious chain → risk_level must be at least Medium
+      Understating risk is a violation.
+
+  R8. Action count
+      ranked_actions must contain between 1 and 5 actions when attack chains
+      are present.  An empty list when chains exist is a violation.
+      More than 5 is a violation (too noisy, forces the analyst to prioritise).
+
+
+Correction prompt design
+-------------------------
+The correction prompt is narrow and targeted.  It does NOT ask the model to
+"review your answer" — that produces verbose, unpredictable output.  Instead:
+
+  - The current verdict JSON is included verbatim.
+  - The violations list is rendered as a numbered list, each violation stating
+    exactly what is wrong and what the fix must be (e.g. "R2: kill_process at
+    position 1 must move after quarantine_file — reversible actions first").
+  - The model is instructed to output ONLY the corrected JSON object with the
+    listed violations fixed and everything else unchanged.
+
+This keeps the model's task narrow and the output predictable.
+
+
+Best-verdict tracking
+----------------------
+At each iteration, the validator counts the number of active violations.
+The verdict with the fewest violations is retained as best_verdict.
+If the loop exits at the iteration cap without reaching zero violations,
+best_verdict is returned rather than the final iteration's output (which may
+have regressed).  A warnings field is appended to the returned AgentVerdict
+listing which rules were still violated so the UI can surface a caution indicator.
+
+
+Separation of concerns
+-----------------------
+  analyst.py   — Round 1 generation.  Produces the initial verdict from the
+                 correlate result.  Knows nothing about the loop.
+
+  reasoning.py — The feedback loop.  Calls analyst.py's analyze() for Round 1,
+                 then runs validate → correct → converge until an exit condition
+                 is met.  Owns the loop state (iteration count, best_verdict,
+                 violations history).
+
+  main.py      — Entry point.  Will call reasoning.refine() instead of
+                 analyst.analyze() directly once reasoning.py is implemented.
+                 No other changes to main.py are needed.
+
+  schema.py    — Unchanged.  RankedAction.fill_derived_fields() still overrides
+                 reversible and confirm_required so the loop's validator always
+                 sees ground-truth values regardless of model output.

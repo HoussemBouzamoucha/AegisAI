@@ -33,7 +33,7 @@ try:
 except ImportError:
     pass  # python-dotenv not installed; key must be set in the shell
 
-from agent.analyst import analyze
+from agent.reasoning import refine
 from agent.schema import AgentVerdict
 
 
@@ -55,7 +55,7 @@ def run_stdin() -> None:
 
 def _run_and_write(correlate_result: dict) -> None:
     try:
-        verdict: AgentVerdict = analyze(correlate_result)
+        verdict: AgentVerdict = refine(correlate_result)
         # model_dump() converts Pydantic model → plain dict; json.dumps serialises it
         print(json.dumps(verdict.model_dump()), flush=True)
     except EnvironmentError as e:

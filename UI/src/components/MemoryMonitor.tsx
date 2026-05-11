@@ -175,7 +175,11 @@ export default function MemoryMonitor() {
           ) : filtered.length === 0 ? (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', opacity: 0.6 }}>
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-dim)' }}>
-                {memoryRegions.length === 0 ? 'Run a memory scan to populate regions.' : 'No memory regions match the filter.'}
+                {memoryStats === null
+                  ? 'Run a memory scan to populate regions.'
+                  : memoryRegions.length === 0
+                  ? `No notable regions detected — ${memoryStats.total_regions.toLocaleString()} regions across ${memoryStats.scanned_processes} processes were clean.`
+                  : 'No memory regions match the filter.'}
               </div>
             </div>
           ) : (

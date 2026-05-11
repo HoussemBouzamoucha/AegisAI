@@ -146,11 +146,12 @@ def _parse_verdict(text: str) -> AgentVerdict:
 
 # ─── Chain builder ────────────────────────────────────────────────────────────
 
-def build_chain():
+def build_llm():
     """
-    Build and return the LangChain analyst chain.
+    Build and return the configured ChatOpenAI instance.
 
-    The chain is stateless and safe to reuse across calls.
+    Separated from build_chain() so that reasoning.py can pair the same
+    LLM with a different (correction) prompt without reconstructing config.
 
     Raises EnvironmentError if OPENROUTER_API_KEY is not set.
     """
@@ -161,7 +162,7 @@ def build_chain():
             "Add it to ai_agent/.env or export it in your shell."
         )
 
-    llm = ChatOpenAI(
+    return ChatOpenAI(
         model=MODEL,
         base_url=OPENROUTER_BASE_URL,
         api_key=api_key,
@@ -174,9 +175,15 @@ def build_chain():
         },
     )
 
+
+def build_chain():
+    """
+    Build and return the LangChain analyst chain.
+
+    The chain is stateless and safe to reuse across calls.
+    """
     # Chain: prompt → LLM  (returns AIMessage)
-    chain = PROMPT | llm
-    return chain
+    return PROMPT | build_llm()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

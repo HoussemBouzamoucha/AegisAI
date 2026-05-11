@@ -114,10 +114,10 @@ fn run_daemon() {
             // reaching tasks nested under System32\Tasks\Microsoft\Windows\*
             max_depth:       Some(3),
             // After the prioritizer sorts highest-risk files first, discard
-            // everything beyond 500 candidates.  Combined with the per-file
+            // everything beyond 10_000 candidates.  Combined with the per-file
             // caps below this keeps quick-scan wall-clock time well under
             // the 900 s daemon timeout.
-            max_files:       Some(500),
+            max_files:       Some(10_000),
             // SHA-256 only — no need for MD5 + SHA-512 on a quick pass.
             enable_multi_hash: false,
             // Skip hash-DB lookup entirely — heuristics catch the same threats faster.

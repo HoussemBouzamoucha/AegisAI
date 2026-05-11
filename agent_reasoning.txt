@@ -1,0 +1,339 @@
+The agent is fully implemented — reasoning.py is the only missing piece. Here's the full picture:                           
+                                               
+  ---                                                                                                                         
+  What the AI agent does                                                                                                      
+                                                                                                                              
+  After the Rust engine runs correlate and builds the threat graph, the Tauri backend spawns main.py as a subprocess, writes  
+  the full correlate result JSON to its stdin, and reads back an AgentVerdict from stdout.
+
+  Data flow:
+  correlate result (JSON)
+    → build_prompt_context()     # extract attack chains, critical path, malicious entities
+    → ChatPromptTemplate         # format compact system + human prompt
+    → LLM (OpenRouter)           # poolside/laguna-xs.2:free, temperature=0, JSON mode
+    → _parse_verdict()           # strip fences, Pydantic validate
+    → AgentVerdict               # typed, validated output → back to Rust → UI
+
+  Output — AgentVerdict:
+  - ranked_actions — 3–5 containment actions ordered most-reversible first (block_ip → quarantine_file → dump_memory →
+  kill_process → isolate_network), each with target, entity_id, pid, and a justification sentence
+  - rationale — 2–4 sentence overall threat assessment
+  - risk_level — Low | Medium | High | Critical
+  - confidence — [0, 1] from the highest-confidence attack chain
+  - pivot_suggestions — 0–3 follow-up scan suggestions
+
+  The schema.py overrides reversible and confirm_required from hardcoded maps — those are facts, not model output, so the
+  model can't get them wrong.
+
+  ---
+  What reasoning.py is supposed to be
+
+  It doesn't exist yet. Based on the architecture, it should be a second reasoning pass that runs after analyst.py's Round 1.
+  The intent is a multi-round chain:
+
+  Round 1 (analyst.py) — "What is happening and what should be done?"
+  - Takes the raw correlate result
+  - Produces the initial AgentVerdict with ranked actions
+
+  Round 2 (reasoning.py) — "Is Round 1's verdict sound? What am I missing?"
+  - Takes the Round 1 verdict + the original correlate result
+  - Runs a self-critique / reflection pass: checks if confidence scores are consistent, if any attack chains were ignored, if
+  the action ordering violates the reversibility rule, if a LOLBin vector was missed
+  - Can downgrade or upgrade actions, add pivot suggestions, or flag conflicts
+  - Returns a refined AgentVerdict
+
+  In practice reasoning.py would expose a refine(correlate_result, initial_verdict) -> AgentVerdict function, and main.py
+  would chain analyze() → refine() before writing to stdout. That's the standard LangChain "reflection agent" pattern — one
+  pass to generate, one pass to critique and correct.
+
+
+
+
+
+
+
+  Why a loop instead of a fixed second pass: a single second pass improves output on average but can't guarantee correctness —
+  the model may fix one violation and introduce another. The loop only re-prompts when concrete, machine-detected violations
+  exist, so each iteration is purposeful.                                                                                     
+
+
+  The 8 validation rules are all deterministic Python checks — no LLM involved:
+  - Score thresholds per action type
+  - Reversibility ordering
+  - confirm_required integrity for kill/isolate
+  - No Malicious/Critical entity left without an action
+  - No hallucinated entity IDs (must exist in the graph)
+  - LOLBin + vector → check_persistence must be present
+  - risk_level can't understate the highest chain severity
+  - Action count between 1–5
+
+  Three break conditions:
+  1. Zero violations found → exit early (happy path, should hit in 1–2 iterations)
+  2. Converged → corrected verdict is identical to previous, further iterations won't help
+  3. Cap of 3 iterations → safety valve; returns the best-so-far (fewest violations), not the last
+
+  Best-verdict tracking is the key correctness guarantee — even if the loop hits the cap, you get the least-broken output, not
+   the last output which may have regressed.
+
+
+
+
+ Level 1 — The micro-loop (already designed)                                                                                 
+                                                                                                                              
+  reasoning.py's validate → correct → break loop. Closed at the per-verdict level. Output: a structurally correct verdict.    
+  This is already covered.                                                                                                    
+
+  ---
+  Level 2 — The action-response loop (session level)
+
+  This is the missing layer. Currently the agent fires once, produces a verdict, and is done. The loop is open — it never sees
+   whether its recommendations worked.
+
+  To close it:
+  correlate → verdict → action executed → re-correlate → new verdict → next action → ...
+  Each action the user executes (kill process, block IP, quarantine file) changes the system state. A re-correlate after the
+  action produces a new graph. The agent should receive that new graph and reassess — not from scratch, but aware of what was
+  already done.
+
+  Break conditions for this loop:
+  - No threat-level entities remain in the re-correlate graph
+  - The new graph is identical to the previous one (the action had no measurable effect — stop recommending it)
+  - Analyst manually approves and closes the incident
+  - Max re-scans reached (e.g. 5) to prevent infinite action cycles
+
+  The key insight: the agent needs an actions_taken context in each re-prompt — a list of what was already done — so it
+  doesn't recommend the same action twice and understands the residual risk.
+
+  ---
+  Level 3 — The learning loop (cross-session)
+
+  The deepest level. The agent currently has no memory between sessions. Every scan starts from zero.
+
+  To close it:
+  - Store (correlate_input, final_verdict, actions_taken, outcome) tuples locally after each incident
+  - Outcome signals: analyst accepted the recommendation, analyst overrode it, re-scan showed threat eliminated, false
+  positive flagged
+  - Use high-quality past verdicts as few-shot examples in the system prompt — the model gets better context about what
+  "correct" looks like for this specific environment
+  - Track which validation rules (R1–R8) fire most often → those are systematic model weaknesses → strengthen them in the
+  prompt explicitly
+
+  Break condition for this loop: there isn't one — it runs continuously. But the quality gate is: only store a verdict as a
+  few-shot example if the analyst accepted it without override. This prevents bad examples from contaminating the prompt.
+
+  ---
+  The convergence risk
+
+  All three levels share the same failure mode: runaway loops where the agent keeps recommending actions that don't improve
+  the state (e.g. blocking an IP that isn't actually C2, re-scanning, seeing the same score, blocking another IP). The guard
+  for this is monotonicity checking — the overall threat score of the graph must decrease after each action-response cycle. If
+   it doesn't, the loop breaks and the agent reports "actions taken, threat score unchanged — manual investigation required."
+
+  ---
+  Want me to update agent_reasoning.txt with all three levels?
+
+
+################### Workflow:
+ The Attack               
+                                                                                                                              
+  A user opens invoice_april.docm. Word spawns PowerShell, PowerShell downloads a payload, injects into explorer.exe, and     
+  starts beaconing to 185.220.101.47:8080.                                                                                    
+                                                                                                                              
+  ---                                                                                                                         
+  Phase 1 — Detection (Rust Engine)
+
+  File scanner scans invoice_april.docm:
+  - Heuristic: macro-enabled Office doc, entropy spike in embedded stream → score 32
+  - YARA: hits rule office_macro_dropper → score jumps to 68
+  - Result: file:a3f9... — Malicious, combined_score 0.81
+
+  Process scanner sees WINWORD.EXE (pid:3412) spawning powershell.exe (pid:7891):
+  - API sequence: CreateProcess → VirtualAlloc → WriteProcessMemory → CreateRemoteThread
+  - GRU model scores the sequence: ml_score = 0.88
+  - Heuristic: suspicious spawn chain, score 28
+  - Result: proc:7891:powershell.exe — Malicious, combined_score 0.79
+
+  Network scanner captures pcap from pid:7891:
+  - 47 UNSW-NB15 features extracted → XGBoost IDS scores it 0.91
+  - Destination: 185.220.101.47:8080, periodic 60s beaconing pattern
+  - Result: net:tcp:192.168.1.5:51234:185.220.101.47:8080 — Malicious
+
+  Memory scanner scans explorer.exe (pid:1204):
+  - Region at 0x00A40000: RWX, private, PE header in anonymous memory
+  - Content analysis: shellcode sequence detected, entropy 7.4
+  - threat_score: 52 → Malicious
+
+  ---
+  Phase 2 — Entity Graph (EntityManager + GraphBuilder)
+
+  EntityManager ingests all four signals, builds aggregated entities:
+
+  entity:3412  WINWORD.EXE       combined_score=0.31  Clean (boosted later)
+  entity:7891  powershell.exe    combined_score=0.79  Malicious
+               ├── network_score=0.91  has_malicious_network=true
+               └── process_score=0.74
+  entity:1204  explorer.exe      combined_score=0.72  Malicious
+               └── memory_score=0.85  has_malicious_memory=true
+  entity-file:a3f9  invoice_april.docm  combined_score=0.81  Malicious
+
+  GraphBuilder connects them:
+  entity:3412 ──ParentChild──► entity:7891       weight=0.55
+  entity:7891 ──SharedC2──►   entity:1204        weight=1.14  (×1.50 multiplier)
+  entity-file:a3f9 ──SharedFileHash──► entity:7891  weight=0.73
+
+  GraphAnalyzer runs:
+  - ProcessInjection on entity:1204 → chain-1, score=0.72, confidence=0.85
+  - C2Communication on entity:7891 → chain-2, score=0.79, confidence=0.91
+  - ExploitedTrustedProcess on entity:3412 → entity:7891 → chain-3, score=0.79
+  - MultiStageAttack BFS finds all 4 nodes connected → chain-4, score=0.81, confidence=0.74
+
+  apply_graph_feedback:
+  - Critical path: entity:3412 → entity:7891 → entity:1204, total_score=1.69
+    - entity:7891 gets +0.12 path boost → combined_score=0.91
+  - Centrality: entity:7891 has degree 3 (highest) → +0.10 → combined_score=1.0 (clamped)
+  - Vector flag: entity:3412 is clean parent of Malicious child → is_vector=true
+    - WINWORD.EXE is not in LOLBINS → is_lolbin=false
+
+  Narrative: invoice_april.docm was loaded by powershell.exe, which connected to 185.220.101.47:8080, which shares C2
+  infrastructure with explorer.exe
+
+  ---
+  Phase 3 — Agent Round 1 (analyst.py)
+
+  build_prompt_context() extracts:
+  ATTACK CHAINS (4 detected, highest severity: Malicious):
+    C2Communication  score=0.91 conf=0.91 sev=Malicious  mitre=T1071  entities=[entity:7891]
+    ProcessInjection score=0.72 conf=0.85 sev=Malicious  mitre=T1055  entities=[entity:1204]
+    ExploitedTrustedProcess score=0.79 conf=0.78 sev=Malicious  entities=[entity:3412, entity:7891]
+    MultiStageAttack score=0.81 conf=0.74 sev=Malicious  entities=[entity:3412,entity:7891,entity:1204,entity-file:a3f9]
+
+  CRITICAL PATH (score 1.69): invoice_april.docm was loaded by powershell.exe,
+  which connected to 185.220.101.47:8080, which shares C2 infrastructure with explorer.exe
+
+  MALICIOUS ENTITIES:
+    entity:7891  label=powershell.exe  pid=7891  score=1.00  flags=mal_net
+    entity:1204  label=explorer.exe    pid=1204  score=0.72  flags=mal_mem
+    entity-file:a3f9  label=invoice_april.docm  pid=null  score=0.81  flags=none
+
+  LLM produces initial verdict:
+  ranked_actions:
+    1. block_ip         target=185.220.101.47  entity_id=entity:7891    reversible=true
+    2. quarantine_file  target=invoice_april.docm  entity_id=entity-file:a3f9  reversible=true
+    3. dump_memory      target=explorer.exe    entity_id=entity:1204   reversible=true
+    4. kill_process     target=powershell.exe  entity_id=entity:7891   confirm_required=true
+    5. isolate_network  target=host            entity_id=entity:7891   confirm_required=false  ← VIOLATION
+
+  rationale: "powershell.exe is beaconing to a known malicious IP while explorer.exe
+  shows signs of process injection. The macro document was the initial vector."
+  risk_level: High
+  confidence: 0.91
+  pivot_suggestions:
+    - "Scan WINWORD.EXE's recent temp files for additional dropped payloads"
+    - "Check registry run keys for persistence"
+
+  ---
+  Phase 4 — Feedback Loop (reasoning.py)
+
+  Iteration 1 — validate:
+  - R3 violation: isolate_network has confirm_required=false — must be true
+  - R7 violation: risk_level=High but highest chain severity is Malicious — must be Critical
+  - R4: all Malicious entities covered ✓
+  - R5: all entity_ids exist in graph ✓
+  - R2: ordering correct ✓
+
+  2 violations found. Build correction prompt with only those two violations listed. LLM fixes both.
+
+  Iteration 2 — validate:
+  - R3: confirm_required=true on isolate_network ✓
+  - R7: risk_level=Critical ✓
+  - All other rules pass ✓
+
+  Zero violations. Loop exits after 2 iterations.
+
+  Final AgentVerdict:
+  ranked_actions:
+    1. block_ip         185.220.101.47      entity:7891   reversible=true  confirm=false
+    2. quarantine_file  invoice_april.docm  entity-file:a3f9  reversible=true  confirm=false
+    3. dump_memory      explorer.exe        entity:1204   reversible=true  confirm=false
+    4. kill_process     powershell.exe      entity:7891   reversible=false  confirm=true
+    5. isolate_network  host                entity:7891   reversible=true   confirm=true
+
+  rationale: "powershell.exe (pid:7891) is actively beaconing to 185.220.101.47:8080
+  and injected into explorer.exe. invoice_april.docm was the delivery vector.
+  Block the C2 IP and quarantine the document first (reversible), then dump explorer
+  memory for forensics, and terminate powershell. Isolate the host only if re-scan
+  confirms the injection persists after kill."
+  risk_level: Critical
+  confidence: 0.91
+  pivot_suggestions:
+    - "Scan WINWORD.EXE temp files for additional dropped payloads"
+    - "Check registry run keys and startup folders for persistence"
+    - "Check sibling processes of explorer.exe for lateral injection"
+
+  ---
+  Phase 5 — Action-Response Loop (Level 2)
+
+  User executes actions in order from the UI:
+
+  Action 1: block_ip 185.220.101.47
+  - Rust executor adds Windows Firewall deny rule
+  - Returns: BlockIpResult { success=true, rule_name="AegisAI_185.220.101.47_out" }
+  - System re-correlates → network scanner no longer sees active beaconing
+  - entity:7891 network_score drops from 0.91 → 0.10 (connection severed)
+  - Graph re-evaluated: C2Communication chain disappears
+  - Agent receives new graph + actions_taken=["block_ip:185.220.101.47"]
+  - New verdict: C2 chain gone, ProcessInjection still active, focus shifts to explorer.exe injection
+  - Monotonicity check: overall threat score decreased (0.91 → 0.72) ✓ — continue loop
+
+  Action 2: quarantine_file invoice_april.docm
+  - File moved to %PROGRAMDATA%\AegisAI\quarantine\a3f9....quarantined
+  - Re-correlate: entity-file:a3f9 removed from graph
+  - ExploitedTrustedProcess and MultiStageAttack chains shrink
+  - Threat score: 0.72 → 0.65 ✓ — continue
+
+  Action 3: dump_memory explorer.exe (pid:1204)
+  - MiniDump written to %PROGRAMDATA%\AegisAI\dumps\1204_20260511T143022.dmp
+  - No graph change (read-only action) — no re-correlate needed
+  - Agent notes dump complete, check_persistence added to pivot
+
+  Action 4: kill_process powershell.exe (pid:7891) — confirm required
+  - User confirms in UI
+  - Process terminated
+  - Re-correlate: entity:7891 gone from process list
+  - Graph: only entity:1204 (explorer injection) remains
+  - Threat score: 0.65 → 0.40
+  - Monotonicity check ✓
+
+  Re-correlate after kill:
+  - Only entity:1204 (explorer.exe) remains, combined_score=0.72
+  - Agent verdict: "Beaconing eliminated. Explorer injection still active — isolate_network or accept residual risk pending
+  memory analysis."
+  - pivot_suggestions: run check_persistence — powershell may have dropped a run key before being killed
+
+  Action 5: check_persistence
+  - Scanner checks registry run keys, scheduled tasks, startup folders
+  - Returns: 1 suspicious entry — HKCU\Software\Microsoft\Windows\CurrentVersion\Run → "updater.exe" →
+  C:\Users\user\AppData\Roaming\updater.exe
+  - Agent adds quarantine_file: updater.exe to the next verdict
+
+  Loop break condition hit:
+  - After quarantining updater.exe, re-correlate finds zero Malicious/Critical entities
+  - Threat score across all entities < 0.30
+  - Agent verdict: risk_level=Low, ranked_actions=[], rationale: "All confirmed threat actors removed. Explorer.exe memory
+  anomaly may be a residual artifact — monitor for recurrence."
+  - Loop exits: no threats remain
+
+  ---
+  Phase 6 — Incident Report
+
+  export_incident_report writes to Documents\AegisAI\incident_20260511T143022.json:
+  actions_taken: [block_ip, quarantine_file, dump_memory, kill_process,
+                  check_persistence, quarantine_file(updater.exe)]
+  iterations: 5 action-response cycles
+  final_threat_score: 0.18
+  verdict_loop_iterations: 2 (reasoning.py)
+  persistence_found: true  ← HKCU run key
+  memory_dump: 1204_20260511T143022.dmp
+
+  This tuple (correlate_input, final_verdict, actions_taken, outcome=resolved) is stored as a candidate few-shot example for
+  Level 3 — only promoted if no analyst override occurred.

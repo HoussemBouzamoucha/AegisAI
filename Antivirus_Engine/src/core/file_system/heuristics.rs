@@ -7,7 +7,7 @@
 //   Very high entropy >7.5                    +4  (packed/obfuscated)
 //   Suspicious keyword (exec/script only)     +3  per keyword, capped at +12
 //   PowerShell obfuscation                    +4
-//   PE executable                             +3
+//   PE executable                             +1  (binary PE header in correct ext)
 //   File type mismatch                        +3
 //   Ransomware content phrase                 +5  per match, capped at +20
 //   Crypto address detected                   +5
@@ -158,7 +158,6 @@ const SUSPICIOUS_KEYWORDS: &[&str] = &[
     "-enc ",
     "-encodedcommand",
     "bitstransfer",
-    "cmd.exe",
     "createobject",
     "createremotethread",
     "curl_easy_setopt",
@@ -172,12 +171,14 @@ const SUSPICIOUS_KEYWORDS: &[&str] = &[
     "net.webclient",
     "powershell",
     "reflection.assembly",
-    "shellexecute",
-    "virtualalloc",
-    "wget",
     "writeprocessmemory",
     "wscript.shell",
 ];
+// Removed from SUSPICIOUS_KEYWORDS (too broad — appear in normal PE import tables):
+//   "cmd.exe"      — standard shell path referenced by countless installers
+//   "shellexecute" — Windows shell API, normal in GUI apps and installers
+//   "virtualalloc" — Windows memory API, normal in every game / runtime
+//   "wget"         — common download tool, appears in many build scripts
 
 // ─── Static name tables ───────────────────────────────────────────────────────
 
@@ -522,7 +523,10 @@ fn check_magic_bytes(bytes: &[u8], ext: &str, is_doc: bool) -> Option<ScoreContr
     }
 
     if matches!(ext, "exe" | "dll" | "sys" | "scr") {
-        return Some(ScoreContribution::new(3, "PE executable", "structure"));
+        // +1 only — being a valid PE is not a threat signal on its own.
+        // The old +3 combined with entropy alone pushed legitimate packed
+        // installers (NSIS, 7z-SFX) over the Malicious threshold.
+        return Some(ScoreContribution::new(1, "PE executable", "structure"));
     }
 
     None
@@ -591,7 +595,12 @@ fn check_content(
     // Entropy-gated: matches inside dense binary/crypto data (local entropy >6.5
     // bits/byte in a ±128-byte window) are suppressed to avoid false positives on
     // TLS / ASN.1 library DLLs whose DER byte sequences resemble wallet addresses.
-    if contains_crypto_address(bytes) {
+    //
+    // Additionally skip binary PE executables — packed installers (FitGirl, DODI,
+    // NSIS, Squirrel) commonly embed a donation BTC address in their about section.
+    // A donation address inside a binary is not a malicious signal; it only becomes
+    // meaningful when found alongside ransomware phrases in a document or script.
+    if !is_exec && contains_crypto_address(bytes) {
         out.push(ScoreContribution::new(5, "Cryptocurrency wallet address detected", "content"));
     }
 

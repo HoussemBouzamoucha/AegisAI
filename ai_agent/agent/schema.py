@@ -111,3 +111,11 @@ class AgentVerdict(BaseModel):
         default_factory=list,
         description="0–3 one-sentence suggestions for targeted follow-up scans"
     )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Non-empty only when the reasoning loop hit the iteration cap without "
+            "resolving all violations. Each entry names a rule that is still violated "
+            "so the UI can surface a caution indicator."
+        )
+    )

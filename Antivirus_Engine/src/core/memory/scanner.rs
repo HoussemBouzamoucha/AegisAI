@@ -252,14 +252,18 @@ impl MemoryScanner {
                     None
                 };
 
-                // Only keep regions that are actually suspicious or malicious.
-                if threat_score >= 20 {
-                    let threat_level = if threat_score >= 40 {
-                        "Malicious"
+                // Include all regions with any non-zero score so the UI list
+                // is populated with noteworthy regions (executable, writable-
+                // private, etc.).  Pure zero-score regions (normal mapped /
+                // read-only pages) are still skipped to avoid flooding the UI.
+                if threat_score > 0 {
+                    let (threat_level, is_threat) = if threat_score >= 40 {
+                        ("Malicious", true)
+                    } else if threat_score >= 20 {
+                        ("Suspicious", true)
                     } else {
-                        "Suspicious"
-                    }
-                    .to_string();
+                        ("Clean", false)
+                    };
 
                     threat_regions.push(MemoryRegion {
                         pid,
@@ -275,9 +279,9 @@ impl MemoryScanner {
                         is_committed:  true,
                         is_private,
                         content_sample,
-                        threat_level:  threat_level.clone(),
+                        threat_level:  threat_level.to_string(),
                         threat_score,
-                        is_threat: true,
+                        is_threat,
                         detection_signals,
                     });
                 }
@@ -489,6 +493,17 @@ const KNOWN_JIT_PROCESSES: &[&str] = &[
     "eclipse.exe",
     "netbeans64.exe",
 
+    // ── Rust toolchain  (LLVM JIT + proc-macro DLL loading) ─────────────────
+    // rust-analyzer-proc-macro-srv allocates RWX regions to JIT-compile
+    // proc-macro crates at build time.  rustc itself uses LLVM's JIT for
+    // incremental compilation passes.  All run from known toolchain paths.
+    "rust-analyzer.exe",
+    "rust-analyzer-proc-macro-srv.exe",
+    "rustc.exe",
+    "cargo.exe",
+    "clippy-driver.exe",
+    "rustdoc.exe",
+
     // ── Python  (CPython / PyPy JIT) ─────────────────────────────────────────
     "python.exe",
     "pythonw.exe",
@@ -632,6 +647,13 @@ fn is_trusted_jit(name: &str, path: Option<&str>) -> bool {
     match path {
         Some(p) => {
             let pl = p.to_lowercase().replace('\\', "/");
+            // Exception: rust-analyzer-proc-macro-srv is legitimately staged by
+            // cargo under %TEMP%\proc-macro-srv<N>-<N>\ at build time.  Trust it
+            // even from temp — the proc-macro-srv directory name is a sufficiently
+            // specific signal that a random dropper would not mimic.
+            if pl.contains("proc-macro-srv") {
+                return true;
+            }
             // Reject if the binary lives in a temp directory.
             !pl.contains("/temp/")
                 && !pl.contains("/tmp/")

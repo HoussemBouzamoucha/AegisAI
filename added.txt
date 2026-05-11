@@ -1,0 +1,20 @@
+ Here's what was added and how it works end-to-end:                                                                          
+   
+  On startup — SystemScanner::new() / with_config() calls                                                                     
+  FileStateCache::load_from_disk(%PROGRAMDATA%\AegisAI\scan_cache.json). If the file exists, the previous run's clean verdicts
+   are loaded immediately. If it's missing or corrupt (e.g. after an upgrade), it silently starts fresh.
+
+  After every scan — once the in-memory cache is updated with fresh verdicts (step 5), save_cache() serializes the entire
+  HashMap to JSON using an atomic write-then-rename, so a crash mid-save can never corrupt the cache file.
+
+  What gets cached vs not:
+  - Only Clean files are stored (same rule as before) — threats are always re-scanned
+  - Cache key is (path, mtime, size) — any modification to a file invalidates its entry automatically
+
+  Practical effect: after the first scan of a session completes, every subsequent scan — including after a full app restart —
+  skips all unchanged clean files instantly. Only new, modified, or previously-flagged files get re-scanned.
+
+
+  if this was added in a proactive manner, then i want the agent to be explained in detial, its actions are only accepted 
+  and authenticated by the user themselves for now, once the system is up and running and ready to be impelmtented in an autonomous
+  manner and does exactly what its asked for that it launched automnomously .
