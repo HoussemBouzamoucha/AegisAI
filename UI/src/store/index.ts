@@ -7,7 +7,7 @@ import type {
   ProcessInfo, ProcessScanResult, ScanHistoryEntry,
   NetworkConnection, NetworkStats, NetworkScanResult,
   MemoryRegion, MemoryStats, MemoryScanResult as MemoryScanResultType,
-  MlIdsResult, CorrelateResult, AgentVerdict,
+  MlIdsResult, CorrelateResult, AgentVerdict, ExecutedAction,
 } from '../types';
 
 interface AppState {
@@ -66,6 +66,16 @@ interface AppState {
   agentError:        string | null;
   runAgentAnalysis:  () => Promise<void>;
   clearAgentVerdict: () => void;
+
+  // ── Agent Round 2+ ─────────────────────────────────────────────────────────
+  actionsTaken:         ExecutedAction[];
+  previousThreatScore:  number;
+  currentRound:         number;
+  agentReassessing:     boolean;
+  agentReassessError:   string | null;
+  recordExecutedAction: (action: ExecutedAction) => void;
+  runAgentReassessment: () => Promise<void>;
+  resetInvestigation:   () => void;
 
   history: ScanHistoryEntry[];
   addHistory: (entry: ScanHistoryEntry) => void;
@@ -455,7 +465,12 @@ export const useStore = create<AppState>((set, get) => ({
       set({ agentError: 'No correlate result available. Run Correlate first.' });
       return;
     }
-    set({ agentLoading: true, agentError: null, agentVerdict: null });
+    set({
+      agentLoading: true, agentError: null, agentVerdict: null,
+      // Reset investigation on fresh Round 1
+      actionsTaken: [], currentRound: 1, previousThreatScore: 0,
+      agentReassessError: null,
+    });
     try {
       const verdict = await invoke<AgentVerdict>('run_agent_analysis', {
         correlateResult,
@@ -466,7 +481,71 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  clearAgentVerdict: () => set({ agentVerdict: null, agentError: null }),
+  clearAgentVerdict: () => set({
+    agentVerdict: null, agentError: null,
+    actionsTaken: [], currentRound: 1, previousThreatScore: 0,
+    agentReassessError: null,
+  }),
+
+  // ── Agent Round 2+ ─────────────────────────────────────────────────────────
+  actionsTaken:        [],
+  previousThreatScore: 0,
+  currentRound:        1,
+  agentReassessing:    false,
+  agentReassessError:  null,
+
+  recordExecutedAction: (action: ExecutedAction) => {
+    set(s => ({ actionsTaken: [...s.actionsTaken, action] }));
+  },
+
+  runAgentReassessment: async () => {
+    const { correlateResult, actionsTaken, currentRound } = get();
+
+    // Compute threat score from the current graph before re-correlating
+    const prevScore = (correlateResult?.graph?.nodes ?? [])
+      .filter(n => n.threat_level === 'Malicious' || n.threat_level === 'Critical')
+      .reduce((sum, n) => sum + ((n as any).combined_score ?? 0), 0);
+
+    set({ agentReassessing: true, agentReassessError: null });
+
+    // Re-correlate to get the post-action graph
+    await get().correlateEntities(false);
+
+    const freshResult = get().correlateResult;
+    if (!freshResult) {
+      set({ agentReassessing: false, agentReassessError: 'Re-correlation failed — no fresh graph available.' });
+      return;
+    }
+
+    const nextRound = currentRound + 1;
+    try {
+      const verdict = await invoke<AgentVerdict>('run_agent_reassessment', {
+        correlateResult:     freshResult,
+        actionsTaken:        actionsTaken,
+        round:               nextRound,
+        previousThreatScore: prevScore,
+      });
+      set({
+        agentVerdict:        verdict,
+        currentRound:        nextRound,
+        previousThreatScore: prevScore,
+      });
+    } catch (e: any) {
+      set({ agentReassessError: String(e) });
+    } finally {
+      set({ agentReassessing: false });
+    }
+  },
+
+  resetInvestigation: () => set({
+    agentVerdict:        null,
+    agentError:          null,
+    actionsTaken:        [],
+    currentRound:        1,
+    previousThreatScore: 0,
+    agentReassessing:    false,
+    agentReassessError:  null,
+  }),
 
   history: [],
   addHistory: (entry) =>

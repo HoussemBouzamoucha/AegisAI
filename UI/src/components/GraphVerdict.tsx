@@ -564,7 +564,7 @@ function ActionPanel({
   nodeMap: Record<string, GraphNodeData>;
 }) {
   // Pull live network connections so we can look up C2/lateral remote IPs by PID
-  const { networkConnections } = useStore();
+  const { networkConnections, recordExecutedAction, runAgentReassessment, agentVerdict } = useStore();
 
   // Build pid → remote_address[] map from the live network store
   const netConnsByPid = useMemo(() => {
@@ -595,6 +595,7 @@ function ActionPanel({
   const handleConfirm = useCallback(async (action: SuggestedAction) => {
     setStatuses(s => ({ ...s, [action.id]: 'running' }));
     setResults(r  => ({ ...r, [action.id]: null }));
+    const executedAt = new Date().toISOString();
 
     try {
       const res = await invoke(action.cmd, action.args);
@@ -604,12 +605,21 @@ function ActionPanel({
         : JSON.stringify(res, null, 2);
       setResults(r  => ({ ...r, [action.id]: text }));
       setStatuses(s => ({ ...s, [action.id]: 'done' }));
+      // Record the executed action for Round 2 re-assessment
+      recordExecutedAction({
+        action:      action.cmd,
+        target:      String(action.args['path'] ?? action.args['remote_ip'] ?? action.args['pid'] ?? action.args['rule_name'] ?? ''),
+        entity_id:   '',
+        executed_at: executedAt,
+        result:      'success',
+        pid:         typeof action.args['pid'] === 'number' ? action.args['pid'] : null,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setResults(r  => ({ ...r, [action.id]: msg }));
       setStatuses(s => ({ ...s, [action.id]: 'error' }));
     }
-  }, []);
+  }, [recordExecutedAction]);
 
   const handleSkip = useCallback((id: string) => {
     setStatuses(s => ({ ...s, [id]: 'skipped' }));
@@ -696,10 +706,35 @@ function ActionPanel({
 
           {allResolved && (
             <div style={{
-              marginTop: 4, fontSize: 9, color: '#00ff88',
-              fontFamily: 'var(--font-mono)', textAlign: 'center', opacity: 0.8,
+              marginTop: 4, display: 'flex', flexDirection: 'column', gap: 6,
+              alignItems: 'center',
             }}>
-              All actions resolved. Consider re-running correlation to verify remediation.
+              <div style={{
+                fontSize: 9, color: '#00ff88',
+                fontFamily: 'var(--font-mono)', opacity: 0.8,
+              }}>
+                All actions resolved.
+              </div>
+              {/* Re-assess button — only show if AI agent has an active verdict */}
+              {agentVerdict && !agentVerdict.investigation_closed && (
+                <button
+                  onClick={runAgentReassessment}
+                  style={{
+                    padding: '5px 14px',
+                    background: 'rgba(167,139,250,0.1)',
+                    border: '1px solid rgba(167,139,250,0.4)',
+                    borderRadius: 5,
+                    color: '#a78bfa',
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 9,
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    letterSpacing: '0.06em',
+                  }}
+                >
+                  Re-assess with AI →
+                </button>
+              )}
             </div>
           )}
         </div>

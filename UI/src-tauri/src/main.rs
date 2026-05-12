@@ -682,18 +682,44 @@ async fn restore_network(
 /// Round 1 agent analysis — take a correlate result and return a ranked action plan.
 ///
 /// `correlate_result` is the full JSON object returned by `correlate_entities`.
-/// The ANTHROPIC_API_KEY environment variable must be set; an error string is
-/// returned if it is missing or the Claude API call fails.
-///
 /// This command is intentionally separate from `correlate_entities` so that:
-///   (a) The detection pipeline is never delayed by a Claude API call.
+///   (a) The detection pipeline is never delayed by an LLM call.
 ///   (b) The analyst decides when to invoke AI reasoning (not automatic).
-///   (c) Future rounds can re-call this with an updated correlate result.
+///   (c) Round 2+ can re-call via `run_agent_reassessment` with an updated graph.
 #[tauri::command]
 async fn run_agent_analysis(
     correlate_result: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let verdict = agent::run_analysis(&correlate_result).await?;
+    serde_json::to_value(&verdict)
+        .map_err(|e| format!("Serialization error: {e}"))
+}
+
+/// Round 2+ agent re-assessment — called after the user executes an action
+/// and the daemon has re-correlated to produce an updated threat graph.
+///
+/// Arguments:
+///   `correlate_result`      — fresh correlate result from the daemon
+///   `actions_taken`         — array of ExecutedAction objects (all actions so far)
+///   `round`                 — current round number (2, 3, …)
+///   `previous_threat_score` — sum of combined_score over Malicious/Critical
+///                             entities from the *previous* round (for monotonicity)
+///
+/// Returns an `AgentVerdict`.  When `investigation_closed` is true the UI
+/// should stop calling this command and surface the `close_reason`.
+#[tauri::command]
+async fn run_agent_reassessment(
+    correlate_result:      serde_json::Value,
+    actions_taken:         Vec<serde_json::Value>,
+    round:                 u32,
+    previous_threat_score: f64,
+) -> Result<serde_json::Value, String> {
+    let verdict = agent::run_reassessment(
+        &correlate_result,
+        &actions_taken,
+        round,
+        previous_threat_score,
+    ).await?;
     serde_json::to_value(&verdict)
         .map_err(|e| format!("Serialization error: {e}"))
 }
@@ -947,6 +973,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             // ── AI agent ──────────────────────────────────────────────────
             run_agent_analysis,
+            run_agent_reassessment,
             // ── Scanning ──────────────────────────────────────────────────
             scan_file,
             scan_directory,

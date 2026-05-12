@@ -463,7 +463,7 @@ export const CONTEXT_FLAG_LABEL: Record<ContextFlag, string> = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Agent Round 1 — AI analysis output types
+// Agent — AI analysis output types (Round 1 + Round 2+)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface RankedAction {
@@ -476,7 +476,7 @@ export interface RankedAction {
   pid:              number | null;
   /** One sentence explaining which chain/pattern drove this recommendation */
   justification:    string;
-  /** Whether the action can be undone (block_ip, quarantine_file = true; kill_process = false) */
+  /** Whether the action can be undone */
   reversible:       boolean;
   /** Whether the entity's combined_score met the action's minimum threshold */
   min_score_met:    boolean;
@@ -484,8 +484,21 @@ export interface RankedAction {
   confirm_required: boolean;
 }
 
+/**
+ * Records one action the user already executed — accumulated across rounds
+ * and sent back to the agent on re-assessment so it never repeats itself.
+ */
+export interface ExecutedAction {
+  action:      string;
+  target:      string;
+  entity_id:   string;
+  executed_at: string | null;  // ISO-8601
+  result:      'success' | 'failed' | 'skipped';
+  pid:         number | null;
+}
+
 export interface AgentVerdict {
-  /** 3–5 actions ordered from most reversible to least reversible */
+  /** 0–5 actions ordered from most reversible to least reversible */
   ranked_actions:    RankedAction[];
   /** 2–4 sentence overall threat assessment and action justification */
   rationale:         string;
@@ -494,6 +507,15 @@ export interface AgentVerdict {
   confidence:        number;
   /** 0–3 suggested follow-up targeted scans */
   pivot_suggestions: string[];
+  /** Non-empty when the micro-loop hit its cap without resolving all rule violations */
+  warnings:          string[];
+  // ── Level 2 fields ──────────────────────────────────────────────────────────
+  /** True when the agent determines no further action is needed */
+  investigation_closed: boolean;
+  /** 'resolved' | 'no_improvement' | 'max_rounds_reached' | null */
+  close_reason:         string | null;
+  /** Which reasoning round produced this verdict (1 = initial, 2+ = re-assessment) */
+  round_num:            number;
 }
 
 export const CONTEXT_FLAG_SEVERITY: Record<

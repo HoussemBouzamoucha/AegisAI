@@ -60,7 +60,7 @@ const YARA_WEAK_RULES: &[&str] = &[
 
 /// Extensions YARA will scan — executables and scripts only.
 /// Documents excluded to prevent false positives from generic rules.
-const YARA_SCAN_EXTENSIONS: &[&str] = &[
+pub const YARA_SCAN_EXTENSIONS: &[&str] = &[
     // Executables & libraries
     "exe", "dll", "sys", "drv", "ocx", "cpl", "scr",
     // Scripts
@@ -338,6 +338,165 @@ impl FileSystemScanner {
         let sha256 = hashes.as_ref().map(|h| h.sha256.clone());
 
         if level == ThreatLevel::Clean {
+            return Ok(ScanResult::clean(path.to_path_buf(), sha256));
+        }
+
+        Ok(ScanResult::from_parts(
+            path.to_path_buf(),
+            level,
+            format!("Score {}: {}", total_score, score_reasons.join(" | ")),
+            sha256,
+            primary_signature,
+            confidence_score,
+            all_signals,
+        ))
+    }
+
+    // ── Optimised path: pre-read bytes + reusable YARA Scanner ───────────────
+
+    /// Single-read, per-thread-scanner hot path used by `parallel_scan` workers.
+    ///
+    /// All three pipeline layers (hash, YARA, heuristics) operate on the same
+    /// `bytes` slice — zero redundant disk reads per file.  The caller supplies
+    /// a `yara_x::Scanner` that is created once per worker thread and reused
+    /// across files, eliminating per-file wasmtime JIT re-initialisation.
+    ///
+    /// `file_size` must be the on-disk byte count (from `fs::metadata`), not
+    /// `bytes.len()`, because large files (> 10 MiB) are passed with an empty
+    /// `bytes` slice but still need accurate size metadata.
+    pub fn scan_bytes_direct(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        file_size: u64,
+        yara_scanner: Option<&mut yara_x::Scanner<'_>>,
+    ) -> Result<ScanResult> {
+        // ── Layer 1: Hash DB ──────────────────────────────────────────────────
+        let hashes = if self.enable_hash_db && !bytes.is_empty() {
+            let sha256 = compute_sha256_from_bytes(bytes);
+            let (md5, sha512) = if self.enable_multi_hash {
+                let md5_val = format!("{:x}", md5::compute(bytes));
+                let mut h512 = sha2::Sha512::new();
+                use sha2::Digest;
+                h512.update(bytes);
+                (md5_val, hex::encode(h512.finalize()))
+            } else {
+                (String::new(), String::new())
+            };
+            let h = FileHashes { md5, sha256, sha512 };
+            if let Some(signature) = self.check_all_hashes(&h) {
+                return Ok(ScanResult::from_parts(
+                    path.to_path_buf(),
+                    crate::core::types::ThreatLevel::Malicious,
+                    format!("Known malware signature: {}", signature),
+                    Some(h.sha256),
+                    Some(signature.to_string()),
+                    1.0,
+                    vec![DetectionSignal::new("hash", format!("Hash match: {}", signature), 100)],
+                ));
+            }
+            Some(h)
+        } else if self.enable_hash_db {
+            // file_size > 10 MiB; stream SHA-256 from disk
+            if let Ok(sha256) = compute_sha256(path) {
+                let h = FileHashes { md5: String::new(), sha256: sha256.clone(), sha512: String::new() };
+                if let Some(sig) = self.check_all_hashes(&h) {
+                    return Ok(ScanResult::from_parts(
+                        path.to_path_buf(),
+                        crate::core::types::ThreatLevel::Malicious,
+                        format!("Known malware signature: {}", sig),
+                        Some(sha256),
+                        Some(sig.to_string()),
+                        1.0,
+                        vec![DetectionSignal::new("hash", format!("Hash match: {}", sig), 100)],
+                    ));
+                }
+                Some(h)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // ── Unified scoring ───────────────────────────────────────────────────
+        let mut total_score: i32 = 0;
+        let mut all_signals: Vec<DetectionSignal> = Vec::new();
+        let mut score_reasons: Vec<String> = Vec::new();
+        let mut primary_signature: Option<String> = None;
+
+        // ── Layer 2: YARA ─────────────────────────────────────────────────────
+        const YARA_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+        if self.enable_yara && self.yara.is_ready() && should_yara_scan(path)
+            && file_size <= YARA_MAX_FILE_BYTES && !bytes.is_empty()
+        {
+            let matches = match yara_scanner {
+                Some(scanner) => YaraEngine::scan_data_reusing(scanner, bytes)
+                    .unwrap_or_default(),
+                None => self.yara.scan_file(path, Some(bytes))
+                    .unwrap_or_default(),
+            };
+
+            if !matches.is_empty() {
+                let mut yara_score = 0i32;
+                let mut rule_names: Vec<String> = Vec::new();
+                for m in &matches {
+                    let rs = yara_rule_score(&m.rule_name);
+                    yara_score += rs;
+                    rule_names.push(m.rule_name.clone());
+                    let desc = m.meta_description.clone()
+                        .unwrap_or_else(|| m.rule_name.clone());
+                    all_signals.push(DetectionSignal::new("yara", desc, rs));
+                }
+                if yara_score > 0 {
+                    total_score += yara_score;
+                    let description = matches.first()
+                        .and_then(|m| m.meta_description.clone())
+                        .unwrap_or_else(|| format!("{} rule(s)", matches.len()));
+                    score_reasons.push(format!(
+                        "YARA +{} ({}): {}",
+                        yara_score, rule_names.join(", "), description
+                    ));
+                    primary_signature = Some(rule_names.join(", "));
+                }
+            }
+        }
+
+        // ── Layer 3: Heuristics from shared buffer ────────────────────────────
+        if self.enable_deep_scan {
+            match self.heuristics.analyze_from_bytes(path, bytes, file_size) {
+                Ok((heuristic_result, h_score)) => {
+                    if heuristic_result.level != crate::core::types::ThreatLevel::Clean {
+                        total_score += h_score;
+                        score_reasons.push(heuristic_result.reason.clone());
+                        all_signals.extend(heuristic_result.detection_signals.clone());
+                        if primary_signature.is_none() {
+                            primary_signature = heuristic_result.signature.clone();
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Heuristic error for {}: {}", path.display(), e),
+            }
+        }
+
+        // ── Decision ──────────────────────────────────────────────────────────
+        let level = if total_score >= MALICIOUS_THRESHOLD {
+            crate::core::types::ThreatLevel::Malicious
+        } else if total_score >= SUSPICIOUS_THRESHOLD {
+            crate::core::types::ThreatLevel::Suspicious
+        } else {
+            crate::core::types::ThreatLevel::Clean
+        };
+
+        let confidence_score = match level {
+            crate::core::types::ThreatLevel::Clean      => 1.0,
+            crate::core::types::ThreatLevel::Suspicious => 0.55 + (total_score as f32 / 40.0).min(0.25),
+            crate::core::types::ThreatLevel::Malicious  => 0.70 + (total_score as f32 / 60.0).min(0.25),
+        };
+
+        let sha256 = hashes.as_ref().map(|h| h.sha256.clone());
+
+        if level == crate::core::types::ThreatLevel::Clean {
             return Ok(ScanResult::clean(path.to_path_buf(), sha256));
         }
 

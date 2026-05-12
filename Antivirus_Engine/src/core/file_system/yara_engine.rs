@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::fs;
+use std::sync::Arc;
 use anyhow::Result;
 
 /// Per-scan YARA timeout.  YARA rules with complex regexes can spin for
@@ -22,8 +23,10 @@ pub struct YaraMatch {
 
 /// YARA scanning engine backed by yara-x
 pub struct YaraEngine {
-    /// Pre-compiled rules ready for scanning
-    rules: Option<yara_x::Rules>,
+    /// Pre-compiled rules wrapped in Arc so worker threads can each create a
+    /// `yara_x::Scanner` that borrows from the same compiled bytecode without
+    /// copying rules — zero per-file JIT re-initialisation.
+    rules: Option<Arc<yara_x::Rules>>,
     /// How many .yar files were loaded
     pub rules_loaded: usize,
 }
@@ -67,7 +70,7 @@ impl YaraEngine {
         let rules = if loaded > 0 {
             let r = compiler.build();
             eprintln!("YARA: successfully compiled {} rule files", loaded);
-            Some(r)
+            Some(Arc::new(r))
         } else {
             None
         };
@@ -107,44 +110,13 @@ impl YaraEngine {
             }
         };
 
-        let mut scanner = yara_x::Scanner::new(rules);
         // NOTE: set_timeout() is intentionally disabled — it activates wasmtime
         // epoch interruption which races against the heartbeat thread and causes
         // non-unwindable aborts in multi-threaded scan workers.  File-size
         // filtering (YARA_MAX_FILE_BYTES in scanner.rs) is the primary guard
         // against long-running scans; each scan worker processes files serially.
-        // scanner.set_timeout(YARA_SCAN_TIMEOUT);
-        let results = match scanner.scan(data) {
-            Ok(r) => r,
-            Err(e) => return Err(e.into()),
-        };
-
-        let matches = results
-            .matching_rules()
-            .map(|rule| {
-                let tags: Vec<String> = rule.tags().map(|t| t.identifier().to_string()).collect();
-
-                // Try to get description from metadata
-                let meta_description = rule
-                    .metadata()
-                    .find(|(key, _)| *key == "description")
-                    .and_then(|(_, val)| {
-                        if let yara_x::MetaValue::String(s) = val {
-                            Some(s.to_string())
-                        } else {
-                            None
-                        }
-                    });
-
-                YaraMatch {
-                    rule_name: rule.identifier().to_string(),
-                    tags,
-                    meta_description,
-                }
-            })
-            .collect();
-
-        Ok(matches)
+        let mut scanner = yara_x::Scanner::new(rules);
+        Self::collect_matches_from_scanner(&mut scanner, data)
     }
 
     /// Scan raw bytes directly (useful for memory scanning)
@@ -153,19 +125,47 @@ impl YaraEngine {
             Some(r) => r,
             None => return Ok(vec![]),
         };
-
         let mut scanner = yara_x::Scanner::new(rules);
-        // set_timeout disabled — see comment in scan_file above
-        // scanner.set_timeout(YARA_SCAN_TIMEOUT);
+        Self::collect_matches_from_scanner(&mut scanner, data)
+    }
+
+    /// Scan `data` using a **caller-provided Scanner**, avoiding a fresh
+    /// `Scanner::new()` for every file.
+    ///
+    /// Workers in `parallel_scan` create one `yara_x::Scanner` at thread
+    /// start and pass `&mut scanner` here on every file — the wasmtime JIT
+    /// state is fully warm and reused across all files in that worker.
+    pub fn scan_data_reusing(
+        scanner: &mut yara_x::Scanner<'_>,
+        data: &[u8],
+    ) -> Result<Vec<YaraMatch>> {
+        Self::collect_matches_from_scanner(scanner, data)
+    }
+
+    /// Clone the inner `Arc<Rules>` so worker threads can each create a
+    /// `yara_x::Scanner<'_>` that borrows from the same compiled bytecode.
+    /// Returns `None` when the engine has no compiled rules.
+    pub fn rules_arc(&self) -> Option<Arc<yara_x::Rules>> {
+        self.rules.clone()
+    }
+
+    // ── Shared match-collection helper ────────────────────────────────────────
+
+    fn collect_matches_from_scanner(
+        scanner: &mut yara_x::Scanner<'_>,
+        data: &[u8],
+    ) -> Result<Vec<YaraMatch>> {
         let results = match scanner.scan(data) {
-            Ok(r) => r,
+            Ok(r)  => r,
             Err(e) => return Err(e.into()),
         };
 
         let matches = results
             .matching_rules()
-            .map(|rule| {   
-                let tags: Vec<String> = rule.tags().map(|t| t.identifier().to_string()).collect();
+            .map(|rule| {
+                let tags: Vec<String> = rule.tags()
+                    .map(|t| t.identifier().to_string())
+                    .collect();
                 let meta_description = rule
                     .metadata()
                     .find(|(key, _)| *key == "description")
@@ -176,7 +176,6 @@ impl YaraEngine {
                             None
                         }
                     });
-
                 YaraMatch {
                     rule_name: rule.identifier().to_string(),
                     tags,

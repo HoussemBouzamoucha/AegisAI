@@ -31,7 +31,7 @@ import sys
 
 from langchain_openai import ChatOpenAI
 
-from .prompt import PROMPT, build_prompt_context
+from .prompt import PROMPT, REASSESS_PROMPT, build_prompt_context, build_reassess_context
 from .schema import AgentVerdict
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -178,15 +178,50 @@ def build_llm():
 
 def build_chain():
     """
-    Build and return the LangChain analyst chain.
+    Build and return the LangChain analyst chain (Round 1).
 
     The chain is stateless and safe to reuse across calls.
     """
-    # Chain: prompt → LLM  (returns AIMessage)
     return PROMPT | build_llm()
 
 
+def build_reassess_chain():
+    """
+    Build and return the re-assessment chain (Round 2+).
+
+    Uses REASSESS_PROMPT which includes the 'actions already taken' block
+    and sets investigation_closed when no threats remain.
+    """
+    return REASSESS_PROMPT | build_llm()
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
+
+def reassess(correlate_result: dict, actions_taken: list[dict], round_num: int) -> AgentVerdict:
+    """
+    Run a re-assessment on a correlate result that reflects system state after
+    one or more user-executed containment actions.
+
+    Args:
+        correlate_result: Fresh correlate result from the daemon (post-action re-scan).
+        actions_taken:    List of ExecutedAction dicts for actions already taken.
+        round_num:        Current round number (≥2).
+
+    Returns:
+        AgentVerdict with investigation_closed=True if no threats remain.
+    """
+    chain    = build_reassess_chain()
+    context  = build_reassess_context(correlate_result, actions_taken, round_num)
+    response = chain.invoke(context)
+
+    print(f"[agent] reassess raw type: {type(response.content)}", file=sys.stderr)
+    print(f"[agent] reassess content: {response.content!r}", file=sys.stderr)
+
+    text    = _extract_text(response)
+    verdict = _parse_verdict(text)
+    # Stamp the round number — the model may output it correctly, but we enforce it.
+    return verdict.model_copy(update={"round_num": round_num})
+
 
 def analyze(correlate_result: dict) -> AgentVerdict:
     """

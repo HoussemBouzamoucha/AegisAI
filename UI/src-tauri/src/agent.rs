@@ -38,14 +38,36 @@ pub struct RankedAction {
     pub confirm_required: bool,
 }
 
+/// Records one action the user already executed — sent back on round 2+ so
+/// the model never re-recommends completed actions.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExecutedAction {
+    pub action:      String,
+    pub target:      String,
+    pub entity_id:   String,
+    pub executed_at: Option<String>,
+    pub result:      String, // "success" | "failed" | "skipped"
+    pub pid:         Option<u32>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentVerdict {
-    pub ranked_actions:    Vec<RankedAction>,
-    pub rationale:         String,
-    pub risk_level:        String,
-    pub confidence:        f32,
-    pub pivot_suggestions: Vec<String>,
+    pub ranked_actions:       Vec<RankedAction>,
+    pub rationale:            String,
+    pub risk_level:           String,
+    pub confidence:           f32,
+    pub pivot_suggestions:    Vec<String>,
+    #[serde(default)]
+    pub warnings:             Vec<String>,
+    // Level 2 fields
+    #[serde(default)]
+    pub investigation_closed: bool,
+    pub close_reason:         Option<String>,
+    #[serde(default = "default_round")]
+    pub round_num:            u32,
 }
+
+fn default_round() -> u32 { 1 }
 
 // ─── Python script locator ────────────────────────────────────────────────────
 
@@ -127,11 +149,12 @@ fn find_python(project_root: &std::path::Path) -> Option<PathBuf> {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
-/// Full Round 1 pipeline: correlate_result → AgentVerdict.
+// ─── Shared subprocess helper ─────────────────────────────────────────────────
+
+/// Spawn the Python agent, write `input_json` to stdin, collect stdout.
 ///
-/// Spawns `python ai_agent/main.py`, writes the correlate result JSON to its
-/// stdin, reads the verdict JSON from stdout, deserialises into AgentVerdict.
-pub async fn run_analysis(correlate_result: &serde_json::Value) -> Result<AgentVerdict, String> {
+/// Returns the raw JSON string from the agent's stdout line.
+fn call_agent(input_json: &str) -> Result<String, String> {
     let script = find_agent_script()
         .ok_or_else(|| {
             let cwd = std::env::current_dir()
@@ -141,73 +164,58 @@ pub async fn run_analysis(correlate_result: &serde_json::Value) -> Result<AgentV
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "<unknown>".into());
             format!(
-                "Cannot find ai_agent/main.py.\n\
-                 cwd = {cwd}\n\
-                 exe = {exe}\n\
+                "Cannot find ai_agent/main.py.\ncwd = {cwd}\nexe = {exe}\n\
                  Make sure ai_agent/ exists at the AegisAI project root."
             )
         })?;
 
-    // project_root is the parent of ai_agent/
     let project_root = script
-        .parent() // ai_agent/
-        .and_then(|p| p.parent()) // AegisAI/
+        .parent()
+        .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let python = find_python(&project_root)
-        .ok_or_else(|| {
-            "Python interpreter not found. \
-             Run: python -m venv ai_agent/.venv && ai_agent/.venv/Scripts/pip install -r ai_agent/requirements.txt".to_string()
-        })?;
+    let python = find_python(&project_root).ok_or_else(|| {
+        "Python interpreter not found. \
+         Run: python -m venv ai_agent/.venv && \
+         ai_agent/.venv/Scripts/pip install -r ai_agent/requirements.txt"
+            .to_string()
+    })?;
 
-    // The Python agent loads OPENROUTER_API_KEY from ai_agent/.env via python-dotenv,
-    // so we only hard-fail here if neither the shell env nor the .env file provides it.
-    // The Python process will emit a clear error on stdout if the key is missing.
-
-    // Serialise the correlate result to a single JSON line
-    let input_json = serde_json::to_string(correlate_result)
-        .map_err(|e| format!("Failed to serialise correlate result: {e}"))?;
-
-    // Spawn the Python agent
     let mut child = Command::new(python)
         .arg(script.to_str().unwrap_or("ai_agent/main.py"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // let Python logs appear in Tauri stderr
+        .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| format!("Failed to spawn Python agent: {e}"))?;
 
-    // Write correlate result to stdin
     if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(input_json.as_bytes())
+        stdin.write_all(input_json.as_bytes())
             .map_err(|e| format!("Failed to write to agent stdin: {e}"))?;
-        stdin
-            .write_all(b"\n")
+        stdin.write_all(b"\n")
             .map_err(|e| format!("Failed to write newline to agent stdin: {e}"))?;
     }
 
-    // Wait for the process and collect stdout
     let output = child
         .wait_with_output()
         .map_err(|e| format!("Agent process error: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!(
-            "Python agent exited with status {}",
-            output.status
-        ));
+        return Err(format!("Python agent exited with status {}", output.status));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stdout = stdout.trim();
+    let stdout = stdout.trim().to_string();
 
     if stdout.is_empty() {
         return Err("Python agent produced no output.".to_string());
     }
 
-    // Check for error response from the Python side
+    Ok(stdout)
+}
+
+fn parse_verdict(stdout: &str) -> Result<AgentVerdict, String> {
     let raw: serde_json::Value = serde_json::from_str(stdout)
         .map_err(|e| format!("Failed to parse agent output as JSON: {e}\nOutput: {stdout}"))?;
 
@@ -215,7 +223,51 @@ pub async fn run_analysis(correlate_result: &serde_json::Value) -> Result<AgentV
         return Err(format!("Agent returned an error: {err}"));
     }
 
-    // Deserialise into AgentVerdict
     serde_json::from_value::<AgentVerdict>(raw)
         .map_err(|e| format!("Failed to deserialise AgentVerdict: {e}\nOutput: {stdout}"))
+}
+
+
+// ─── Entry points ─────────────────────────────────────────────────────────────
+
+/// Full Round 1 pipeline: correlate_result → AgentVerdict.
+///
+/// Spawns `python ai_agent/main.py`, writes the correlate result JSON to its
+/// stdin, reads the verdict JSON from stdout, deserialises into AgentVerdict.
+pub async fn run_analysis(correlate_result: &serde_json::Value) -> Result<AgentVerdict, String> {
+    // Round 1: pass the raw correlate result directly (no wrapper).
+    // Python's main.py recognises it by the absence of a "correlate_result" key.
+    let input_json = serde_json::to_string(correlate_result)
+        .map_err(|e| format!("Failed to serialise correlate result: {e}"))?;
+
+    let stdout = call_agent(&input_json)?;
+    parse_verdict(&stdout)
+}
+
+/// Round 2+ pipeline: re-assess after user-executed containment actions.
+///
+/// Wraps `correlate_result` + `actions_taken` + metadata into the protocol
+/// envelope that `main.py` recognises as a re-assessment request.
+///
+/// `previous_threat_score` is the sum of `combined_score` over all
+/// Malicious/Critical entities from the *previous* round — used by the
+/// Python monotonicity guard.
+pub async fn run_reassessment(
+    correlate_result:      &serde_json::Value,
+    actions_taken:         &[serde_json::Value],
+    round_num:             u32,
+    previous_threat_score: f64,
+) -> Result<AgentVerdict, String> {
+    let envelope = serde_json::json!({
+        "correlate_result":      correlate_result,
+        "actions_taken":         actions_taken,
+        "round":                 round_num,
+        "previous_threat_score": previous_threat_score,
+    });
+
+    let input_json = serde_json::to_string(&envelope)
+        .map_err(|e| format!("Failed to serialise reassessment envelope: {e}"))?;
+
+    let stdout = call_agent(&input_json)?;
+    parse_verdict(&stdout)
 }

@@ -1,15 +1,13 @@
 // File: UI/src/components/AgentVerdict.tsx
 //
-// Agent Round 1 verdict panel — shows the AI's ranked action plan.
-// Rendered inside the ThreatGraph right-side panel (LegendPanel).
-//
-// Uses the same inline-style design system as ThreatGraph.tsx:
-//   CSS variables: --surface, --border, --text-dim, --text-bright,
-//                  --font-mono, --font-hud, --elevated
-//   Accent colours from the existing palette.
+// Agent verdict panel — shows the AI's ranked action plan (Round 1+).
+// Round 2+ adds: execute buttons, investigation-closed banner, round badge,
+// warnings display, and a Re-assess button.
 
+import { useState, useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../store';
-import type { RankedAction } from '../types';
+import type { RankedAction, ExecutedAction } from '../types';
 
 // ─── Colour maps ──────────────────────────────────────────────────────────────
 
@@ -40,16 +38,95 @@ const ACTION_ICON: Record<string, string> = {
   remove_block_ip:   '↩',
 };
 
+const CLOSE_REASON_LABEL: Record<string, string> = {
+  resolved:            'All threats resolved — investigation closed.',
+  no_improvement:      'Threat score did not decrease — further actions may not help.',
+  max_rounds_reached:  'Maximum reassessment rounds reached.',
+};
+
+// ─── Action → Tauri command + args mapping ────────────────────────────────────
+
+function buildTauriArgs(action: RankedAction): { cmd: string; args: Record<string, unknown> } {
+  switch (action.action) {
+    case 'kill_process':
+      return { cmd: 'kill_process', args: { pid: action.pid } };
+    case 'quarantine_file':
+      return { cmd: 'quarantine_file', args: { path: action.target } };
+    case 'block_ip':
+      return { cmd: 'block_ip', args: { remote_ip: action.target, direction: 'out' } };
+    case 'dump_memory':
+      return { cmd: 'dump_memory', args: { pid: action.pid } };
+    case 'check_persistence':
+      return { cmd: 'check_persistence', args: { suspicious_paths: [action.target] } };
+    case 'isolate_network':
+      return { cmd: 'isolate_network', args: {} };
+    case 'remove_block_ip':
+      return { cmd: 'remove_block_ip', args: { rule_name: action.target } };
+    default:
+      return { cmd: action.action, args: { target: action.target } };
+  }
+}
+
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
-function ActionCard({ action, index }: { action: RankedAction; index: number }) {
+type ExecStatus = 'idle' | 'running' | 'done' | 'error';
+
+function ActionCard({
+  action,
+  index,
+  onExecuted,
+}: {
+  action:     RankedAction;
+  index:      number;
+  onExecuted: (executed: ExecutedAction) => void;
+}) {
   const accentColor = ACTION_COLOR[action.action] ?? '#00d4ff';
   const icon        = ACTION_ICON[action.action]  ?? '•';
+  const [status, setStatus] = useState<ExecStatus>('idle');
+  const [result, setResult] = useState<string | null>(null);
+
+  const handleExecute = useCallback(async () => {
+    setStatus('running');
+    setResult(null);
+    const { cmd, args } = buildTauriArgs(action);
+    const executedAt = new Date().toISOString();
+    try {
+      const res = await invoke(cmd, args);
+      const text = typeof res === 'string' ? res : JSON.stringify(res, null, 2);
+      setResult(text);
+      setStatus('done');
+      onExecuted({
+        action:      action.action,
+        target:      action.target,
+        entity_id:   action.entity_id,
+        executed_at: executedAt,
+        result:      'success',
+        pid:         action.pid ?? null,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setResult(msg);
+      setStatus('error');
+      onExecuted({
+        action:      action.action,
+        target:      action.target,
+        entity_id:   action.entity_id,
+        executed_at: executedAt,
+        result:      'failed',
+        pid:         action.pid ?? null,
+      });
+    }
+  }, [action, onExecuted]);
 
   return (
     <div style={{
-      background: 'var(--elevated)',
-      border: `1px solid ${accentColor}30`,
+      background: status === 'done'  ? 'rgba(0,255,136,0.04)'
+                : status === 'error' ? 'rgba(255,51,85,0.05)'
+                : 'var(--elevated)',
+      border: `1px solid ${
+        status === 'done'  ? 'rgba(0,255,136,0.25)'
+        : status === 'error' ? 'rgba(255,51,85,0.25)'
+        : `${accentColor}30`}`,
       borderLeft: `3px solid ${accentColor}`,
       borderRadius: 6,
       padding: '8px 10px',
@@ -127,7 +204,61 @@ function ActionCard({ action, index }: { action: RankedAction; index: number }) 
             confirm required
           </span>
         )}
+        {status === 'done' && (
+          <span style={{ fontFamily: 'var(--font-hud)', fontSize: 7.5, color: '#00ff88',
+            background: 'rgba(0,255,136,0.12)', borderRadius: 3, padding: '1px 5px' }}>
+            executed
+          </span>
+        )}
+        {status === 'error' && (
+          <span style={{ fontFamily: 'var(--font-hud)', fontSize: 7.5, color: '#ff3355',
+            background: 'rgba(255,51,85,0.12)', borderRadius: 3, padding: '1px 5px' }}>
+            failed
+          </span>
+        )}
       </div>
+
+      {/* Result text */}
+      {result && (
+        <div style={{
+          fontFamily: 'var(--font-mono)',
+          fontSize: 8,
+          color: status === 'error' ? '#ff3355' : '#00ff88',
+          background: status === 'error' ? 'rgba(255,51,85,0.07)' : 'rgba(0,255,136,0.06)',
+          borderRadius: 3,
+          padding: '4px 6px',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-all',
+          maxHeight: 80,
+          overflowY: 'auto',
+        }}>
+          {result}
+        </div>
+      )}
+
+      {/* Execute button — hidden once done */}
+      {status !== 'done' && (
+        <button
+          onClick={handleExecute}
+          disabled={status === 'running'}
+          style={{
+            marginTop: 4,
+            alignSelf: 'flex-start',
+            padding: '4px 12px',
+            background: status === 'running' ? 'rgba(0,212,255,0.12)' : accentColor,
+            color: status === 'running' ? accentColor : '#000',
+            border: `1px solid ${accentColor}`,
+            borderRadius: 4,
+            fontFamily: 'var(--font-mono)',
+            fontSize: 9,
+            fontWeight: 700,
+            cursor: status === 'running' ? 'not-allowed' : 'pointer',
+            letterSpacing: '0.06em',
+          }}
+        >
+          {status === 'running' ? 'executing…' : status === 'error' ? 'RETRY' : 'EXECUTE'}
+        </button>
+      )}
     </div>
   );
 }
@@ -142,6 +273,13 @@ export function AgentVerdictPanel() {
     runAgentAnalysis,
     clearAgentVerdict,
     correlateResult,
+    // Round 2+
+    actionsTaken,
+    currentRound,
+    agentReassessing,
+    agentReassessError,
+    recordExecutedAction,
+    runAgentReassessment,
   } = useStore();
 
   // Don't render at all until there's a graph to analyze
@@ -150,6 +288,8 @@ export function AgentVerdictPanel() {
   const riskColor = agentVerdict
     ? (RISK_COLOR[agentVerdict.risk_level] ?? '#00d4ff')
     : '#00d4ff';
+
+  const hasNewActions = actionsTaken.length > 0;
 
   return (
     <div style={{
@@ -162,13 +302,30 @@ export function AgentVerdictPanel() {
       gap: 10,
     }}>
       {/* Section header */}
-      <div style={{
-        fontFamily: 'var(--font-hud)',
-        fontSize: 9,
-        color: 'var(--text-dim)',
-        letterSpacing: '0.1em',
-      }}>
-        AI ANALYSIS
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{
+          fontFamily: 'var(--font-hud)',
+          fontSize: 9,
+          color: 'var(--text-dim)',
+          letterSpacing: '0.1em',
+          flex: 1,
+        }}>
+          AI ANALYSIS
+        </span>
+        {/* Round badge */}
+        {agentVerdict && currentRound > 1 && (
+          <span style={{
+            fontFamily: 'var(--font-hud)',
+            fontSize: 7.5,
+            color: '#a78bfa',
+            background: 'rgba(167,139,250,0.12)',
+            border: '1px solid rgba(167,139,250,0.3)',
+            borderRadius: 3,
+            padding: '1px 6px',
+          }}>
+            ROUND {currentRound}
+          </span>
+        )}
       </div>
 
       {/* Idle — show trigger button */}
@@ -192,7 +349,7 @@ export function AgentVerdictPanel() {
         </button>
       )}
 
-      {/* Loading */}
+      {/* Loading (Round 1) */}
       {agentLoading && (
         <div style={{
           textAlign: 'center',
@@ -205,7 +362,30 @@ export function AgentVerdictPanel() {
         </div>
       )}
 
-      {/* Error */}
+      {/* Reassessing (Round 2+) */}
+      {agentReassessing && (
+        <div style={{
+          display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6,
+          padding: '10px 0',
+        }}>
+          <div style={{
+            fontFamily: 'var(--font-mono)',
+            fontSize: 9,
+            color: '#a78bfa',
+          }}>
+            Re-correlating and reassessing…
+          </div>
+          <div style={{
+            fontFamily: 'var(--font-hud)',
+            fontSize: 7.5,
+            color: 'var(--text-dim)',
+          }}>
+            ROUND {currentRound + 1}
+          </div>
+        </div>
+      )}
+
+      {/* Error (Round 1) */}
       {agentError && !agentLoading && (
         <>
           <div style={{
@@ -238,9 +418,66 @@ export function AgentVerdictPanel() {
         </>
       )}
 
+      {/* Reassess error */}
+      {agentReassessError && !agentReassessing && (
+        <div style={{
+          fontFamily: 'var(--font-mono)',
+          fontSize: 8.5,
+          color: '#ff3355',
+          background: 'rgba(255,51,85,0.07)',
+          border: '1px solid rgba(255,51,85,0.2)',
+          borderRadius: 5,
+          padding: '6px 8px',
+          lineHeight: 1.5,
+        }}>
+          Re-assess error: {agentReassessError}
+        </div>
+      )}
+
       {/* Verdict */}
-      {agentVerdict && !agentLoading && (
+      {agentVerdict && !agentLoading && !agentReassessing && (
         <>
+          {/* Investigation closed banner */}
+          {agentVerdict.investigation_closed && (
+            <div style={{
+              background: agentVerdict.close_reason === 'resolved'
+                ? 'rgba(0,255,136,0.08)' : 'rgba(255,179,0,0.07)',
+              border: `1px solid ${agentVerdict.close_reason === 'resolved'
+                ? 'rgba(0,255,136,0.3)' : 'rgba(255,179,0,0.3)'}`,
+              borderRadius: 6,
+              padding: '8px 10px',
+              fontFamily: 'var(--font-mono)',
+              fontSize: 8.5,
+              color: agentVerdict.close_reason === 'resolved' ? '#00ff88' : '#ffb300',
+              lineHeight: 1.5,
+            }}>
+              {CLOSE_REASON_LABEL[agentVerdict.close_reason ?? '']
+                ?? `Investigation closed: ${agentVerdict.close_reason}`}
+            </div>
+          )}
+
+          {/* Warnings */}
+          {agentVerdict.warnings.length > 0 && (
+            <div style={{
+              background: 'rgba(255,179,0,0.05)',
+              border: '1px solid rgba(255,179,0,0.2)',
+              borderRadius: 5,
+              padding: '6px 8px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 3,
+            }}>
+              <div style={{ fontFamily: 'var(--font-hud)', fontSize: 7.5, color: '#ffb300', letterSpacing: '0.07em' }}>
+                VALIDATION WARNINGS
+              </div>
+              {agentVerdict.warnings.map((w, i) => (
+                <div key={i} style={{ fontFamily: 'var(--font-mono)', fontSize: 7.5, color: '#ffb300', opacity: 0.8 }}>
+                  {w}
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* Risk badge + confidence */}
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
             <span style={{
@@ -271,7 +508,7 @@ export function AgentVerdictPanel() {
                 cursor: 'pointer',
                 padding: 0,
               }}
-              title="Clear and re-analyze"
+              title="Clear verdict and reset investigation"
             >
               ✕
             </button>
@@ -300,7 +537,12 @@ export function AgentVerdictPanel() {
                 RECOMMENDED ACTIONS ({agentVerdict.ranked_actions.length})
               </div>
               {agentVerdict.ranked_actions.map((a, i) => (
-                <ActionCard key={i} action={a} index={i} />
+                <ActionCard
+                  key={i}
+                  action={a}
+                  index={i}
+                  onExecuted={recordExecutedAction}
+                />
               ))}
             </>
           ) : (
@@ -309,8 +551,32 @@ export function AgentVerdictPanel() {
               fontSize: 8.5,
               color: 'var(--text-dim)',
             }}>
-              No containment actions recommended.
+              {agentVerdict.investigation_closed
+                ? 'No further actions recommended.'
+                : 'No containment actions recommended.'}
             </div>
+          )}
+
+          {/* Re-assess button — shown after any action executed and investigation not closed */}
+          {hasNewActions && !agentVerdict.investigation_closed && (
+            <button
+              onClick={runAgentReassessment}
+              disabled={agentReassessing}
+              style={{
+                marginTop: 4,
+                padding: '7px 0',
+                background: 'rgba(167,139,250,0.1)',
+                border: '1px solid rgba(167,139,250,0.4)',
+                borderRadius: 6,
+                color: '#a78bfa',
+                fontFamily: 'var(--font-hud)',
+                fontSize: 9,
+                letterSpacing: '0.08em',
+                cursor: agentReassessing ? 'not-allowed' : 'pointer',
+              }}
+            >
+              RE-ASSESS WITH AI ({actionsTaken.length} action{actionsTaken.length !== 1 ? 's' : ''} taken)
+            </button>
           )}
 
           {/* Pivot suggestions */}
@@ -341,24 +607,81 @@ export function AgentVerdictPanel() {
             </>
           )}
 
-          {/* Re-analyze button */}
-          <button
-            onClick={runAgentAnalysis}
-            style={{
-              marginTop: 2,
-              padding: '5px 0',
-              background: 'transparent',
-              border: '1px solid var(--border)',
-              borderRadius: 6,
-              color: 'var(--text-dim)',
-              fontFamily: 'var(--font-hud)',
-              fontSize: 8.5,
-              letterSpacing: '0.06em',
-              cursor: 'pointer',
-            }}
-          >
-            RE-ANALYZE
-          </button>
+          {/* Actions taken summary */}
+          {actionsTaken.length > 0 && (
+            <>
+              <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
+              <div style={{
+                fontFamily: 'var(--font-hud)',
+                fontSize: 8,
+                color: 'var(--text-dim)',
+                letterSpacing: '0.08em',
+              }}>
+                ACTIONS TAKEN ({actionsTaken.length})
+              </div>
+              {actionsTaken.map((a, i) => (
+                <div key={i} style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 7.5,
+                  color: a.result === 'success' ? '#00ff88' : '#ff3355',
+                  background: 'var(--elevated)',
+                  borderRadius: 4,
+                  padding: '4px 7px',
+                  display: 'flex',
+                  gap: 6,
+                }}>
+                  <span style={{ opacity: 0.7 }}>#{i + 1}</span>
+                  <span style={{ fontWeight: 700 }}>{a.action}</span>
+                  <span style={{ color: 'var(--text-dim)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {a.target}
+                  </span>
+                  <span style={{ flexShrink: 0 }}>{a.result}</span>
+                </div>
+              ))}
+            </>
+          )}
+
+          {/* Re-analyze / Reset buttons */}
+          <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
+            {!agentVerdict.investigation_closed && (
+              <button
+                onClick={runAgentAnalysis}
+                style={{
+                  flex: 1,
+                  padding: '5px 0',
+                  background: 'transparent',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                  color: 'var(--text-dim)',
+                  fontFamily: 'var(--font-hud)',
+                  fontSize: 8.5,
+                  letterSpacing: '0.06em',
+                  cursor: 'pointer',
+                }}
+              >
+                RE-ANALYZE
+              </button>
+            )}
+            {actionsTaken.length > 0 && (
+              <button
+                onClick={() => useStore.getState().resetInvestigation()}
+                style={{
+                  flex: 1,
+                  padding: '5px 0',
+                  background: 'transparent',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                  color: 'var(--text-dim)',
+                  fontFamily: 'var(--font-hud)',
+                  fontSize: 8.5,
+                  letterSpacing: '0.06em',
+                  cursor: 'pointer',
+                }}
+              >
+                RESET
+              </button>
+            )}
+          </div>
         </>
       )}
     </div>

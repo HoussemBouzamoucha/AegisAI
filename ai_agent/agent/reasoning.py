@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from .analyst import analyze, build_llm, _extract_text, _parse_verdict
+from .analyst import analyze, reassess, build_llm, _extract_text, _parse_verdict
 from .schema import AgentVerdict
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -452,6 +452,185 @@ def refine(correlate_result: dict) -> AgentVerdict:
         # Attach warnings — AgentVerdict.warnings is already defined in schema.py
         best_verdict = best_verdict.model_copy(
             update={"warnings": warning_strs}
+        )
+
+    return best_verdict
+
+
+# ─── Level 2: Action-Response loop ────────────────────────────────────────────
+
+MAX_ROUNDS = 5  # hard cap on re-assessment cycles
+
+
+def _compute_threat_score(correlate_result: dict) -> float:
+    """
+    Sum of combined_score for all Malicious/Critical entities in the graph.
+
+    Used for monotonicity checking: if this value did not decrease after an
+    action, the action had no measurable effect on the threat state.
+    """
+    nodes = correlate_result.get("graph", {}).get("nodes", [])
+    return sum(
+        float(n.get("combined_score", 0.0))
+        for n in nodes
+        if n.get("threat_level") in ("Malicious", "Critical")
+    )
+
+
+def refine_reassess(
+    correlate_result:       dict,
+    actions_taken:          list[dict],
+    round_num:              int,
+    previous_threat_score:  float = 0.0,
+) -> AgentVerdict:
+    """
+    Level 2 — action-response loop entry point.
+
+    Called after the user executes an action and the Rust daemon has
+    re-correlated.  Performs three checks before invoking the LLM:
+
+    1. **No-improvement guard**: if the overall threat score did not decrease
+       after the action, stop recommending further actions and flag the
+       investigation for manual review.
+
+    2. **Resolved guard**: if no Malicious/Critical entities remain, close
+       the investigation immediately without an LLM call.
+
+    3. **Max-rounds guard**: if we have already cycled MAX_ROUNDS times, close
+       the investigation and require human escalation.
+
+    If none of the guards fire, the function calls analyst.reassess() then
+    runs the same validate → correct micro-loop from refine() to ensure the
+    new verdict is structurally sound.
+
+    Args:
+        correlate_result:      Fresh daemon correlate result (post-action state).
+        actions_taken:         List of ExecutedAction dicts, newest last.
+        round_num:             Current round (caller increments: 1 → 2 → …).
+        previous_threat_score: Sum of combined_scores from the *previous* round.
+                               0.0 on the very first re-assessment means the check
+                               is skipped (no baseline to compare against).
+
+    Returns:
+        AgentVerdict with investigation_closed=True when the loop should stop.
+    """
+    current_score = _compute_threat_score(correlate_result)
+
+    # ── Guard 1: monotonicity ─────────────────────────────────────────────────
+    # Only check if we have a real baseline (previous_score > 0) and there were
+    # actually actions taken.  A score of exactly 0 after actions means resolved.
+    if (
+        actions_taken
+        and previous_threat_score > 0.0
+        and current_score >= previous_threat_score
+        and current_score > 0.0
+    ):
+        msg = (
+            f"Overall threat score did not decrease after the last action "
+            f"({previous_threat_score:.2f} → {current_score:.2f}). "
+            "The action may have had no measurable effect. Manual investigation required."
+        )
+        print(f"[reasoning] Round {round_num}: monotonicity guard fired — {msg}", file=sys.stderr)
+        return AgentVerdict(
+            ranked_actions=[],
+            rationale=msg,
+            risk_level="High",
+            confidence=0.0,
+            pivot_suggestions=[
+                "Re-examine whether the executed action targeted the correct entity.",
+                "Check if the threat actor spawned a new process after the action.",
+            ],
+            investigation_closed=True,
+            close_reason="no_improvement",
+            round_num=round_num,
+        )
+
+    # ── Guard 2: resolved ─────────────────────────────────────────────────────
+    if current_score == 0.0 or not any(
+        n.get("threat_level") in ("Malicious", "Critical")
+        for n in correlate_result.get("graph", {}).get("nodes", [])
+    ):
+        msg = "All confirmed threat entities have been removed. Investigation complete."
+        print(f"[reasoning] Round {round_num}: resolved — {msg}", file=sys.stderr)
+        return AgentVerdict(
+            ranked_actions=[],
+            rationale=msg,
+            risk_level="Low",
+            confidence=1.0,
+            pivot_suggestions=[],
+            investigation_closed=True,
+            close_reason="resolved",
+            round_num=round_num,
+        )
+
+    # ── Guard 3: max rounds ───────────────────────────────────────────────────
+    if round_num >= MAX_ROUNDS:
+        msg = (
+            f"Maximum re-assessment rounds ({MAX_ROUNDS}) reached with threats still "
+            "present. Escalating to manual review."
+        )
+        print(f"[reasoning] {msg}", file=sys.stderr)
+        return AgentVerdict(
+            ranked_actions=[],
+            rationale=msg,
+            risk_level="Critical",
+            confidence=0.0,
+            pivot_suggestions=["Perform manual forensic analysis — automated loop exhausted."],
+            investigation_closed=True,
+            close_reason="max_rounds_reached",
+            round_num=round_num,
+        )
+
+    # ── LLM re-assessment + micro-loop ───────────────────────────────────────
+    print(
+        f"[reasoning] Round {round_num}: re-assessing — score {previous_threat_score:.2f} → "
+        f"{current_score:.2f}, {len(actions_taken)} action(s) taken so far.",
+        file=sys.stderr,
+    )
+
+    verdict    = reassess(correlate_result, actions_taken, round_num)
+    violations = validate(verdict, correlate_result)
+
+    print(
+        f"[reasoning] Round {round_num} initial verdict — {len(violations)} violation(s): "
+        f"{[v.rule for v in violations]}",
+        file=sys.stderr,
+    )
+
+    if not violations:
+        return verdict
+
+    # Correction sub-loop (same as in refine(), capped at MAX_ITERATIONS).
+    llm             = build_llm()
+    best_verdict    = verdict
+    best_violations = violations
+    prev_verdict    = verdict
+
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        try:
+            corrected = _correct(prev_verdict, best_violations, llm)
+        except Exception as exc:
+            print(f"[reasoning] Round {round_num} correction failed: {exc}", file=sys.stderr)
+            break
+
+        if _verdicts_equal(corrected, prev_verdict):
+            print(f"[reasoning] Round {round_num}: converged.", file=sys.stderr)
+            break
+
+        new_violations = validate(corrected, correlate_result)
+        if len(new_violations) < len(best_violations):
+            best_verdict    = corrected
+            best_violations = new_violations
+
+        prev_verdict = corrected
+
+        if not new_violations:
+            print(f"[reasoning] Round {round_num}: all violations resolved.", file=sys.stderr)
+            return best_verdict
+
+    if best_violations:
+        best_verdict = best_verdict.model_copy(
+            update={"warnings": [str(v) for v in best_violations]}
         )
 
     return best_verdict

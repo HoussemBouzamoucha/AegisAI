@@ -5,6 +5,9 @@
 # RankedAction uses a model_validator to fill in fields the model sometimes
 # omits (reversible, min_score_met, justification) from the action name,
 # so validation never hard-fails on missing optional metadata.
+#
+# ExecutedAction records what the user has already done — passed back in
+# on round 2+ so the model never re-recommends completed actions.
 
 from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
@@ -33,6 +36,16 @@ _ACTION_CONFIRM: dict[str, bool] = {
     "check_persistence": False,
     "remove_block_ip":   False,
 }
+
+
+class ExecutedAction(BaseModel):
+    """Records one action the user already executed — passed back on round 2+."""
+    action:      str                                     = Field(description="Action name, same vocabulary as RankedAction.action")
+    target:      str                                     = Field(description="Human-readable target (IP, label, path)")
+    entity_id:   str                                     = Field(description="entity_id from the graph at the time the action was taken")
+    executed_at: Optional[str]                           = Field(default=None, description="ISO-8601 timestamp, or null")
+    result:      Literal["success", "failed", "skipped"] = Field(default="success", description="Outcome reported by the Rust executor")
+    pid:         Optional[int]                           = Field(default=None, description="PID if the action targeted a running process")
 
 
 class RankedAction(BaseModel):
@@ -118,4 +131,23 @@ class AgentVerdict(BaseModel):
             "resolving all violations. Each entry names a rule that is still violated "
             "so the UI can surface a caution indicator."
         )
+    )
+    # ── Level 2 fields ────────────────────────────────────────────────────────
+    investigation_closed: bool = Field(
+        default=False,
+        description=(
+            "True when the agent determines the investigation is complete: "
+            "no threats remain, no improvement was detected, or max rounds hit."
+        )
+    )
+    close_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "Why the investigation closed. One of: 'resolved' | 'no_improvement' | "
+            "'max_rounds_reached' | null (still open)."
+        )
+    )
+    round_num: int = Field(
+        default=1,
+        description="Which reasoning round produced this verdict (1 = initial, 2+ = re-assessment)."
     )

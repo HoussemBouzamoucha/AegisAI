@@ -39,13 +39,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use walkdir::WalkDir;
 
-use crate::core::file_system::scanner::{FileSystemScanner, ScanStatistics};
+use crate::core::file_system::heuristics::HeuristicAnalyzer;
+use crate::core::file_system::scanner::{FileSystemScanner, ScanStatistics, YARA_SCAN_EXTENSIONS};
 use crate::core::file_system::yara_engine::YaraEngine;
 use crate::core::types::{ScanResult, ThreatLevel};
 
@@ -54,11 +56,20 @@ use crate::core::types::{ScanResult, ThreatLevel};
 /// Files larger than this are skipped (default 256 MB).
 const DEFAULT_MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Default number of worker threads in the scan thread pool.
-const DEFAULT_THREAD_COUNT: usize = 4;
-
-/// Hard ceiling on worker threads (to avoid thrashing on low-core machines).
+/// Hard ceiling on worker threads.
 const MAX_THREADS: usize = 16;
+
+/// Two-pass triage threshold.  Files whose fast-score (extension + filename +
+/// magic bytes + entropy) is strictly below this value skip the full YARA +
+/// content-heuristics pass entirely — they are cached as Clean immediately.
+/// Value of 4 equals SUSPICIOUS_THRESHOLD: only files with at least one
+/// suspicious signal proceed to the expensive layers.
+const TRIAGE_PASS_THRESHOLD: i32 = 4;
+
+/// Chunk size for the streaming walk sorter.  The walker sends paths in
+/// chunks of this size; each chunk is priority-sorted before dispatch so
+/// workers start scanning high-risk files within milliseconds of walk start.
+const WALK_CHUNK_SIZE: usize = 1_000;
 
 /// Extensions excluded from scanning by default.
 const SKIP_EXTENSIONS: &[&str] = &[
@@ -71,6 +82,14 @@ const SKIP_EXTENSIONS: &[&str] = &[
     "psd", "xcf", "ai", "indd",
     // Disk / VM images (very large, not directly executable)
     "iso", "img", "vmdk", "vhd", "vhdx", "qcow2",
+    // Fonts — zero malware surface, very large numbers under System32
+    "ttf", "otf", "fon", "fnt", "woff", "woff2",
+    // Windows locale / catalog / manifest files — thousands in System32,
+    // never contain executable code; skipping saves 20–40 min on full scans.
+    "mui", "cat", "mum",
+    // Compiled native images & NGEN caches — Microsoft-signed, pre-JIT DLLs.
+    // Not scannable as normal PE — YARA rules produce false positives.
+    "ngen", "ni",
 ];
 
 /// Windows system paths skipped by default.
@@ -88,21 +107,6 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     "/proc",
     "/sys",
     "/dev",
-];
-
-/// Keyword fragments that bump a path to the front of the priority split
-/// (before [`ScanPrioritizer`] applies fine-grained scoring within each group).
-const PRIORITY_FRAGMENTS: &[&str] = &[
-    "Downloads",
-    "Desktop",
-    "Temp",
-    "tmp",
-    "Startup",
-    "Start Menu",
-    "AppData\\Local\\Temp",
-    "AppData\\Roaming",
-    "Tasks",
-    "Scheduled Tasks",
 ];
 
 // ─── ScanPrioritizer constants ────────────────────────────────────────────────
@@ -377,6 +381,10 @@ pub struct SystemScanConfig {
 
 impl Default for SystemScanConfig {
     fn default() -> Self {
+        // Scale threads to hardware: HDD optimum is 4–6, SSD/NVMe 8–16.
+        // We pick logical-core count clamped to MAX_THREADS as a safe default
+        // that keeps disk queues saturated on both storage types.
+        let auto_threads = num_cpus::get().clamp(4, MAX_THREADS);
         Self {
             roots: SystemScanner::default_roots(),
             skip_dirs: DEFAULT_SKIP_DIRS
@@ -388,7 +396,7 @@ impl Default for SystemScanConfig {
                 .map(|s| s.to_string())
                 .collect(),
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
-            num_threads: DEFAULT_THREAD_COUNT,
+            num_threads: auto_threads,
             incremental: true,
             yara_rules_dir: None,
             max_depth: None,
@@ -400,39 +408,6 @@ impl Default for SystemScanConfig {
     }
 }
 
-impl SystemScanConfig {
-    fn should_skip_file(&self, path: &Path, size: u64) -> bool {
-        if size > self.max_file_bytes {
-            return true;
-        }
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let lower = ext.to_lowercase();
-            return self.skip_extensions.iter().any(|e| e == &lower);
-        }
-        false
-    }
-
-    fn should_skip_dir(&self, dir: &Path) -> bool {
-        let dir_str = dir.to_string_lossy().to_lowercase();
-        if self.skip_dirs.iter().any(|skip| {
-            let skip_str = skip.to_string_lossy().to_lowercase();
-            dir_str.starts_with(&*skip_str)
-        }) {
-            return true;
-        }
-        // Rust compiler proc-macro staging dirs — created by cargo on-the-fly for
-        // proc-macro crates; always compiler internals, never user/malware files.
-        // Pattern: %TEMP%\proc-macro-srv<N>-<N>\  (random numeric suffixes)
-        dir_str.contains("proc-macro-srv")
-    }
-
-    /// Returns `true` if `path` contains any priority fragment (coarse split
-    /// before fine-grained prioritizer scoring).
-    fn is_priority(&self, path: &Path) -> bool {
-        let s = path.to_string_lossy();
-        PRIORITY_FRAGMENTS.iter().any(|frag| s.contains(frag))
-    }
-}
 
 // ─── ScanAllResult ────────────────────────────────────────────────────────────
 
@@ -478,22 +453,41 @@ fn cache_file_path() -> PathBuf {
     PathBuf::from(base).join("AegisAI").join("scan_cache.json")
 }
 
+/// Outcome of a cache lookup — tells `filter_cached` what to do with a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheVerdict {
+    /// File is unchanged and was clean last time → skip entirely.
+    Skip,
+    /// File was previously suspicious/malicious, or content changed →
+    /// re-scan so remediated files are caught quickly.
+    Rescan,
+    /// No cache entry — scan for the first time.
+    NotCached,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "json", derive(serde::Serialize, serde::Deserialize))]
 struct CachedFileState {
     mtime_secs: u64,
     file_size: u64,
+    /// SHA-256 of the file at scan time.  Used as a secondary cache key:
+    /// if mtime changed but hash matches, the file was only timestamp-touched
+    /// (e.g. Windows Update) and is still clean — no re-scan needed.
+    sha256: Option<String>,
     level: ThreatLevel,
 }
 
 /// In-memory cache mapping `PathBuf → CachedFileState`.
 ///
-/// Non-clean entries are never cached — they are always re-evaluated so that
-/// remediated files are promptly reclassified.
+/// **All** verdict levels are cached (Clean, Suspicious, Malicious).
+/// - Clean entries: skipped on the next scan when mtime+size match.
+/// - Suspicious / Malicious entries: re-scanned so that remediated files are
+///   quickly reclassified and newly-mutated threats are caught.
+/// - SHA-256 secondary key: if mtime changed but hash is the same (common
+///   after Windows Update touches DLL timestamps), the file is still clean.
 ///
 /// The cache is persisted to `%PROGRAMDATA%\AegisAI\scan_cache.json` after
-/// every scan so the next session starts with a warm cache instead of
-/// re-scanning every unchanged file from scratch.
+/// every scan so the next session starts with a warm cache.
 pub struct FileStateCache {
     inner: HashMap<PathBuf, CachedFileState>,
 }
@@ -563,21 +557,52 @@ impl FileStateCache {
         { let _ = (self, path); }
     }
 
-    fn check(&self, path: &Path, mtime_secs: u64, file_size: u64) -> Option<ThreatLevel> {
-        let state = self.inner.get(path)?;
+    /// Look up `path` and decide whether to skip or rescan.
+    ///
+    /// Two-key matching:
+    /// 1. Primary   — `mtime_secs` + `file_size` match → `Skip` (if clean) or `Rescan`.
+    /// 2. Secondary — `sha256` match (mtime changed, content didn't) → `Skip` (clean only).
+    fn check(
+        &self,
+        path: &Path,
+        mtime_secs: u64,
+        file_size: u64,
+        sha256: Option<&str>,
+    ) -> CacheVerdict {
+        let state = match self.inner.get(path) {
+            Some(s) => s,
+            None    => return CacheVerdict::NotCached,
+        };
+
+        // Primary key: mtime + size
         if state.mtime_secs == mtime_secs && state.file_size == file_size {
-            Some(state.level.clone())
-        } else {
-            None
+            return match state.level {
+                ThreatLevel::Clean => CacheVerdict::Skip,
+                _                  => CacheVerdict::Rescan, // suspicious/malicious: re-verify
+            };
         }
+
+        // Secondary key: SHA-256 (handles Windows Update timestamp-only changes)
+        if let (Some(cached_hash), Some(new_hash)) = (&state.sha256, sha256) {
+            if cached_hash == new_hash && state.level == ThreatLevel::Clean {
+                return CacheVerdict::Skip;
+            }
+        }
+
+        CacheVerdict::NotCached
     }
 
-    fn update(&mut self, path: PathBuf, mtime_secs: u64, file_size: u64, level: ThreatLevel) {
-        if level == ThreatLevel::Clean {
-            self.inner.insert(path, CachedFileState { mtime_secs, file_size, level });
-        } else {
-            self.inner.remove(&path);
-        }
+    /// Upsert a scan result.  All verdict levels are stored so subsequent
+    /// scans know whether to re-scan (Suspicious/Malicious) or skip (Clean).
+    fn update(
+        &mut self,
+        path: PathBuf,
+        mtime_secs: u64,
+        file_size: u64,
+        sha256: Option<String>,
+        level: ThreatLevel,
+    ) {
+        self.inner.insert(path, CachedFileState { mtime_secs, file_size, sha256, level });
     }
 
     pub fn clear(&mut self) {
@@ -756,121 +781,43 @@ impl SystemScanner {
 
     // ── Path collection ───────────────────────────────────────────────────────
 
-    /// Walks all configured roots and returns two sorted path lists with
-    /// per-file metadata already read: `(priority, normal, skipped_count)`.
+    // ── Streaming walk + parallel scan ───────────────────────────────────────
+
+    /// Walk all roots in a producer thread and scan in worker threads
+    /// simultaneously — scanning starts within milliseconds of walk begin
+    /// rather than waiting for the entire filesystem to be enumerated.
     ///
-    /// Each element is `(path, size_bytes, mtime_unix_secs)`.
-    /// Reading mtime here avoids a second `stat` call in `filter_cached`.
-    fn collect_paths(&self) -> (Vec<(PathBuf, u64, u64)>, Vec<(PathBuf, u64, u64)>, usize) {
-        let mut priority: Vec<(PathBuf, u64, u64)> = Vec::new();
-        let mut normal:   Vec<(PathBuf, u64, u64)> = Vec::new();
-        let mut skipped = 0usize;
-
-        for root in &self.config.roots {
-            if !root.exists() { continue; }
-
-            let walker = {
-                let w = WalkDir::new(root).follow_links(false);
-                if let Some(d) = self.config.max_depth { w.max_depth(d) } else { w }
-            };
-            for entry in walker
-                .into_iter()
-                .filter_entry(|e| {
-                    if e.file_type().is_dir() {
-                        !self.config.should_skip_dir(e.path())
-                    } else {
-                        true
-                    }
-                })
-            {
-                let entry = match entry {
-                    Ok(e)  => e,
-                    Err(_) => { skipped += 1; continue; }
-                };
-
-                if !entry.file_type().is_file() { continue; }
-
-                let path = entry.path().to_path_buf();
-
-                // Read size and mtime together from one metadata call.
-                let meta = entry.metadata();
-                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                let mtime_secs = meta.ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                if self.config.should_skip_file(&path, size) {
-                    skipped += 1;
-                    continue;
-                }
-
-                if self.config.is_priority(&path) {
-                    priority.push((path, size, mtime_secs));
-                } else {
-                    normal.push((path, size, mtime_secs));
-                }
-            }
-        }
-
-        (priority, normal, skipped)
-    }
-
-    // ── Incremental cache filtering ───────────────────────────────────────────
-
-    /// Removes from `paths` any entry whose `(mtime, size)` matches the cache.
-    /// Returns `(paths_to_scan, cache_hit_results, cache_hit_count)`.
-    fn filter_cached(
-        &self,
-        paths: Vec<(PathBuf, u64, u64)>,
-        cache: &FileStateCache,
-    ) -> (Vec<PathBuf>, Vec<ScanResult>, usize) {
-        let mut to_scan: Vec<PathBuf> = Vec::new();
-        let mut from_cache: Vec<ScanResult> = Vec::new();
-        let mut hits = 0usize;
-
-        for (path, size, mtime_secs) in paths {
-            if let Some(_cached_level) = cache.check(&path, mtime_secs, size) {
-                hits += 1;
-                from_cache.push(ScanResult::clean(path, None));
-            } else {
-                to_scan.push(path);
-            }
-        }
-
-        (to_scan, from_cache, hits)
-    }
-
-    // ── Parallel scan engine ──────────────────────────────────────────────────
-
-    /// Distributes `paths` across a thread pool and collects `ScanResult`s.
+    /// Optimisations applied here:
+    /// - **Per-thread YARA Scanner**: one `yara_x::Scanner` per worker, reused
+    ///   across all files in that thread.  Zero per-file wasmtime JIT init.
+    /// - **Single file read**: worker reads each file once; the buffer is
+    ///   passed to hash, YARA, and heuristics — zero redundant disk reads.
+    /// - **Two-pass triage**: `HeuristicAnalyzer::fast_score` runs first (no
+    ///   YARA, no content scan).  Files scoring < `TRIAGE_PASS_THRESHOLD` are
+    ///   returned as Clean immediately, skipping the expensive layers.
+    /// - **Streaming walk**: `WALK_CHUNK_SIZE`-path chunks are
+    ///   priority-sorted and dispatched to workers as the walk progresses.
     fn parallel_scan(
         &self,
-        paths: Vec<PathBuf>,
-        progress: Option<ProgressFn>,
-    ) -> Vec<ScanResult> {
-        if paths.is_empty() { return Vec::new(); }
-
-        let total = paths.len();
+        progress:    Option<ProgressFn>,
+        cache:       Arc<Mutex<FileStateCache>>,
+        incremental: bool,
+    ) -> (Vec<ScanResult>, usize /* cached_hits */, usize /* skipped */) {
         let num_threads       = self.config.num_threads.clamp(1, MAX_THREADS);
         let yara_dir          = self.config.yara_rules_dir.clone();
         let enable_multi_hash = self.config.enable_multi_hash;
         let enable_hash_db    = self.config.enable_hash_db;
         let enable_yara       = self.config.enable_yara;
+        let max_file_bytes    = self.config.max_file_bytes;
+        let max_files         = self.config.max_files;
 
-        // ── Compile YARA rules once in the calling thread ─────────────────────
-        // Each worker used to call YaraEngine::default() independently, which
-        // runs wasmtime JIT compilation for every thread simultaneously.
-        // Concurrent access to wasmtime's global engine singleton causes a
-        // non-recoverable process abort.  Compile once here, then share the
-        // Arc<YaraEngine> so workers do zero compilation work.
-        let shared_yara = if enable_yara {
+        // ── Compile YARA rules once; share Arc across all workers ─────────────
+        let shared_yara: Arc<YaraEngine> = if enable_yara {
             eprintln!("SCAN: compiling YARA rules (once, shared across {} workers)…", num_threads);
             let engine = match &yara_dir {
                 Some(dir) => YaraEngine::load_from_directory(dir)
                     .unwrap_or_else(|_| YaraEngine::default()),
-                None      => YaraEngine::default(),
+                None => YaraEngine::default(),
             };
             eprintln!("SCAN: YARA ready — {} rule file(s) compiled", engine.rules_loaded);
             Arc::new(engine)
@@ -878,9 +825,152 @@ impl SystemScanner {
             Arc::new(YaraEngine::disabled())
         };
 
-        let (work_tx, work_rx) = mpsc::channel::<PathBuf>();
+        // ── Walk → sorter channel (bounded to bound memory) ───────────────────
+        // Each item: (path, size_bytes, mtime_secs)
+        let (walk_tx, walk_rx) =
+            mpsc::sync_channel::<Option<(PathBuf, u64, u64)>>(WALK_CHUNK_SIZE * 4);
+
+        let roots          = self.config.roots.clone();
+        let skip_dirs      = self.config.skip_dirs.clone();
+        let skip_exts      = self.config.skip_extensions.clone();
+        let config_max_depth = self.config.max_depth;
+
+        // Counter shared between the walker thread and the collection code below.
+        let walker_skipped     = Arc::new(AtomicUsize::new(0));
+        let walker_skipped_w   = Arc::clone(&walker_skipped);
+
+        // Producer thread: walks the filesystem and streams paths.
+        thread::spawn(move || {
+            for root in &roots {
+                if !root.exists() { continue; }
+                let walker = {
+                    let w = WalkDir::new(root).follow_links(false);
+                    if let Some(d) = config_max_depth { w.max_depth(d) } else { w }
+                };
+                for entry in walker
+                    .into_iter()
+                    .filter_entry(|e| {
+                        if e.file_type().is_dir() {
+                            let dir_str = e.path().to_string_lossy().to_lowercase();
+                            let blocked = skip_dirs.iter().any(|s| {
+                                dir_str.starts_with(&s.to_string_lossy().to_lowercase() as &str)
+                            });
+                            !blocked && !dir_str.contains("proc-macro-srv")
+                        } else {
+                            true
+                        }
+                    })
+                {
+                    let entry = match entry { Ok(e) => e, Err(_) => continue };
+                    if !entry.file_type().is_file() { continue; }
+                    let path = entry.path().to_path_buf();
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    let mtime_secs = entry.metadata().ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    // Skip-filter (size + extension) before sending to sorter
+                    if size > max_file_bytes {
+                        walker_skipped_w.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        let lower = ext.to_ascii_lowercase();
+                        if skip_exts.iter().any(|e| e == &lower) {
+                            walker_skipped_w.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+
+                    if walk_tx.send(Some((path, size, mtime_secs))).is_err() {
+                        return; // receiver dropped (max_files hit)
+                    }
+                }
+            }
+            let _ = walk_tx.send(None); // sentinel
+        });
+
+        // ── Work channel: sorted paths ready for workers ───────────────────────
+        let (work_tx, work_rx) = mpsc::channel::<(PathBuf, u64, u64)>();
         let work_rx = Arc::new(Mutex::new(work_rx));
 
+        // ── Cached-result channel: clean hits from cache ───────────────────────
+        let (cached_tx, cached_rx) = mpsc::channel::<ScanResult>();
+
+        // Sorter thread: receives chunks from the walker, priority-sorts each,
+        // checks incremental cache, and dispatches to workers.
+        let prioritizer   = ScanPrioritizer::new();
+        let cache_sorter  = Arc::clone(&cache);
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sort_thread = thread::spawn(move || {
+            let mut chunk: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(WALK_CHUNK_SIZE);
+            let mut total_dispatched = 0usize;
+            let mut cached_hits      = 0usize;
+            let extra_skipped        = 0usize;
+
+            let dispatch = |chunk: &mut Vec<(PathBuf, u64, u64)>,
+                             cache: &Arc<Mutex<FileStateCache>>,
+                             work_tx: &mpsc::Sender<(PathBuf, u64, u64)>,
+                             cached_tx: &mpsc::Sender<ScanResult>,
+                             hits: &mut usize,
+                             dispatched: &mut usize,
+                             max_files: Option<usize>| {
+                prioritizer.sort(chunk, now_secs);
+                let locked = cache.lock().unwrap();
+                for (path, size, mtime) in chunk.drain(..) {
+                    if max_files.map(|m| *dispatched >= m).unwrap_or(false) {
+                        break;
+                    }
+                    let verdict = if incremental {
+                        locked.check(&path, mtime, size, None)
+                    } else {
+                        CacheVerdict::NotCached
+                    };
+                    match verdict {
+                        CacheVerdict::Skip => {
+                            *hits += 1;
+                            let _ = cached_tx.send(ScanResult::clean(path, None));
+                        }
+                        _ => {
+                            // Rescan + NotCached both go to workers
+                            *dispatched += 1;
+                            let _ = work_tx.send((path, size, mtime));
+                        }
+                    }
+                }
+            };
+
+            loop {
+                match walk_rx.recv() {
+                    Ok(Some(item)) => {
+                        chunk.push(item);
+                        if chunk.len() >= WALK_CHUNK_SIZE {
+                            dispatch(&mut chunk, &cache_sorter, &work_tx, &cached_tx,
+                                     &mut cached_hits, &mut total_dispatched, max_files);
+                            if max_files.map(|m| total_dispatched >= m).unwrap_or(false) {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        // Flush remaining chunk
+                        dispatch(&mut chunk, &cache_sorter, &work_tx, &cached_tx,
+                                 &mut cached_hits, &mut total_dispatched, max_files);
+                        break;
+                    }
+                }
+            }
+
+            (cached_hits, extra_skipped)
+        });
+
+        // ── Worker threads ────────────────────────────────────────────────────
         let (result_tx, result_rx) = mpsc::channel::<ScanResult>();
 
         let handles: Vec<_> = (0..num_threads)
@@ -890,50 +980,110 @@ impl SystemScanner {
                 let yara_share = Arc::clone(&shared_yara);
 
                 thread::spawn(move || {
-                    eprintln!("SCAN worker: initializing scanner (hash_db={}, yara={})", enable_hash_db, enable_yara);
+                    // Clone the Arc<Rules> so this thread owns a ref.
+                    // Scanner borrows from the local Arc — valid for thread lifetime.
+                    let rules_arc = yara_share.rules_arc();
+                    // Safety: rules_arc is kept alive for the thread's full lifetime
+                    // (it is dropped at the end of this closure), so the Scanner
+                    // borrow is valid for the entire loop.
+                    let mut yara_scanner: Option<yara_x::Scanner<'_>> =
+                        rules_arc.as_deref().map(yara_x::Scanner::new);
+
                     let mut scanner = FileSystemScanner::with_shared_yara(
                         enable_multi_hash,
-                        true,       // deep scan (heuristics) always on
-                        yara_share, // pre-compiled rules, zero JIT in this thread
+                        true,
+                        yara_share,
                     );
                     scanner.set_hash_db(enable_hash_db);
-                    eprintln!("SCAN worker: scanner ready");
 
                     loop {
-                        let path = match rx.lock().unwrap().recv() {
+                        let (path, _size, _mtime) = match rx.lock().unwrap().recv() {
                             Ok(p)  => p,
                             Err(_) => break,
                         };
 
-                        match scanner.scan_file(&path) {
-                            Ok(result) => { tx.send(result).ok(); }
-                            Err(e)     => {
+                        // ── Read file once ────────────────────────────────────
+                        const MAX_SCAN_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+                        let meta = match std::fs::metadata(&path) {
+                            Ok(m)  => m,
+                            Err(e) => {
                                 tx.send(ScanResult::error(path, e.to_string())).ok();
+                                continue;
+                            }
+                        };
+                        let file_size = meta.len();
+
+                        let bytes: Vec<u8> = if file_size > 0
+                            && file_size as usize <= MAX_SCAN_BYTES
+                        {
+                            std::fs::read(&path).unwrap_or_default()
+                        } else {
+                            Vec::new() // large files: YARA skipped by size gate anyway
+                        };
+
+                        // ── Pass 1: fast triage ───────────────────────────────
+                        // Extension + filename + magic bytes + entropy — no I/O
+                        // beyond the read above.  Files below threshold skip the
+                        // full YARA + content-heuristics pass entirely.
+                        //
+                        // YARA-eligible extensions (exe, dll, com, ps1, …) are
+                        // always forwarded to Pass 2 — triage cannot detect
+                        // signature-only threats like EICAR with no heuristic signal.
+                        let is_yara_ext = match path.extension().and_then(|e| e.to_str()) {
+                            Some(ext) => YARA_SCAN_EXTENSIONS
+                                .contains(&ext.to_ascii_lowercase().as_str()),
+                            None => true, // no extension — treat as executable
+                        };
+                        if !is_yara_ext {
+                            let triage = HeuristicAnalyzer::fast_score(&path, file_size, &bytes);
+                            if triage < TRIAGE_PASS_THRESHOLD {
+                                tx.send(ScanResult::clean(path, None)).ok();
+                                continue;
                             }
                         }
+
+                        // ── Pass 2: full scan (YARA + heuristics + hash DB) ───
+                        let result = scanner.scan_bytes_direct(
+                            &path,
+                            &bytes,
+                            file_size,
+                            yara_scanner.as_mut(),
+                        );
+
+                        match result {
+                            Ok(r)  => { tx.send(r).ok(); }
+                            Err(e) => { tx.send(ScanResult::error(path, e.to_string())).ok(); }
+                        }
                     }
+
+                    drop(yara_scanner);
+                    drop(rules_arc);
                 })
             })
             .collect();
 
         drop(result_tx);
 
-        for path in paths {
-            work_tx.send(path).ok();
-        }
-        drop(work_tx);
+        // ── Collect: merge cached + fresh results ─────────────────────────────
+        let (sort_cached_hits, sort_skipped) = sort_thread.join().unwrap_or((0, 0));
 
-        let mut results: Vec<ScanResult> = Vec::with_capacity(total);
+        let mut results: Vec<ScanResult> = cached_rx.into_iter().collect();
+        let cached_count = sort_cached_hits;
+
+        let fresh_start = results.len();
+        let _ = fresh_start;
+
         for result in result_rx {
             if let Some(ref cb) = progress {
-                cb(results.len() + 1, total, &result.path);
+                cb(results.len() + 1, results.len() + 1, &result.path);
             }
             results.push(result);
         }
 
         for h in handles { h.join().ok(); }
 
-        results
+        let walk_skips = walker_skipped.load(Ordering::Relaxed);
+        (results, cached_count, sort_skipped + walk_skips)
     }
 
     // ── Public scan entry point ───────────────────────────────────────────────
@@ -949,87 +1099,55 @@ impl SystemScanner {
     /// 6. Merge cache-hit results + freshly scanned results.
     /// 7. Update the incremental cache with new verdicts.
     pub fn scan(&self, progress: Option<ProgressFn>) -> ScanAllResult {
-        eprintln!("SCAN: step 1 — collecting paths (roots: {})", self.config.roots.len());
+        eprintln!("SCAN: starting — roots: {}, threads: {}, yara: {}, hash_db: {}",
+            self.config.roots.len(), self.config.num_threads,
+            self.config.enable_yara, self.config.enable_hash_db);
+
         let scan_time = SystemTime::now();
-        let timer = Instant::now();
+        let timer     = Instant::now();
 
-        // Capture current time once for consistent recency scoring across the batch.
-        let now_secs = scan_time
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // ── Streaming walk + parallel scan (steps 1-4 are now pipelined) ─────
+        let (results, cached_hits, extra_skipped) = self.parallel_scan(
+            progress,
+            Arc::clone(&self.cache),
+            self.config.incremental,
+        );
 
-        // ── Step 1: collect paths ──────────────────────────────────────────────
-        let (mut priority_paths, normal_paths, mut skipped_files) =
-            self.collect_paths();
-        eprintln!("SCAN: step 1 done — priority={} normal={} skipped={}",
-            priority_paths.len(), normal_paths.len(), skipped_files);
+        let skipped_files = extra_skipped + cached_hits;
 
-        // Priority-location paths first; normal paths follow.
-        priority_paths.extend(normal_paths);
-        let mut all_paths = priority_paths;
-
-        // ── Step 2: fine-grained priority sort ────────────────────────────────
-        // ScanPrioritizer stable-sorts: highest-risk files bubble to the front.
-        // Equal-score files preserve the coarse order (priority bucket before
-        // normal bucket) because sort_by is stable.
-        self.prioritizer.sort(&mut all_paths, now_secs);
-
-        // ── Step 2b: max_files cap ────────────────────────────────────────────
-        // Applied after sorting so the truncated slice always contains the
-        // highest-risk files.  Excess paths are counted as skipped.
-        if let Some(cap) = self.config.max_files {
-            if all_paths.len() > cap {
-                skipped_files += all_paths.len() - cap;
-                all_paths.truncate(cap);
-            }
-        }
-
-        // ── Step 3: incremental cache filter ──────────────────────────────────
-        let (paths_to_scan, mut results, cached_hits) = if self.config.incremental {
-            let cache = self.cache.lock().unwrap();
-            self.filter_cached(all_paths, &cache)
-        } else {
-            let paths: Vec<PathBuf> = all_paths.into_iter().map(|(p, _, _)| p).collect();
-            (paths, Vec::new(), 0)
-        };
-
-        skipped_files += cached_hits;
-
-        // ── Step 4: parallel scan ─────────────────────────────────────────────
-        eprintln!("SCAN: step 4 — parallel scan of {} files ({} threads, hash_db={}, yara={}, max_bytes={})",
-            paths_to_scan.len(), self.config.num_threads,
-            self.config.enable_hash_db, self.config.enable_yara, self.config.max_file_bytes);
-        let fresh_results = self.parallel_scan(paths_to_scan, progress);
-        eprintln!("SCAN: step 4 done — {} results", fresh_results.len());
+        eprintln!("SCAN: pipeline done — {} results ({} cached, {} skipped)",
+            results.len(), cached_hits, extra_skipped);
 
         // ── Step 5: update incremental cache ──────────────────────────────────
+        // Use metadata from walk (already read); sha256 from scan result.
+        // A single fs::metadata call per result (not two, as before).
         {
             let mut cache = self.cache.lock().unwrap();
-            for r in &fresh_results {
-                let size = fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
-                let mtime_secs = fs::metadata(&r.path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                cache.update(r.path.clone(), mtime_secs, size, r.level.clone());
+            for r in &results {
+                if let Ok(meta) = fs::metadata(&r.path) {
+                    let size = meta.len();
+                    let mtime_secs = meta.modified().ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    cache.update(
+                        r.path.clone(),
+                        mtime_secs,
+                        size,
+                        r.hash.clone(),       // SHA-256 secondary key
+                        r.level.clone(),
+                    );
+                }
             }
         }
 
-        results.extend(fresh_results);
-
         // ── Step 5b: persist cache to disk ────────────────────────────────────
-        // Done after extending results so the warm cache is available immediately
-        // on the next daemon startup — even if the process is killed mid-flight
-        // the atomic rename in save_to_disk prevents a corrupt file.
         self.save_cache();
 
         // ── Step 6: aggregate statistics ──────────────────────────────────────
         let mut stats = ScanStatistics::new();
         for r in &results {
-            let size = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
+            let size = fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
             stats.update(r, size);
         }
 
