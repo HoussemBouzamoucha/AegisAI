@@ -26,6 +26,110 @@ use anyhow::Result;
 use sha2::{Digest, Sha512};
 use hex;
 
+// ─── Ember2024 ML bridge ──────────────────────────────────────────────────────
+
+struct EmberResult {
+    score: f32,
+    file_type: String,
+    malicious: bool,
+}
+
+/// Locate `bridge.py` relative to the running engine binary.
+///
+/// Layout:
+///   Antivirus_Engine/target/{profile}/antivirus.exe
+///   Antivirus_Engine/src/core/file_system/Ember2024/bridge.py
+fn find_ember_script() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // exe → target/{profile}/ → target/ → Antivirus_Engine/
+    let engine_root = exe.parent()?.parent()?.parent()?;
+    let script = engine_root
+        .join("src").join("core").join("file_system")
+        .join("Ember2024").join("bridge.py");
+    if script.exists() { Some(script) } else { None }
+}
+
+/// Call `bridge.py <path>` via Python and parse the JSON result.
+///
+/// Returns `None` if:
+/// - bridge.py cannot be located
+/// - Python is not on PATH
+/// - The file type is unsupported (bridge returns `{"skipped":true}`)
+/// - Any other error occurs
+///
+/// This function is intentionally silent on failures — the caller continues
+/// with heuristic-only scoring.
+fn run_ember_ml(path: &Path) -> Option<EmberResult> {
+    let script = find_ember_script()?;
+    let path_str = path.to_str()?;
+    let script_str = script.to_str()?;
+
+    // Candidate order:
+    //   1. Venv Python — has thrember + lightgbm installed
+    //   2. System Python candidates — fallback if venv path changes
+    let exe = std::env::current_exe().ok()?;
+    let engine_root = exe.parent()?.parent()?.parent()?;
+    let venv_python = engine_root
+        .parent()                          // AegisAI/
+        .map(|r| r.join("ai_agent").join(".venv").join("Scripts").join("python.exe"))
+        .filter(|p| p.exists());
+
+    let venv_str: Option<String> = venv_python.as_ref()
+        .and_then(|p| p.to_str().map(|s| s.to_string()));
+
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(ref s) = venv_str { candidates.push(s.as_str()); }
+    candidates.extend_from_slice(&["python", "python3", "py"]);
+
+    for py in &candidates {
+        let output = match std::process::Command::new(py)
+            .args([script_str, path_str])
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let stdout = match std::str::from_utf8(&output.stdout) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&stdout) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Bridge returns {"skipped": true} for unsupported file types — treat as no-op.
+        if v.get("skipped").and_then(|b| b.as_bool()).unwrap_or(false) {
+            return None;
+        }
+        // Bridge may return {"error": "..."} — treat as no-op.
+        if v.get("error").is_some() {
+            return None;
+        }
+
+        let score = match v.get("score").and_then(|s| s.as_f64()) {
+            Some(s) => s as f32,
+            None => continue,
+        };
+        let file_type = v.get("file_type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        let malicious = v.get("malicious")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(score >= 0.8);
+
+        return Some(EmberResult { score, file_type, malicious });
+    }
+
+    None
+}
+
 // ─── Score thresholds ─────────────────────────────────────────────────────────
 
 const MALICIOUS_THRESHOLD: i32 = 10;
@@ -318,7 +422,7 @@ impl FileSystemScanner {
         }
 
         // ── Decision ──────────────────────────────────────────────────────────
-        let level = if total_score >= MALICIOUS_THRESHOLD {
+        let mut level = if total_score >= MALICIOUS_THRESHOLD {
             ThreatLevel::Malicious
         } else if total_score >= SUSPICIOUS_THRESHOLD {
             ThreatLevel::Suspicious
@@ -326,11 +430,38 @@ impl FileSystemScanner {
             ThreatLevel::Clean
         };
 
-        let confidence_score = match level {
+        let mut confidence_score = match level {
             ThreatLevel::Clean      => 1.0,
             ThreatLevel::Suspicious => 0.55 + (total_score as f32 / 40.0).min(0.25),
             ThreatLevel::Malicious  => 0.70 + (total_score as f32 / 60.0).min(0.25),
         };
+
+        // ── Layer 4: Ember2024 ML (gated — Suspicious/Malicious only) ─────────
+        // Runs only on single-file scans so the Python subprocess cost does not
+        // degrade directory or system-wide scan throughput.
+        if level != ThreatLevel::Clean {
+            if let Some(ember) = run_ember_ml(path) {
+                all_signals.push(DetectionSignal::new(
+                    "ember_ml",
+                    format!("EMBER2024_{} score {:.4}", ember.file_type, ember.score),
+                    // Audit-trail weight only; YARA+heuristics own the primary verdict.
+                    if ember.malicious { 5 } else { 2 },
+                ));
+                score_reasons.push(format!(
+                    "EMBER2024_{} {:.4} ({})",
+                    ember.file_type,
+                    ember.score,
+                    if ember.malicious { "malicious" } else { "suspicious" },
+                ));
+                // Escalate Suspicious → Malicious when Ember concurs.
+                if ember.malicious && level == ThreatLevel::Suspicious {
+                    level = ThreatLevel::Malicious;
+                }
+                // Blend Ember confidence into the running score.
+                let ember_confidence = 0.60 + (ember.score * 0.35).min(0.35);
+                confidence_score = confidence_score.max(ember_confidence);
+            }
+        }
 
         // Use the SHA-256 from the hash-DB phase if available; heuristics may
         // also have computed it (stored inside heuristic_result.hash) but we

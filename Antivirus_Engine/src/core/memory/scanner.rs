@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
-use crate::core::utils::calculate_entropy;
+use crate::core::utils::{calculate_entropy, is_pe_file};
 
 #[cfg(windows)]
 use windows::{
@@ -934,7 +934,7 @@ fn analyze_content(
     // "MZ" at offset 0 inside a MEM_PRIVATE executable region means a PE was
     // loaded without going through the normal image loader — reflective DLL
     // injection (T1055.001).
-    if is_executable && is_private && bytes[0] == 0x4D && bytes[1] == 0x5A {
+    if is_executable && is_private && is_pe_file(bytes) {
         bonus += 20;
         signals.push(DetectionSignal::new(
             "memory",

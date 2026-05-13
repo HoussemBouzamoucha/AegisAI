@@ -2,10 +2,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../store';
+import type { EmberMlFileResult } from '../store';
 import {
   FolderOpen, FileSearch, X, AlertTriangle,
   CheckCircle, Loader, ChevronDown, ChevronRight,
-  Shield, Zap, Tag, HardDrive, Clock,
+  Shield, Zap, Tag, HardDrive, Clock, BrainCircuit,
 } from 'lucide-react';
 import type { ScanResult, ContextFlag, DetectionSignal } from '../types';
 import { CONTEXT_FLAG_LABEL, CONTEXT_FLAG_SEVERITY } from '../types';
@@ -52,6 +53,7 @@ const SIGNAL_SOURCE_COLOR: Record<string, string> = {
   obfuscation: 'var(--red)',
   timestamp:   'var(--text-dim)',
   context:     'var(--red)',
+  ember_ml:    '#a855f7',   // violet — Ember2024 ML signal
 };
 
 const FLAG_COLOR: Record<'critical' | 'high' | 'medium', string> = {
@@ -312,6 +314,287 @@ function ResultRow({ result, index }: { result: ScanResult; index: number }) {
   );
 }
 
+// ─── Ember ML comparison row ──────────────────────────────────────────────────
+
+function EmberMlRow({ record, index }: { record: EmberMlFileResult; index: number }) {
+  const verdictColor = record.mlVerdict === 'malicious'
+    ? 'var(--red)'
+    : record.mlVerdict === 'clean'
+    ? 'var(--green)'
+    : 'var(--text-dim)';
+
+  const finalColor = record.finalLevel === 'Malicious'
+    ? 'var(--red)'
+    : record.finalLevel === 'Suspicious'
+    ? 'var(--amber)'
+    : 'var(--green)';
+
+  const scorePct = record.mlScore !== null ? Math.round(record.mlScore * 100) : null;
+
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: '1fr 100px 28px 60px 120px 28px 100px',
+      alignItems: 'center',
+      gap: 10,
+      padding: '9px 16px',
+      borderBottom: '1px solid var(--border)',
+      animation: `fadeUp 0.2s ease ${Math.min(index * 0.04, 0.4)}s both`,
+    }}>
+
+      {/* File name */}
+      <span style={{
+        fontFamily: 'var(--font-mono)', fontSize: 11,
+        color: 'var(--text)',
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }} title={record.path}>
+        {record.fileName}
+      </span>
+
+      {/* Initial verdict — always Suspicious */}
+      <span style={{
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        padding: '2px 8px',
+        background: 'rgba(255,180,0,0.12)',
+        border: '1px solid rgba(255,180,0,0.4)',
+        borderRadius: 3,
+        fontFamily: 'var(--font-hud)', fontSize: 8,
+        color: 'var(--amber)', letterSpacing: '0.06em',
+      }}>
+        SUSPICIOUS
+      </span>
+
+      {/* Arrow */}
+      <span style={{ color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'center' }}>→</span>
+
+      {/* Model chip — All model gets a distinct muted colour */}
+      {record.mlModel ? (
+        <span style={{
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          padding: '2px 7px',
+          background: record.mlModel === 'All'
+            ? 'rgba(100,116,139,0.15)'
+            : 'rgba(168,85,247,0.12)',
+          border: `1px solid ${record.mlModel === 'All'
+            ? 'rgba(100,116,139,0.4)'
+            : 'rgba(168,85,247,0.35)'}`,
+          borderRadius: 3,
+          fontFamily: 'var(--font-hud)', fontSize: 8,
+          color: record.mlModel === 'All' ? '#94a3b8' : '#a855f7',
+          letterSpacing: '0.06em',
+          whiteSpace: 'nowrap',
+        }}
+        title={record.mlModel === 'All' ? 'Catch-all model — byte-level features (no PE/PDF header)' : undefined}
+        >
+          {record.mlModel}
+        </span>
+      ) : (
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
+          —
+        </span>
+      )}
+
+      {/* Score bar + number */}
+      {scorePct !== null ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <div style={{
+            height: 3, background: 'var(--border)', borderRadius: 2, overflow: 'hidden',
+          }}>
+            <div style={{
+              height: '100%',
+              width: `${scorePct}%`,
+              background: scorePct >= 80 ? 'var(--red)' : scorePct >= 50 ? 'var(--amber)' : 'var(--green)',
+              borderRadius: 2,
+              transition: 'width 0.4s ease',
+            }} />
+          </div>
+          <span style={{
+            fontFamily: 'var(--font-mono)', fontSize: 9,
+            color: verdictColor, textAlign: 'right',
+          }}>
+            {record.mlScore!.toFixed(4)}
+          </span>
+        </div>
+      ) : (
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
+          skipped
+        </span>
+      )}
+
+      {/* Arrow 2 */}
+      <span style={{ color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', fontSize: 12, textAlign: 'center' }}>→</span>
+
+      {/* ML verdict / final verdict */}
+      {record.skipped ? (
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)',
+        }}>
+          unsupported
+        </span>
+      ) : (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+          <span style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            padding: '2px 8px',
+            background: record.finalLevel === 'Malicious'
+              ? 'rgba(255,50,50,0.12)'
+              : record.finalLevel === 'Clean'
+              ? 'rgba(0,200,80,0.10)'
+              : 'rgba(255,180,0,0.10)',
+            border: `1px solid ${finalColor}60`,
+            borderRadius: 3,
+            fontFamily: 'var(--font-hud)', fontSize: 8,
+            color: finalColor, letterSpacing: '0.06em',
+          }}>
+            {record.finalLevel.toUpperCase()}
+          </span>
+          {record.escalated && (
+            <span style={{
+              fontFamily: 'var(--font-hud)', fontSize: 8,
+              color: 'var(--red)', letterSpacing: '0.04em',
+            }} title="Escalated from Suspicious to Malicious by Ember ML">
+              ▲
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Ember ML comparison panel ─────────────────────────────────────────────────
+
+function EmberMlPanel({
+  results,
+  running,
+  progress,
+}: {
+  results: EmberMlFileResult[];
+  running: boolean;
+  progress: { done: number; total: number } | null;
+}) {
+  const escalated = results.filter(r => r.escalated).length;
+  const confirmed = results.filter(r => !r.escalated && r.mlVerdict === 'malicious').length;
+  const clean     = results.filter(r => r.mlVerdict === 'clean').length;
+  const skipped   = results.filter(r => r.skipped).length;
+
+  return (
+    <div style={{
+      background: 'var(--surface)',
+      border: '1px solid rgba(168,85,247,0.3)',
+      borderRadius: 8,
+      overflow: 'hidden',
+    }}>
+      {/* Panel header */}
+      <div style={{
+        padding: '10px 16px',
+        background: 'rgba(168,85,247,0.06)',
+        borderBottom: '1px solid rgba(168,85,247,0.2)',
+        display: 'flex', alignItems: 'center', gap: 12,
+      }}>
+        <BrainCircuit size={14} color="#a855f7" />
+        <span style={{
+          fontFamily: 'var(--font-hud)', fontSize: 11, fontWeight: 700,
+          color: '#a855f7', letterSpacing: '0.08em', flex: 1,
+        }}>
+          EMBER2024 ML ANALYSIS
+          {running && progress && (
+            <span style={{ fontWeight: 400, marginLeft: 8, color: 'var(--text-dim)' }}>
+              — {progress.done}/{progress.total} files
+            </span>
+          )}
+          {!running && results.length > 0 && (
+            <span style={{ fontWeight: 400, marginLeft: 8, color: 'var(--text-dim)' }}>
+              — {results.length} file{results.length !== 1 ? 's' : ''} processed
+            </span>
+          )}
+        </span>
+
+        {/* Summary chips — shown once at least one result is in */}
+        {results.length > 0 && (
+          <div style={{ display: 'flex', gap: 6 }}>
+            {escalated > 0 && (
+              <span style={{
+                padding: '2px 8px',
+                background: 'rgba(255,50,50,0.12)', border: '1px solid rgba(255,50,50,0.4)',
+                borderRadius: 3, fontFamily: 'var(--font-hud)', fontSize: 8,
+                color: 'var(--red)', letterSpacing: '0.05em',
+              }}>
+                ▲ {escalated} ESCALATED
+              </span>
+            )}
+            {confirmed > 0 && (
+              <span style={{
+                padding: '2px 8px',
+                background: 'rgba(255,100,50,0.10)', border: '1px solid rgba(255,100,50,0.35)',
+                borderRadius: 3, fontFamily: 'var(--font-hud)', fontSize: 8,
+                color: 'var(--amber)', letterSpacing: '0.05em',
+              }}>
+                {confirmed} CONFIRMED MALICIOUS
+              </span>
+            )}
+            {clean > 0 && (
+              <span style={{
+                padding: '2px 8px',
+                background: 'rgba(0,200,80,0.08)', border: '1px solid rgba(0,200,80,0.35)',
+                borderRadius: 3, fontFamily: 'var(--font-hud)', fontSize: 8,
+                color: 'var(--green)', letterSpacing: '0.05em',
+              }}>
+                {clean} CLEAN
+              </span>
+            )}
+            {skipped > 0 && (
+              <span style={{
+                padding: '2px 8px',
+                background: 'var(--elevated)', border: '1px solid var(--border)',
+                borderRadius: 3, fontFamily: 'var(--font-hud)', fontSize: 8,
+                color: 'var(--text-dim)', letterSpacing: '0.05em',
+              }}>
+                {skipped} SKIPPED
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Column headings */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '1fr 100px 28px 60px 120px 28px 100px',
+        gap: 10,
+        padding: '6px 16px',
+        borderBottom: '1px solid var(--border)',
+        background: 'var(--elevated)',
+      }}>
+        {['FILE', 'INITIAL', '', 'MODEL', 'ML SCORE', '', 'VERDICT'].map((h, i) => (
+          <span key={i} style={{
+            fontFamily: 'var(--font-hud)', fontSize: 8,
+            color: 'var(--text-dim)', letterSpacing: '0.08em',
+            textAlign: i === 2 || i === 5 ? 'center' : 'left',
+          }}>
+            {h}
+          </span>
+        ))}
+      </div>
+
+      {/* Rows — scrollable, header + column labels stay pinned */}
+      <div style={{ maxHeight: 260, overflowY: 'auto' }}>
+        {results.length === 0 && running && (
+          <div style={{
+            padding: '20px 16px', textAlign: 'center',
+            fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)',
+          }}>
+            Waiting for first result...
+          </div>
+        )}
+        {results.map((r, i) => (
+          <EmberMlRow key={r.path} record={r} index={i} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Scanner component ───────────────────────────────────────────────────
 
 export default function Scanner() {
@@ -319,6 +602,7 @@ export default function Scanner() {
     scanning, scanResults, scanStats, scanError,
     lastScanDurationMs,
     scanFile, scanDirectory, scanAll, quickScan, clearScan,
+    emberMlRunning, emberMlProgress, emberMlError, emberMlResults, applyEmberMl,
   } = useStore();
 
   const [tab, setTab] = useState<'threats' | 'all'>('threats');
@@ -387,6 +671,9 @@ export default function Scanner() {
 
   const threats = scanResults.filter(r => r.is_threat);
   const displayed = tab === 'threats' ? threats : scanResults;
+
+  // Suspicious files eligible for Ember2024 ML analysis
+  const suspiciousFiles = scanResults.filter(r => r.level === 'Suspicious');
 
   // Count critical context flags across all results for summary
   const criticalContextCount = scanResults.filter(r =>
@@ -703,6 +990,120 @@ export default function Scanner() {
             </div>
           ))}
         </div>
+      )}
+
+      {/* ── Ember2024 ML banner ───────────────────────────────────────────── */}
+      {/* Shown when there are suspicious files waiting for ML analysis,      */}
+      {/* or while the ML scan is in progress.                                */}
+      {(suspiciousFiles.length > 0 || emberMlRunning || emberMlError) && !scanning && (
+        <div style={{
+          padding: '10px 16px',
+          background: emberMlRunning
+            ? 'rgba(168,85,247,0.08)'
+            : 'rgba(168,85,247,0.05)',
+          border: `1px solid ${emberMlRunning ? 'rgba(168,85,247,0.5)' : 'rgba(168,85,247,0.25)'}`,
+          borderRadius: 6,
+          display: 'flex', alignItems: 'center', gap: 12,
+          transition: 'all 0.2s',
+        }}>
+          {/* Icon */}
+          {emberMlRunning
+            ? <Loader size={15} color="#a855f7" style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
+            : <BrainCircuit size={15} color="#a855f7" style={{ flexShrink: 0 }} />
+          }
+
+          {/* Label */}
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }}>
+            {emberMlRunning && emberMlProgress ? (
+              <>
+                <span style={{
+                  fontFamily: 'var(--font-hud)', fontSize: 10,
+                  color: '#a855f7', letterSpacing: '0.08em',
+                }}>
+                  EMBER2024 ML — ANALYZING {emberMlProgress.done}/{emberMlProgress.total} FILES
+                </span>
+                {/* Progress bar */}
+                <div style={{
+                  height: 3, background: 'rgba(168,85,247,0.2)',
+                  borderRadius: 2, overflow: 'hidden', maxWidth: 240,
+                }}>
+                  <div style={{
+                    height: '100%',
+                    width: `${Math.round((emberMlProgress.done / emberMlProgress.total) * 100)}%`,
+                    background: '#a855f7',
+                    borderRadius: 2,
+                    transition: 'width 0.3s ease',
+                  }} />
+                </div>
+              </>
+            ) : emberMlError ? (
+              <span style={{
+                fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--red)',
+              }}>
+                ML error: {emberMlError}
+              </span>
+            ) : (
+              <>
+                <span style={{
+                  fontFamily: 'var(--font-hud)', fontSize: 10,
+                  color: '#a855f7', letterSpacing: '0.08em',
+                }}>
+                  EMBER2024 ML READY
+                </span>
+                <span style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)',
+                }}>
+                  {suspiciousFiles.length} suspicious file{suspiciousFiles.length !== 1 ? 's' : ''} — run EMBER2024 Win32 / Win64 / .NET / PDF models to confirm or escalate
+                </span>
+              </>
+            )}
+          </div>
+
+          {/* Apply ML button */}
+          <button
+            onClick={applyEmberMl}
+            disabled={emberMlRunning || suspiciousFiles.length === 0}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 7,
+              padding: '8px 16px',
+              background: emberMlRunning ? 'rgba(168,85,247,0.05)' : 'rgba(168,85,247,0.12)',
+              border: '1px solid rgba(168,85,247,0.5)',
+              borderRadius: 6,
+              color: '#a855f7',
+              fontFamily: 'var(--font-hud)', fontSize: 10,
+              letterSpacing: '0.1em', fontWeight: 700,
+              cursor: (emberMlRunning || suspiciousFiles.length === 0) ? 'not-allowed' : 'pointer',
+              opacity: (emberMlRunning || suspiciousFiles.length === 0) ? 0.5 : 1,
+              transition: 'all 0.15s',
+              flexShrink: 0,
+            }}
+            onMouseEnter={e => {
+              if (!emberMlRunning && suspiciousFiles.length > 0) {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.background = 'rgba(168,85,247,0.22)';
+                el.style.boxShadow = '0 0 12px rgba(168,85,247,0.25)';
+              }
+            }}
+            onMouseLeave={e => {
+              const el = e.currentTarget as HTMLButtonElement;
+              el.style.background = emberMlRunning ? 'rgba(168,85,247,0.05)' : 'rgba(168,85,247,0.12)';
+              el.style.boxShadow = 'none';
+            }}
+          >
+            <BrainCircuit size={13} />
+            APPLY ML
+          </button>
+        </div>
+      )}
+
+      {/* ── Ember ML comparison panel ─────────────────────────────────────── */}
+      {/* Visible while ML is running OR after it completes with results.     */}
+      {(emberMlRunning || (emberMlResults !== null && emberMlResults.length > 0)) && !scanning && (
+        <EmberMlPanel
+          results={emberMlResults ?? []}
+          running={emberMlRunning}
+          progress={emberMlProgress}
+        />
       )}
 
       {/* ── Critical context alert banner ─────────────────────────────────── */}

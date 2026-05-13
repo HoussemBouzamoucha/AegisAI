@@ -351,7 +351,7 @@ function buildActions(
           });
         }
       });
-      const exePaths = nodes.map(n => n.sub_label).filter(Boolean) as string[];
+      const exePaths = [...new Set(nodes.map(n => n.sub_label).filter(Boolean) as string[])];
       exePaths.forEach(p => {
         actions.push({
           id: `quarantine-multi-${p}`,

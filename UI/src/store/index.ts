@@ -10,6 +10,51 @@ import type {
   MlIdsResult, CorrelateResult, AgentVerdict, ExecutedAction,
 } from '../types';
 
+// ─── Ember ML per-file comparison record ─────────────────────────────────────
+
+export interface EmberMlFileResult {
+  path: string;
+  fileName: string;                            // basename for display
+  initialLevel: 'Suspicious';                  // always — we only run on Suspicious files
+  finalLevel: 'Suspicious' | 'Malicious' | 'Clean';
+  mlModel: string | null;                      // 'Win32' | 'Win64' | 'DotNet' | 'PDF'
+  mlScore: number | null;                      // 0.0–1.0; null when skipped
+  mlVerdict: 'malicious' | 'clean' | null;     // null when skipped / unsupported
+  escalated: boolean;                          // Suspicious → Malicious
+  skipped: boolean;                            // bridge returned skipped:true
+}
+
+// ── Helper: extract Ember data from a freshly-rescanned ScanResult ────────────
+function extractEmberMlData(
+  filePath: string,
+  initial: ScanResult,
+  updated: ScanResult,
+): EmberMlFileResult {
+  const fileName = filePath.split(/[\\/]/).pop() ?? filePath;
+  const emberSig = updated.detection_signals.find(s => s.source === 'ember_ml');
+
+  // Description format from Rust: "EMBER2024_Win64 score 0.9230 (malicious)"
+  const match = emberSig?.description.match(
+    /EMBER2024_(\w+)\s+score\s+([\d.]+)\s+\((\w+)\)/,
+  );
+
+  const mlModel   = match ? match[1] : null;
+  const mlScore   = match ? parseFloat(match[2]) : null;
+  const mlVerdict = match ? (match[3] as 'malicious' | 'clean') : null;
+
+  return {
+    path:         filePath,
+    fileName,
+    initialLevel: 'Suspicious',
+    finalLevel:   updated.level as EmberMlFileResult['finalLevel'],
+    mlModel,
+    mlScore,
+    mlVerdict,
+    escalated:    initial.level === 'Suspicious' && updated.level === 'Malicious',
+    skipped:      !emberSig,
+  };
+}
+
 interface AppState {
   view: View;
   setView: (v: View) => void;
@@ -27,6 +72,12 @@ interface AppState {
   scanAll: () => Promise<void>;
   quickScan: () => Promise<void>;
   clearScan: () => void;
+
+  emberMlRunning: boolean;
+  emberMlProgress: { done: number; total: number } | null;
+  emberMlError: string | null;
+  emberMlResults: EmberMlFileResult[] | null;
+  applyEmberMl: () => Promise<void>;
 
   processScanning: boolean;
   processes: ProcessInfo[];
@@ -307,7 +358,76 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  clearScan: () => set({ scanResults: [], scanStats: null, scanError: null, lastScanDurationMs: null }),
+  clearScan: () => set({
+    scanResults: [], scanStats: null, scanError: null, lastScanDurationMs: null,
+    emberMlRunning: false, emberMlProgress: null, emberMlError: null, emberMlResults: null,
+  }),
+
+  emberMlRunning: false,
+  emberMlProgress: null,
+  emberMlError: null,
+  emberMlResults: null,
+
+  applyEmberMl: async () => {
+    const suspicious = get().scanResults.filter(r => r.level === 'Suspicious');
+    if (suspicious.length === 0) return;
+
+    // Reset results so a re-run starts fresh
+    set({
+      emberMlRunning: true,
+      emberMlError: null,
+      emberMlProgress: { done: 0, total: suspicious.length },
+      emberMlResults: [],
+    });
+
+    let done = 0;
+    for (const file of suspicious) {
+      let record: EmberMlFileResult;
+      try {
+        const result = await invoke<ScanOutput>('scan_file', { path: file.path });
+        const files = (result.files ?? []).map(normalizeScanResult);
+        const updated = files[0] ?? file;
+
+        // Patch the result row in-place
+        set(s => ({
+          scanResults: s.scanResults.map(r => r.path === file.path ? updated : r),
+        }));
+
+        record = extractEmberMlData(file.path, file, updated);
+      } catch {
+        // file deleted / locked — record as skipped
+        record = {
+          path: file.path,
+          fileName: file.path.split(/[\\/]/).pop() ?? file.path,
+          initialLevel: 'Suspicious',
+          finalLevel: 'Suspicious',
+          mlModel: null, mlScore: null, mlVerdict: null,
+          escalated: false, skipped: true,
+        };
+      }
+
+      done++;
+      // Push the record live so the panel fills as results arrive
+      set(s => ({
+        emberMlResults: [...(s.emberMlResults ?? []), record],
+        emberMlProgress: { done, total: s.emberMlProgress?.total ?? suspicious.length },
+      }));
+    }
+
+    // Recompute stats from the updated results
+    const final = get().scanResults;
+    const prev  = get().scanStats;
+    set({
+      scanStats: prev ? {
+        ...prev,
+        suspicious_files: final.filter(r => r.level === 'Suspicious').length,
+        malicious_files:  final.filter(r => r.level === 'Malicious').length,
+        clean_files:      final.filter(r => r.level === 'Clean').length,
+      } : prev,
+      emberMlRunning:  false,
+      emberMlProgress: null,
+    });
+  },
 
   processScanning: false,
   processes: [],

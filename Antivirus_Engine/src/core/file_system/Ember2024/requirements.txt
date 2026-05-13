@@ -1,0 +1,14 @@
+# ── Ember2024 bridge dependencies ─────────────────────────────────────────────
+# Install with:  pip install -r requirements.txt
+# Requires Python >= 3.9
+
+# Core ML inference engine (LightGBM .model files)
+lightgbm>=4.5.0
+
+# EMBER2024 feature extractor — parses PE / PDF and vectorises for LightGBM
+# thrember pulls in: pefile, polars, scikit-learn, signify,
+#                    huggingface_hub, matplotlib, tqdm
+thrember>=0.1.0
+
+# Numerical array ops (used in bridge.py for .reshape())
+numpy>=1.26.0
