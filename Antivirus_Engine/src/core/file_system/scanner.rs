@@ -26,27 +26,198 @@ use anyhow::Result;
 use sha2::{Digest, Sha512};
 use hex;
 
-// ─── Ember2024 ML bridge ──────────────────────────────────────────────────────
+// ─── Ember2024 ML bridge ─────────────────────────────────────────────────────
 
-struct EmberResult {
-    score: f32,
-    file_type: String,
-    malicious: bool,
+// ── Persistent bridge server ──────────────────────────────────────────────────
+//
+// `EmberServer` keeps bridge.py alive between Apply-ML calls so that the five
+// LightGBM models are loaded exactly **once** per daemon lifetime (not once per
+// chunk).  The server communicates via stdin/stdout line-by-line JSON, matching
+// bridge.py's `--server` protocol:
+//   → write one absolute path + newline to server stdin
+//   ← read one JSON result line from server stdout
+//
+// Usage pattern in the daemon:
+//   1. `EmberServer::start()` — spawn bridge.py --server, models load (~5-10 s).
+//   2. `server.analyze_batch(paths)` — send paths, collect results (~0.1-0.3 s/file).
+//   3. Server stays alive; subsequent calls skip the model-load step entirely.
+
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+pub struct EmberServer {
+    stdin:       ChildStdin,
+    response_rx: mpsc::Receiver<String>,
+    child:       Child,
+}
+
+impl EmberServer {
+    /// Spawn `bridge.py --server` and return a handle.
+    /// Returns `None` if bridge.py or a suitable Python interpreter cannot be found.
+    pub fn start() -> Option<Self> {
+        let script     = find_ember_script()?;
+        let script_str = script.to_str()?.to_string();
+
+        let exe         = std::env::current_exe().ok()?;
+        let engine_root = exe.parent()?.parent()?.parent()?.to_path_buf();
+        let venv_python = engine_root
+            .parent()
+            .map(|r| r.join("ai_agent").join(".venv").join("Scripts").join("python.exe"))
+            .filter(|p| p.exists());
+
+        let venv_str: Option<String> = venv_python
+            .as_ref()
+            .and_then(|p| p.to_str().map(|s| s.to_string()));
+
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(ref s) = venv_str { candidates.push(s.clone()); }
+        candidates.extend(["python", "python3", "py"].iter().map(|s| s.to_string()));
+
+        for py in &candidates {
+            let mut child = match std::process::Command::new(py)
+                .arg(&script_str)
+                .arg("--server")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())   // relay "bridge: server ready" to daemon stderr
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let stdin = match child.stdin.take() {
+                Some(s) => s,
+                None => { child.kill().ok(); continue; }
+            };
+            let stdout_pipe = match child.stdout.take() {
+                Some(s) => s,
+                None => { child.kill().ok(); continue; }
+            };
+
+            // Background thread: read response lines and send them on the channel.
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout_pipe).lines() {
+                    match line {
+                        Ok(l) => { if tx.send(l).is_err() { break; } }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            eprintln!("EMBER SERVER: started with {}", py);
+            return Some(EmberServer { stdin, response_rx: rx, child });
+        }
+
+        None
+    }
+
+    /// Send `paths` to the server one-per-line, read back one JSON result per path.
+    ///
+    /// Sequential protocol: write one path → wait for one response, then repeat.
+    /// This avoids OS pipe-buffer saturation when models are still loading (the
+    /// server wouldn't be reading stdin yet, so writing all paths up-front would
+    /// fill the ~64 KiB pipe buffer and block the daemon thread permanently).
+    ///
+    /// Timeouts:
+    ///   • First file  → 120 s  (covers Python startup + 5-model LightGBM load)
+    ///   • Subsequent  →  20 s  (pure inference; models already warm)
+    ///
+    /// If any response is late the server is killed and all remaining files in
+    /// this batch are marked `Err("server_timeout")`.  The caller must set
+    /// `server = None` afterwards so the server is restarted on the next call.
+    pub fn analyze_batch(
+        &mut self,
+        paths: &[&Path],
+    ) -> Vec<(PathBuf, Result<EmberResult, String>)> {
+        // 180 s: Python start + venv re-launch + 5-model LightGBM deserialisation
+        // on machines with slow storage or first-run cold disk cache.
+        const WARMUP_TIMEOUT:    Duration = Duration::from_secs(180);
+        // 30 s: generous ceiling for large-file PE feature extraction.
+        const PER_FILE_TIMEOUT:  Duration = Duration::from_secs(30);
+
+        let mut results = Vec::with_capacity(paths.len());
+        let mut stuck   = false;
+
+        for (i, path) in paths.iter().enumerate() {
+            if stuck {
+                results.push((path.to_path_buf(), Err("server_timeout".to_string())));
+                continue;
+            }
+
+            // ── Send one path ─────────────────────────────────────────────────
+            if let Some(s) = path.to_str() {
+                if writeln!(self.stdin, "{}", s).is_err()
+                    || self.stdin.flush().is_err()
+                {
+                    eprintln!("EMBER SERVER: stdin write failed, server dead");
+                    self.child.kill().ok();
+                    stuck = true;
+                    results.push((path.to_path_buf(), Err("server_dead".to_string())));
+                    continue;
+                }
+            } else {
+                results.push((path.to_path_buf(), Err("invalid_path".to_string())));
+                continue;
+            }
+
+            // ── Wait for one response ─────────────────────────────────────────
+            let timeout = if i == 0 { WARMUP_TIMEOUT } else { PER_FILE_TIMEOUT };
+            match self.response_rx.recv_timeout(timeout) {
+                Ok(line) => {
+                    let v: serde_json::Value = serde_json::from_str(&line)
+                        .unwrap_or(serde_json::Value::Null);
+                    results.push((path.to_path_buf(), parse_ember_json(&v)));
+                }
+                Err(_) => {
+                    eprintln!(
+                        "EMBER SERVER: no response within {}s for file #{}, killing",
+                        timeout.as_secs(), i + 1
+                    );
+                    self.child.kill().ok();
+                    stuck = true;
+                    results.push((path.to_path_buf(), Err("server_timeout".to_string())));
+                }
+            }
+        }
+
+        results
+    }
+
+    /// True while the bridge.py process is still running.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+pub struct EmberResult {
+    pub score: f32,
+    pub file_type: String,
+    pub malicious: bool,
 }
 
 /// Locate `bridge.py` relative to the running engine binary.
 ///
-/// Layout:
-///   Antivirus_Engine/target/{profile}/antivirus.exe
-///   Antivirus_Engine/src/core/file_system/Ember2024/bridge.py
+/// Handles both default and cross-compilation layouts:
+///   Antivirus_Engine/target/{profile}/antivirus.exe          (3 levels up)
+///   Antivirus_Engine/target/{triple}/{profile}/antivirus.exe (4 levels up)
 fn find_ember_script() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    // exe → target/{profile}/ → target/ → Antivirus_Engine/
-    let engine_root = exe.parent()?.parent()?.parent()?;
-    let script = engine_root
-        .join("src").join("core").join("file_system")
-        .join("Ember2024").join("bridge.py");
-    if script.exists() { Some(script) } else { None }
+    let bridge_rel = ["src", "core", "file_system", "Ember2024", "bridge.py"];
+
+    // Walk up from 3 to 5 parent levels to find Antivirus_Engine root.
+    let mut candidate = exe.as_path();
+    for _ in 0..5 {
+        candidate = candidate.parent()?;
+        let script: PathBuf = bridge_rel.iter().fold(candidate.to_path_buf(), |p, s| p.join(s));
+        if script.exists() {
+            return Some(script);
+        }
+    }
+    None
 }
 
 /// Call `bridge.py <path>` via Python and parse the JSON result.
@@ -103,31 +274,199 @@ fn run_ember_ml(path: &Path) -> Option<EmberResult> {
             Err(_) => continue,
         };
 
-        // Bridge returns {"skipped": true} for unsupported file types — treat as no-op.
-        if v.get("skipped").and_then(|b| b.as_bool()).unwrap_or(false) {
-            return None;
+        match parse_ember_json(&v) {
+            Ok(result) => return Some(result),
+            Err(_)     => return None, // bridge skipped/error — stop trying other Python candidates
         }
-        // Bridge may return {"error": "..."} — treat as no-op.
-        if v.get("error").is_some() {
-            return None;
-        }
-
-        let score = match v.get("score").and_then(|s| s.as_f64()) {
-            Some(s) => s as f32,
-            None => continue,
-        };
-        let file_type = v.get("file_type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("Unknown")
-            .to_string();
-        let malicious = v.get("malicious")
-            .and_then(|b| b.as_bool())
-            .unwrap_or(score >= 0.8);
-
-        return Some(EmberResult { score, file_type, malicious });
     }
 
     None
+}
+
+/// Parse one Ember result from a single JSON value.
+///
+/// Returns `Ok(EmberResult)` on success, or `Err(skip_reason)` when the bridge
+/// reported a skip.  `skip_reason` is the `skip_reason` field from the JSON
+/// (e.g. `"file_unavailable"`, `"prediction_error"`) or `"skipped"` as a
+/// fallback for older bridge output that omits the field.
+fn parse_ember_json(v: &serde_json::Value) -> Result<EmberResult, String> {
+    if v.get("skipped").and_then(|b| b.as_bool()).unwrap_or(false) {
+        let reason = v.get("skip_reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("skipped")
+            .to_string();
+        return Err(reason);
+    }
+    // Unexpected error field without explicit skipped flag
+    if v.get("error").is_some() && v.get("score").is_none() {
+        return Err("prediction_error".to_string());
+    }
+    let score = v.get("score")
+        .and_then(|s| s.as_f64())
+        .ok_or_else(|| "no_score".to_string())? as f32;
+    let file_type = v.get("file_type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("Unknown")
+        .to_string();
+    let malicious = v.get("malicious")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(score >= 0.8);
+    Ok(EmberResult { score, file_type, malicious })
+}
+
+/// Run Ember2024 ML on a batch of files using a **single** Python subprocess.
+///
+/// Bridge is called with `--batch path1 path2 …` and returns a JSON array.
+/// Because the Python interpreter and all five LightGBM models are loaded only
+/// once, this is dramatically faster than calling `run_ember_ml` per file
+/// (no repeated subprocess spawn, no repeated model deserialisation).
+///
+/// Returns one `(PathBuf, Result<EmberResult, String>)` per input path in order.
+/// `Err(skip_reason)` means the bridge skipped or errored; the string is the
+/// `skip_reason` field from the bridge JSON (e.g. `"file_unavailable"`).
+pub fn run_ember_ml_batch(paths: &[&Path]) -> Vec<(PathBuf, Result<EmberResult, String>)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    let nones: Vec<(PathBuf, Result<EmberResult, String>)> = paths.iter()
+        .map(|p| (p.to_path_buf(), Err("batch_error".to_string())))
+        .collect();
+
+    let script = match find_ember_script() {
+        Some(s) => s,
+        None => return nones,
+    };
+    let script_str = match script.to_str() {
+        Some(s) => s.to_string(),
+        None => return nones,
+    };
+
+    // Reuse the same venv-first candidate logic as run_ember_ml.
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return nones,
+    };
+    let engine_root = match exe.parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    {
+        Some(r) => r.to_path_buf(),
+        None => return nones,
+    };
+    let venv_python = engine_root
+        .parent()
+        .map(|r| r.join("ai_agent").join(".venv").join("Scripts").join("python.exe"))
+        .filter(|p| p.exists());
+
+    let venv_str: Option<String> = venv_python
+        .as_ref()
+        .and_then(|p| p.to_str().map(|s| s.to_string()));
+
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(ref s) = venv_str { candidates.push(s.clone()); }
+    candidates.extend(["python", "python3", "py"].iter().map(|s| s.to_string()));
+
+    let path_strs: Vec<&str> = paths.iter().filter_map(|p| p.to_str()).collect();
+
+    // How long to wait for the Python subprocess before killing it.
+    // 150 s covers model load (5 LightGBM models, ~30–120 s on slow machines)
+    // plus up to 10 files with expensive PE feature extraction.
+    const SUBPROCESS_TIMEOUT_SECS: u64 = 150;
+
+    for py in &candidates {
+        // Use `spawn()` instead of `output()` so we can:
+        //   (a) read stdout in a background thread — prevents pipe-buffer deadlock
+        //       when the JSON output is large.
+        //   (b) kill the process if it hangs beyond SUBPROCESS_TIMEOUT_SECS.
+        let mut child = match std::process::Command::new(py)
+            .arg(&script_str)
+            .arg("--batch")
+            .args(&path_strs)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Drain stdout in a background thread so the pipe never fills and
+        // blocks the Python process before it can exit.
+        let mut pipe = match child.stdout.take() {
+            Some(s) => s,
+            None => { child.kill().ok(); continue; }
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            pipe.read_to_end(&mut buf).ok();
+            tx.send(buf).ok();
+        });
+
+        // Poll for process exit; kill after timeout.
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(SUBPROCESS_TIMEOUT_SECS);
+        let mut timed_out = false;
+        let success = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if start.elapsed() >= timeout => {
+                    child.kill().ok();
+                    timed_out = true;
+                    eprintln!(
+                        "run_ember_ml_batch: Python subprocess killed after {}s timeout \
+                         ({} files)",
+                        SUBPROCESS_TIMEOUT_SECS, paths.len()
+                    );
+                    break false;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                Err(_) => { child.kill().ok(); break false; }
+            }
+        };
+
+        if !success {
+            // Subprocess timed out — the same binary will face the same model-load
+            // cost and timeout again.  Stop trying other interpreter candidates
+            // immediately rather than burning another 150 s per candidate.
+            if timed_out { break; }
+            // Subprocess spawned but exited with failure (wrong interpreter, import
+            // error, etc.) — try the next candidate.
+            continue;
+        }
+
+        // Collect the stdout bytes from the reader thread (5 s deadline).
+        let raw = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        let stdout_str = match std::str::from_utf8(&raw) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => continue,
+        };
+        let arr: serde_json::Value = match serde_json::from_str(&stdout_str) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let results_arr = match arr.as_array() {
+            Some(a) => a,
+            None => continue,
+        };
+
+        let out = paths.iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let v = results_arr.get(i).cloned().unwrap_or(serde_json::Value::Null);
+                (p.to_path_buf(), parse_ember_json(&v))
+            })
+            .collect();
+        return out;
+    }
+
+    nones
 }
 
 // ─── Score thresholds ─────────────────────────────────────────────────────────
@@ -443,7 +782,12 @@ impl FileSystemScanner {
             if let Some(ember) = run_ember_ml(path) {
                 all_signals.push(DetectionSignal::new(
                     "ember_ml",
-                    format!("EMBER2024_{} score {:.4}", ember.file_type, ember.score),
+                    format!(
+                        "EMBER2024_{} score {:.4} ({})",
+                        ember.file_type,
+                        ember.score,
+                        if ember.malicious { "malicious" } else { "clean" },
+                    ),
                     // Audit-trail weight only; YARA+heuristics own the primary verdict.
                     if ember.malicious { 5 } else { 2 },
                 ));

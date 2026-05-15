@@ -143,6 +143,20 @@ fn run_daemon() {
 
     eprintln!("DAEMON: scanner initialized, waiting for requests...");
 
+    // Persistent Ember ML server — started eagerly so that the five LightGBM
+    // models are loaded in the background while the daemon is otherwise idle.
+    // By the time the user clicks "Apply ML" the warmup is already done, so
+    // the 120 s first-file timeout in analyze_batch is purely a safety net.
+    // If bridge.py or Python cannot be found, this is None and analyze_batch
+    // falls back to the one-shot subprocess path.
+    let mut ember_server: Option<crate::core::file_system::scanner::EmberServer> =
+        crate::core::file_system::scanner::EmberServer::start();
+    if ember_server.is_some() {
+        eprintln!("DAEMON: Ember ML server starting (models loading in background)...");
+    } else {
+        eprintln!("DAEMON: Ember ML server unavailable — will use fallback batch mode");
+    }
+
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
@@ -225,6 +239,25 @@ fn run_daemon() {
                 request["include_memory"].as_bool().unwrap_or(false),
                 &id,
             ),
+            "apply-ember-ml" => {
+                let paths: Vec<String> = request["paths"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                daemon_apply_ember_ml(&paths, &id, &mut ember_server)
+            }
+            "apply-process-gru" => {
+                // entries: [{pid, exe_path}, ...]
+                let entries: Vec<(u32, String)> = request["entries"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|e| {
+                        let pid      = e["pid"].as_u64()? as u32;
+                        let exe_path = e["exe_path"].as_str()?.to_string();
+                        Some((pid, exe_path))
+                    }).collect())
+                    .unwrap_or_default();
+                daemon_apply_process_gru(&entries, &id)
+            }
             "ping" => json!({ "id": id, "status": "pong" }),
             _      => json!({ "id": id, "error": format!("Unknown command: {}", cmd) }),
         };
@@ -383,6 +416,233 @@ fn daemon_scan_all(scanner: &SystemScanner, id: &str) -> serde_json::Value {
         },
         "files": files,
     })
+}
+
+/// Run Ember2024 ML on a batch of file paths.
+///
+/// Uses the persistent `EmberServer` (bridge.py --server) so that LightGBM
+/// models are loaded only once per daemon lifetime.  If the server has not
+/// been started yet, or if it crashed, it is (re)started here before the
+/// batch is processed.  Falls back to `run_ember_ml_batch` (one-shot subprocess)
+/// if the server cannot be started at all.
+fn daemon_apply_ember_ml(
+    paths: &[String],
+    id:    &str,
+    server: &mut Option<crate::core::file_system::scanner::EmberServer>,
+) -> serde_json::Value {
+    use crate::core::file_system::scanner::{EmberServer, run_ember_ml_batch};
+
+    let path_refs: Vec<&Path> = paths.iter().map(|s| Path::new(s.as_str())).collect();
+
+    // (Re)start the server if it is absent or has crashed.
+    if server.as_mut().map(|s| !s.is_alive()).unwrap_or(true) {
+        eprintln!("EMBER SERVER: (re)starting…");
+        *server = EmberServer::start();
+        if server.is_none() {
+            eprintln!("EMBER SERVER: could not start, falling back to batch subprocess");
+        }
+    }
+
+    let results = match server.as_mut() {
+        Some(s) => {
+            let r = s.analyze_batch(&path_refs);
+            // If the server died mid-batch, clear it so the next call restarts it.
+            if !s.is_alive() { *server = None; }
+            r
+        }
+        None => run_ember_ml_batch(&path_refs),
+    };
+
+    let entries: Vec<serde_json::Value> = results
+        .into_iter()
+        .map(|(path, ember)| match ember {
+            Ok(e) => json!({
+                "path":        path.display().to_string(),
+                "skipped":     false,
+                "skip_reason": null,
+                "file_type":   e.file_type,
+                "score":       e.score,
+                "malicious":   e.malicious,
+            }),
+            Err(reason) => json!({
+                "path":        path.display().to_string(),
+                "skipped":     true,
+                "skip_reason": reason,
+                "file_type":   null,
+                "score":       null,
+                "malicious":   null,
+            }),
+        })
+        .collect();
+
+    json!({ "id": id, "success": true, "results": entries })
+}
+
+/// Locate `process_bridge.py` relative to the running engine binary.
+///
+/// Layout: Antivirus_Engine/target/{profile}/antivirus.exe
+///         Antivirus_Engine/src/core/process/Sys_API/process_bridge.py
+fn find_process_bridge_script() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let bridge_rel = ["src", "core", "process", "Sys_API", "process_bridge.py"];
+
+    let mut candidate = exe.as_path();
+    for _ in 0..5 {
+        candidate = candidate.parent()?;
+        let script: std::path::PathBuf = bridge_rel.iter()
+            .fold(candidate.to_path_buf(), |p, s| p.join(s));
+        if script.exists() {
+            return Some(script);
+        }
+    }
+    None
+}
+
+/// Run `process_bridge.py --batch` on a list of (pid, exe_path) entries.
+///
+/// Returns one result per input entry (in order).  Each result is a JSON
+/// object with the GRU verdict or a `skipped/reason` pair on failure.
+///
+/// Uses a one-shot Python subprocess (batch mode) — the PyTorch model is
+/// smaller than EMBER2024 so cold-start is ~5–15 s vs ~120 s for EMBER.
+fn daemon_apply_process_gru(entries: &[(u32, String)], id: &str) -> serde_json::Value {
+    let error_results = |reason: &str| {
+        let items: Vec<serde_json::Value> = entries.iter().map(|(pid, exe)| json!({
+            "pid":      pid,
+            "exe_path": exe,
+            "skipped":  true,
+            "reason":   reason,
+        })).collect();
+        json!({ "id": id, "success": true, "results": items })
+    };
+
+    let script = match find_process_bridge_script() {
+        Some(s) => s,
+        None    => return error_results("bridge_not_found"),
+    };
+    let script_str = match script.to_str() {
+        Some(s) => s.to_string(),
+        None    => return error_results("invalid_script_path"),
+    };
+
+    // Venv-first candidate list (same logic as run_ember_ml_batch)
+    let exe_bin = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return error_results("no_current_exe"),
+    };
+    let engine_root = match exe_bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+        Some(r) => r.to_path_buf(),
+        None    => return error_results("no_engine_root"),
+    };
+    let venv_python = engine_root
+        .parent()
+        .map(|r| r.join("ai_agent").join(".venv").join("Scripts").join("python.exe"))
+        .filter(|p| p.exists());
+
+    let venv_str: Option<String> = venv_python
+        .as_ref()
+        .and_then(|p| p.to_str().map(|s| s.to_string()));
+
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(ref s) = venv_str { candidates.push(s.clone()); }
+    candidates.extend(["python", "python3", "py"].iter().map(|s| s.to_string()));
+
+    let exe_paths: Vec<&str> = entries.iter().map(|(_, e)| e.as_str()).collect();
+
+    // Subprocess timeout: PyTorch cold-start (~15 s) + ~2 s/exe for PE parse + inference.
+    const TIMEOUT_SECS: u64 = 120;
+
+    for py in &candidates {
+        let mut child = match std::process::Command::new(py)
+            .arg(&script_str)
+            .arg("--batch")
+            .args(&exe_paths)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Drain stdout in a background thread (prevent pipe-buffer deadlock).
+        let mut pipe = match child.stdout.take() {
+            Some(s) => s,
+            None => { child.kill().ok(); continue; }
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            pipe.read_to_end(&mut buf).ok();
+            tx.send(buf).ok();
+        });
+
+        let start   = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(TIMEOUT_SECS);
+        let mut timed_out = false;
+        let success = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if start.elapsed() >= timeout => {
+                    child.kill().ok();
+                    timed_out = true;
+                    eprintln!(
+                        "daemon_apply_process_gru: killed after {}s ({} exes)",
+                        TIMEOUT_SECS, entries.len()
+                    );
+                    break false;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                Err(_)   => { child.kill().ok(); break false; }
+            }
+        };
+
+        if !success {
+            if timed_out { break; }
+            continue;
+        }
+
+        let raw = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(b)  => b,
+            Err(_) => continue,
+        };
+        let stdout_str = match std::str::from_utf8(&raw) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => continue,
+        };
+        let arr: serde_json::Value = match serde_json::from_str(&stdout_str) {
+            Ok(v)  => v,
+            Err(_) => continue,
+        };
+        let results_arr = match arr.as_array() {
+            Some(a) => a,
+            None    => continue,
+        };
+
+        // Merge: attach pid back to each result (bridge only knows exe_path).
+        let out: Vec<serde_json::Value> = entries.iter()
+            .enumerate()
+            .map(|(i, (pid, exe))| {
+                let mut entry = results_arr.get(i)
+                    .cloned()
+                    .unwrap_or_else(|| json!({
+                        "exe_path": exe,
+                        "skipped":  true,
+                        "reason":   "missing_result",
+                    }));
+                // Inject pid so Tauri/frontend can match back to ProcessInfo
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("pid".to_string(), json!(pid));
+                }
+                entry
+            })
+            .collect();
+
+        return json!({ "id": id, "success": true, "results": out });
+    }
+
+    error_results("python_unavailable")
 }
 
 fn daemon_scan_processes(scanner: &ProcessScanner, id: &str) -> serde_json::Value {
