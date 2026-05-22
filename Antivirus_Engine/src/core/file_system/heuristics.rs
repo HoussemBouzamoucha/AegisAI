@@ -2,17 +2,18 @@
 // Unified Scoring Heuristic Engine
 //
 // Scoring table:
-//   Base64 payload (executable/script only)   +1
+//   Base64 payload (script only, line >400B)  +1
 //   High entropy >7.2 (executable only)       +2
-//   Very high entropy >7.5                    +4  (packed/obfuscated)
-//   Suspicious keyword (exec/script only)     +3  per keyword, capped at +12
+//   Very high entropy >7.7                    +3  (was +4 at 7.5 — NSIS/7z-SFX hit 7.5–7.7 legitimately)
+//   Suspicious keyword (scripts)              +3  per keyword, capped at +12
+//   Suspicious keyword (PE exec, specific)    +2  per keyword, capped at +6  (generic API strings excluded)
 //   PowerShell obfuscation                    +4
 //   PE executable                             +1  (binary PE header in correct ext)
 //   File type mismatch                        +3
 //   Ransomware content phrase                 +5  per match, capped at +20
 //   Crypto address detected                   +5
 //   Zero-byte executable                      +8
-//   Small executable dropper (<1KB)           +6
+//   Small executable dropper (<512B, .exe)    +4  (was +6 at 1KB — stub DLLs/SYS can be <1KB)
 //   Ransomware filename pattern               +7
 //   Malware filename pattern (exec)           +5
 //   Ransomware extension                      +8
@@ -22,7 +23,7 @@
 //
 // Thresholds:
 //   score >= 10  → MALICIOUS
-//   score >= 4   → SUSPICIOUS
+//   score >= 5   → SUSPICIOUS  (raised from 4 — PE+entropy+base64 = 4, too easy to reach)
 //   else         → CLEAN
 //
 // Optimizations applied:
@@ -50,7 +51,7 @@ use anyhow::Result;
 // ─── Thresholds ───────────────────────────────────────────────────────────────
 
 const MALICIOUS_THRESHOLD: i32 = 10;
-const SUSPICIOUS_THRESHOLD: i32 = 4;
+const SUSPICIOUS_THRESHOLD: i32 = 5;
 const MAX_CONTENT_SCAN_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 // ─── Path trust tiers ─────────────────────────────────────────────────────────
@@ -90,9 +91,24 @@ fn path_trust_tier(path: &Path) -> PathTrustTier {
     if s.contains(r"windows\winsxs") || s.contains(r"windows\installer") {
         return PathTrustTier::TrustedInstall;
     }
-    // Rust compiler proc-macro staging dirs — always compiler internals, never malware.
-    // Cargo creates %TEMP%\proc-macro-srv<N>-<N>\ on-the-fly for proc-macro crates.
-    if s.contains("proc-macro-srv") {
+    // Rust compiler proc-macro staging dirs and Cargo registry — compiler internals.
+    if s.contains("proc-macro-srv") || s.contains(r".cargo\registry") {
+        return PathTrustTier::TrustedInstall;
+    }
+    // Package manager / dependency caches — pre-built artefacts, not user code.
+    // node_modules binaries, NuGet packages, and Chocolatey installs are signed
+    // upstream; treating them like Unknown generates large numbers of false positives.
+    if s.contains("node_modules")
+        || s.contains(r".nuget\packages")
+        || s.contains(r"chocolatey\lib")
+    {
+        return PathTrustTier::TrustedInstall;
+    }
+    // Vendor-installed software in Program Files — full scoring still applies inside
+    // these directories; we only cap at TrustedInstall level so that a legitimately
+    // packed installer (NSIS, Inno, 7z-SFX) cannot tip into Malicious on entropy
+    // alone without a second corroborating signal.
+    if s.contains(r"program files\") || s.contains(r"program files (x86)\") {
         return PathTrustTier::TrustedInstall;
     }
     PathTrustTier::Unknown
@@ -152,15 +168,41 @@ const RANSOMWARE_CONTENT: &[&str] = &[
     "monero address",
 ];
 
-// ─── Suspicious keywords (executable/script files only) ───────────────────────
+// ─── Suspicious keywords ──────────────────────────────────────────────────────
+//
+// Two tiers:
+//
+//  SUSPICIOUS_KEYWORDS_EXEC — used only for PE binary executables.
+//    These are specific obfuscation patterns that have no legitimate reason to
+//    appear as strings inside a compiled binary's string table.  Generic Windows
+//    API names (CreateRemoteThread, WriteProcessMemory, curl_easy_setopt, eval)
+//    are excluded because they appear in import tables of debuggers, libcurl
+//    users, and COM-based apps without any malicious intent.
+//    Score: +2 per hit, capped at +6.
+//
+//  SUSPICIOUS_KEYWORDS_SCRIPT — used for interpreted script files (.ps1, .vbs,
+//    .bat, .js, .py, etc.).  In script context, all keywords are live code, not
+//    strings in a binary — the full list applies at higher weight.
+//    Score: +3 per hit, capped at +12.
 
-const SUSPICIOUS_KEYWORDS: &[&str] = &[
+/// High-confidence keywords for PE binary string-table scanning.
+/// Only patterns that are specific to obfuscation / in-memory loading.
+const SUSPICIOUS_KEYWORDS_EXEC: &[&str] = &[
+    "-encodedcommand",
+    "bitstransfer",
+    "frombase64string",
+    "iex(",
+    "invoke-expression",
+    "reflection.assembly",
+];
+
+/// Full keyword set for script files — every hit is live executable code.
+const SUSPICIOUS_KEYWORDS_SCRIPT: &[&str] = &[
     "-enc ",
     "-encodedcommand",
     "bitstransfer",
     "createobject",
     "createremotethread",
-    "curl_easy_setopt",
     "curl_exec",
     "downloadfile",
     "downloadstring",
@@ -174,11 +216,13 @@ const SUSPICIOUS_KEYWORDS: &[&str] = &[
     "writeprocessmemory",
     "wscript.shell",
 ];
-// Removed from SUSPICIOUS_KEYWORDS (too broad — appear in normal PE import tables):
-//   "cmd.exe"      — standard shell path referenced by countless installers
-//   "shellexecute" — Windows shell API, normal in GUI apps and installers
-//   "virtualalloc" — Windows memory API, normal in every game / runtime
-//   "wget"         — common download tool, appears in many build scripts
+// Removed from both lists (too broad — appear in normal PE import tables or are
+// universal low-level primitives):
+//   "cmd.exe"          — standard shell path referenced by countless installers
+//   "shellexecute"     — Windows shell API, normal in GUI apps and installers
+//   "virtualalloc"     — Windows memory API, normal in every game / runtime
+//   "wget"             — common download tool, appears in many build scripts
+//   "curl_easy_setopt" — libcurl import, extremely common in network apps
 
 // ─── Static name tables ───────────────────────────────────────────────────────
 
@@ -203,10 +247,15 @@ static RANSOMWARE_FILENAMES: &[&str] = &[
 ];
 
 /// Substrings that identify malware-named executables.
+///
+/// Removed intentionally — too broad:
+///   "crypt"   — matches bcrypt.dll, decryptor, winrar-crypt, cryptsetup
+///   "virus"   — matches antivirus, virustotal, virus_definitions
+///   "dropper" — matches eyedropper (colour-picker tools), update-dropper
 static MALWARE_FILENAMES: &[&str] = &[
-    "backdoor", "coinminer", "crypt", "dropper", "exploit",
-    "injector", "keylogger", "payload", "remoteadmintool",
-    "stealer", "trojan", "virus", "worm",
+    "backdoor", "coinminer", "crypter", "exploit",
+    "injector", "keylogger", "payload", "ransomware",
+    "remoteadmintool", "stealer", "trojan", "worm",
 ];
 
 /// Known ransomware file extensions.
@@ -503,10 +552,14 @@ fn check_zero_byte(ext: &str, file_size: u64) -> Option<ScoreContribution> {
             "metadata",
         ));
     }
-    if file_size < 1024 && file_size > 0 && matches!(ext, "exe" | "dll" | "sys") {
+    // Threshold tightened: 1KB → 512B, exe-only (was exe|dll|sys), +4 (was +6).
+    // Stub DLLs (COM forwarding stubs, API-set shims) and minimal SYS drivers are
+    // commonly under 1KB.  Dropper pattern is most relevant for standalone .exe files
+    // that are too small to contain any real payload of their own.
+    if file_size < 512 && file_size > 0 && ext == "exe" {
         return Some(ScoreContribution::new(
-            6,
-            format!("Unusually small executable ({}B — possible dropper)", file_size),
+            4,
+            format!("Unusually small executable ({}B — possible dropper stub)", file_size),
             "metadata",
         ));
     }
@@ -601,12 +654,18 @@ fn check_magic_bytes(bytes: &[u8], ext: &str, is_doc: bool) -> Option<ScoreContr
 }
 
 /// Entropy check from in-memory buffer — no file I/O.
+///
+/// Threshold raised from 7.5 → 7.7 for the high-score band:
+/// NSIS, Inno Setup, and 7z self-extracting archives routinely sit at 7.5–7.7
+/// (compressed payload inside a signed launcher).  Genuine packers/crypters
+/// push past 7.7.  Lowering the false-positive floor here prevents packed
+/// legitimate installers from being flagged on entropy alone.
 fn check_entropy(bytes: &[u8]) -> Option<ScoreContribution> {
     let entropy = calculate_entropy(bytes);
-    if entropy > 7.5 {
+    if entropy > 7.7 {
         Some(ScoreContribution::new(
-            4,
-            format!("Very high entropy ({:.2}) — packed/obfuscated", entropy),
+            3,
+            format!("Very high entropy ({:.2}) — packed/crypted", entropy),
             "entropy",
         ))
     } else if entropy > 7.2 {
@@ -672,12 +731,11 @@ fn check_content(
         out.push(ScoreContribution::new(5, "Cryptocurrency wallet address detected", "content"));
     }
 
-    // ── Executable / script only ──────────────────────────────────────────────
-    if is_exec || is_script {
-        // Suspicious keywords — searched on pre-lowercased bytes
+    // ── Script files — full keyword list, higher weight ───────────────────────
+    if is_script {
         let mut kw_score = 0i32;
         let mut kw_hits: Vec<&str> = Vec::new();
-        for kw in SUSPICIOUS_KEYWORDS {
+        for kw in SUSPICIOUS_KEYWORDS_SCRIPT {
             if memmem(&lower, kw.as_bytes()) {
                 kw_score += 3;
                 kw_hits.push(kw);
@@ -687,12 +745,13 @@ fn check_content(
         if kw_score > 0 {
             out.push(ScoreContribution::new(
                 kw_score,
-                format!("Suspicious keywords: {}", kw_hits.join(", ")),
+                format!("Suspicious script keywords: {}", kw_hits.join(", ")),
                 "keyword",
             ));
         }
 
-        // Base64 payload — single-pass byte scan (no chars() double-traverse)
+        // Base64 payload in scripts — threshold raised to 400B to avoid false
+        // positives on embedded certificates and icon data in resource scripts.
         if contains_base64_payload(bytes) {
             out.push(ScoreContribution::new(1, "Base64 encoded payload detected", "obfuscation"));
         }
@@ -702,6 +761,40 @@ fn check_content(
             out.push(ScoreContribution::new(
                 4,
                 "PowerShell obfuscation techniques detected",
+                "obfuscation",
+            ));
+        }
+    }
+
+    // ── PE binary executables — specific obfuscation keywords only ────────────
+    // Generic Windows API names (CreateRemoteThread, WriteProcessMemory, curl_*)
+    // are excluded because they appear in import tables of legitimate debuggers,
+    // libcurl consumers, and COM-based applications without malicious intent.
+    // Score is +2/hit (not +3) because string-table hits are weaker than live code.
+    if is_exec {
+        let mut kw_score = 0i32;
+        let mut kw_hits: Vec<&str> = Vec::new();
+        for kw in SUSPICIOUS_KEYWORDS_EXEC {
+            if memmem(&lower, kw.as_bytes()) {
+                kw_score += 2;
+                kw_hits.push(kw);
+                if kw_score >= 6 { break; }
+            }
+        }
+        if kw_score > 0 {
+            out.push(ScoreContribution::new(
+                kw_score,
+                format!("Suspicious strings in PE binary: {}", kw_hits.join(", ")),
+                "keyword",
+            ));
+        }
+
+        // PowerShell obfuscation patterns embedded in PE — also meaningful for
+        // droppers that bundle encoded PS scripts in their resource section.
+        if contains_powershell_obfuscation(&lower) {
+            out.push(ScoreContribution::new(
+                4,
+                "PowerShell obfuscation patterns embedded in PE",
                 "obfuscation",
             ));
         }
@@ -797,13 +890,15 @@ fn local_entropy_around(bytes: &[u8], pos: usize, len: usize) -> f64 {
 
 /// Single-pass Base64 payload detector operating directly on bytes.
 ///
-/// Returns `true` if any line is >200 bytes long and consists entirely of
+/// Returns `true` if any line is >400 bytes long and consists entirely of
 /// Base64 characters (A-Z, a-z, 0-9, +, /) with at most 2 trailing `=`.
-/// One byte-scan pass per line replaces the previous two `chars()` traversals.
+/// Threshold raised from 200 → 400: PEM certificates, embedded icons, and
+/// base64-encoded config values in resource scripts routinely produce 200–400
+/// character lines and would otherwise generate false positives.
 fn contains_base64_payload(bytes: &[u8]) -> bool {
     for line in bytes.split(|&b| b == b'\n') {
         let t = trim_ascii(line);
-        if t.len() <= 200 { continue; }
+        if t.len() <= 400 { continue; }
         let mut eq_count: usize = 0;
         let mut valid = true;
         for &b in t {
@@ -958,13 +1053,16 @@ mod tests {
 
     #[test]
     fn test_base64_payload_detection() {
-        // A long base64-like line should be detected
-        let b64_line = "A".repeat(201);
+        // A long base64-like line (>400B) should be detected
+        let b64_line = "A".repeat(401);
         assert!(contains_base64_payload(b64_line.as_bytes()));
+        // Lines ≤400B should not trigger (PEM certs, embedded icons are typically shorter)
+        let short_b64 = "A".repeat(300);
+        assert!(!contains_base64_payload(short_b64.as_bytes()));
         // Short line should not trigger
         assert!(!contains_base64_payload(b"short"));
-        // Non-base64 chars should not trigger
-        let bad_line = format!("{}!", "A".repeat(201));
+        // Non-base64 chars should not trigger even if long
+        let bad_line = format!("{}!", "A".repeat(401));
         assert!(!contains_base64_payload(bad_line.as_bytes()));
     }
 

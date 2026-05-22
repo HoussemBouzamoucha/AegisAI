@@ -10,6 +10,33 @@ import type {
   MlIdsResult, CorrelateResult, AgentVerdict, ExecutedAction,
 } from '../types';
 
+// ─── Steganography scan result ───────────────────────────────────────────────
+
+export interface StegScanResult {
+  path:          string;
+  fileName:      string;
+  stegProb:      number | null;   // 0.0–1.0 probability of being stego
+  isStego:       boolean | null;
+  verdict:       'stego' | 'clean' | 'error';
+  lsbOnesRatio:  number | null;   // fraction of pixels with LSB==1; stego → ~0.50
+  warning:       string | null;   // e.g. JPEG warning or LSB distribution note
+  error:         string | null;
+}
+
+// ─── Ember ML per-process result ─────────────────────────────────────────────
+
+export interface ProcessEmberResult {
+  pid:          number;
+  name:         string;
+  exe_path:     string;
+  mlModel:      string | null;   // 'GRU' (process bridge)
+  mlScore:      number | null;   // 0.0–1.0 sigmoid probability; null when skipped
+  mlVerdict:    'malicious' | 'clean' | null;
+  escalated:    boolean;         // Suspicious → Malicious
+  skipped:      boolean;
+  skipReason:   string | null;
+}
+
 // ─── Ember ML per-file comparison record ─────────────────────────────────────
 
 export interface EmberMlFileResult {
@@ -17,42 +44,23 @@ export interface EmberMlFileResult {
   fileName: string;                            // basename for display
   initialLevel: 'Suspicious';                  // always — we only run on Suspicious files
   finalLevel: 'Suspicious' | 'Malicious' | 'Clean';
-  mlModel: string | null;                      // 'Win32' | 'Win64' | 'DotNet' | 'PDF'
+  mlModel: string | null;                      // 'Win32' | 'Win64' | 'DotNet' | 'PDF' | 'All'
   mlScore: number | null;                      // 0.0–1.0; null when skipped
-  mlVerdict: 'malicious' | 'clean' | null;     // null when skipped / unsupported
+  mlVerdict: 'malicious' | 'clean' | null;     // null when skipped
   escalated: boolean;                          // Suspicious → Malicious
-  skipped: boolean;                            // bridge returned skipped:true
+  skipped: boolean;                            // bridge could not analyse this file
+  skipReason: string | null;                   // "file_unavailable" | "prediction_error" | …
 }
 
-// ── Helper: extract Ember data from a freshly-rescanned ScanResult ────────────
-function extractEmberMlData(
-  filePath: string,
-  initial: ScanResult,
-  updated: ScanResult,
-): EmberMlFileResult {
-  const fileName = filePath.split(/[\\/]/).pop() ?? filePath;
-  const emberSig = updated.detection_signals.find(s => s.source === 'ember_ml');
-
-  // Description format from Rust: "EMBER2024_Win64 score 0.9230 (malicious)"
-  const match = emberSig?.description.match(
-    /EMBER2024_(\w+)\s+score\s+([\d.]+)\s+\((\w+)\)/,
-  );
-
-  const mlModel   = match ? match[1] : null;
-  const mlScore   = match ? parseFloat(match[2]) : null;
-  const mlVerdict = match ? (match[3] as 'malicious' | 'clean') : null;
-
-  return {
-    path:         filePath,
-    fileName,
-    initialLevel: 'Suspicious',
-    finalLevel:   updated.level as EmberMlFileResult['finalLevel'],
-    mlModel,
-    mlScore,
-    mlVerdict,
-    escalated:    initial.level === 'Suspicious' && updated.level === 'Malicious',
-    skipped:      !emberSig,
-  };
+// ── Raw entry returned by the apply-ember-ml daemon command ──────────────────
+interface EmberBatchEntry {
+  path: string;
+  skipped: boolean;
+  /** Populated when skipped=true: "file_unavailable" | "prediction_error" | "batch_error" | … */
+  skip_reason: string | null;
+  file_type: string | null;
+  score: number | null;
+  malicious: boolean | null;
 }
 
 interface AppState {
@@ -78,6 +86,11 @@ interface AppState {
   emberMlError: string | null;
   emberMlResults: EmberMlFileResult[] | null;
   applyEmberMl: () => Promise<void>;
+
+  processEmberRunning: boolean;
+  processEmberError: string | null;
+  processEmberResults: ProcessEmberResult[] | null;
+  applyProcessMl: () => Promise<void>;
 
   processScanning: boolean;
   processes: ProcessInfo[];
@@ -127,6 +140,14 @@ interface AppState {
   recordExecutedAction: (action: ExecutedAction) => void;
   runAgentReassessment: () => Promise<void>;
   resetInvestigation:   () => void;
+
+  // ── Steganography ML ───────────────────────────────────────────────────────
+  stegScanRunning:  boolean;
+  stegScanError:    string | null;
+  stegScanResults:  StegScanResult[] | null;
+  scanImagesSteg:   (paths: string[]) => Promise<void>;
+  clearStegScan:    () => void;
+  embedStegTest:    (srcPath: string) => Promise<string | null>;
 
   history: ScanHistoryEntry[];
   addHistory: (entry: ScanHistoryEntry) => void;
@@ -380,38 +401,47 @@ export const useStore = create<AppState>((set, get) => ({
       emberMlResults: [],
     });
 
-    let done = 0;
-    for (const file of suspicious) {
-      let record: EmberMlFileResult;
-      try {
-        const result = await invoke<ScanOutput>('scan_file', { path: file.path });
-        const files = (result.files ?? []).map(normalizeScanResult);
-        const updated = files[0] ?? file;
+    try {
+      // The daemon's persistent EmberServer (bridge.py --server) loads all
+      // LightGBM models once at first call and keeps them in memory.
+      // Subsequent calls bypass model loading entirely — inference only.
+      const batchRaw = await invoke<EmberBatchEntry[]>('apply_ember_ml', {
+        paths: suspicious.map(r => r.path),
+      });
 
-        // Patch the result row in-place
-        set(s => ({
-          scanResults: s.scanResults.map(r => r.path === file.path ? updated : r),
-        }));
+      const mlResults: EmberMlFileResult[] = suspicious.map((file, i) => {
+        const entry     = batchRaw[i];
+        const fileName  = file.path.split(/[\\/]/).pop() ?? file.path;
+        const skipped   = !entry || entry.skipped;
+        const mlModel   = entry?.file_type ?? null;
+        const mlScore   = entry?.score ?? null;
+        const mlVerdict: EmberMlFileResult['mlVerdict'] =
+          entry?.malicious === true  ? 'malicious' :
+          entry?.malicious === false ? 'clean'     : null;
+        const escalated  = !skipped && entry?.malicious === true;
+        const finalLevel: EmberMlFileResult['finalLevel'] = escalated
+          ? 'Malicious'
+          : (file.level as EmberMlFileResult['finalLevel']);
+        const skipReason = skipped ? (entry?.skip_reason ?? 'skipped') : null;
+        return { path: file.path, fileName, initialLevel: 'Suspicious',
+                 finalLevel, mlModel, mlScore, mlVerdict, escalated, skipped, skipReason };
+      });
 
-        record = extractEmberMlData(file.path, file, updated);
-      } catch {
-        // file deleted / locked — record as skipped
-        record = {
-          path: file.path,
-          fileName: file.path.split(/[\\/]/).pop() ?? file.path,
-          initialLevel: 'Suspicious',
-          finalLevel: 'Suspicious',
-          mlModel: null, mlScore: null, mlVerdict: null,
-          escalated: false, skipped: true,
-        };
-      }
+      const escalatedPaths = new Set(mlResults.filter(r => r.escalated).map(r => r.path));
 
-      done++;
-      // Push the record live so the panel fills as results arrive
       set(s => ({
-        emberMlResults: [...(s.emberMlResults ?? []), record],
-        emberMlProgress: { done, total: s.emberMlProgress?.total ?? suspicious.length },
+        emberMlResults: mlResults,
+        emberMlProgress: { done: suspicious.length, total: suspicious.length },
+        ...(escalatedPaths.size > 0 && {
+          scanResults: s.scanResults.map(r =>
+            escalatedPaths.has(r.path)
+              ? { ...r, level: 'Malicious' as const, is_threat: true }
+              : r
+          ),
+        }),
       }));
+    } catch (e: any) {
+      set({ emberMlError: String(e) });
     }
 
     // Recompute stats from the updated results
@@ -427,6 +457,66 @@ export const useStore = create<AppState>((set, get) => ({
       emberMlRunning:  false,
       emberMlProgress: null,
     });
+  },
+
+  processEmberRunning: false,
+  processEmberError:   null,
+  processEmberResults: null,
+
+  applyProcessMl: async () => {
+    const suspicious = get().processes.filter(
+      p => p.threat_level === 'Suspicious' && p.exe_path,
+    );
+    if (suspicious.length === 0) return;
+
+    set({ processEmberRunning: true, processEmberError: null, processEmberResults: null });
+
+    try {
+      // Build entries for the GRU daemon command
+      const entries = suspicious.map(p => ({ pid: p.pid, exe_path: p.exe_path as string }));
+
+      // Raw result from daemon: array of {pid, exe_path, probability, verdict, label,
+      //   top_api_calls, trigger_chunk, api_count, source, skipped, reason}
+      const batchRaw = await invoke<any[]>('apply_process_gru', { entries });
+
+      const results: ProcessEmberResult[] = suspicious.map((proc, i) => {
+        const entry   = batchRaw[i];
+        const skipped = !entry || entry.skipped;
+        // GRU returns "MALWARE" | "BENIGN" — map to our verdict type
+        const mlVerdict: ProcessEmberResult['mlVerdict'] =
+          entry?.verdict === 'MALWARE' ? 'malicious' :
+          entry?.verdict === 'BENIGN'  ? 'clean'     : null;
+        const escalated = !skipped && entry?.verdict === 'MALWARE';
+        return {
+          pid:        proc.pid,
+          name:       proc.name,
+          exe_path:   proc.exe_path as string,
+          mlModel:    'GRU',
+          mlScore:    entry?.probability ?? null,
+          mlVerdict,
+          escalated,
+          skipped,
+          skipReason: skipped ? (entry?.reason ?? 'skipped') : null,
+        };
+      });
+
+      // Escalate Suspicious → Malicious when GRU concurs
+      const escalatedPids = new Set(results.filter(r => r.escalated).map(r => r.pid));
+      set(s => ({
+        processEmberResults: results,
+        ...(escalatedPids.size > 0 && {
+          processes: s.processes.map(p =>
+            escalatedPids.has(p.pid)
+              ? { ...p, threat_level: 'Malicious' as const, is_threat: true }
+              : p
+          ),
+        }),
+      }));
+    } catch (e: any) {
+      set({ processEmberError: String(e) });
+    } finally {
+      set({ processEmberRunning: false });
+    }
   },
 
   processScanning: false,
@@ -666,6 +756,56 @@ export const useStore = create<AppState>((set, get) => ({
     agentReassessing:    false,
     agentReassessError:  null,
   }),
+
+  // ── Steganography ML ───────────────────────────────────────────────────────
+  stegScanRunning: false,
+  stegScanError:   null,
+  stegScanResults: null,
+
+  scanImagesSteg: async (paths) => {
+    if (paths.length === 0) return;
+    set({ stegScanRunning: true, stegScanError: null, stegScanResults: null });
+    try {
+      const raw = await invoke<Array<{
+        path: string; stego_prob: number | null; is_stego: boolean | null;
+        verdict: string; lsb_ones_ratio: number | null;
+        warning: string | null; error: string | null;
+      }>>('scan_images_steg', { paths });
+
+      const results: StegScanResult[] = raw.map(r => ({
+        path:         r.path,
+        fileName:     r.path.split(/[\\/]/).pop() ?? r.path,
+        stegProb:     r.stego_prob,
+        isStego:      r.is_stego,
+        verdict:      (r.verdict === 'stego' || r.verdict === 'clean' || r.verdict === 'error')
+                        ? r.verdict as StegScanResult['verdict']
+                        : 'error',
+        lsbOnesRatio: r.lsb_ones_ratio ?? null,
+        warning:      r.warning,
+        error:        r.error,
+      }));
+      set({ stegScanResults: results });
+    } catch (e: any) {
+      set({ stegScanError: String(e) });
+    } finally {
+      set({ stegScanRunning: false });
+    }
+  },
+
+  clearStegScan: () => set({ stegScanRunning: false, stegScanError: null, stegScanResults: null }),
+
+  embedStegTest: async (srcPath) => {
+    try {
+      const result = await invoke<{ success: boolean; dst_path?: string; error?: string }>(
+        'embed_steg_test', { srcPath }
+      );
+      if (!result.success) throw new Error(result.error ?? 'Embed failed');
+      return result.dst_path ?? null;
+    } catch (e: any) {
+      set({ stegScanError: String(e) });
+      return null;
+    }
+  },
 
   history: [],
   addHistory: (entry) =>

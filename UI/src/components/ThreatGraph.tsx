@@ -837,7 +837,7 @@ function DetailPanel({ node, edges, nodeMap, onClose, criticalPath }: {
         {/* Primary scores */}
         <div style={{ display: 'flex', gap: 8 }}>
           <Chip label="COMBINED"  value={`${(node.data.combined_score * 100).toFixed(1)}%`} color={accent} />
-          <Chip label="HEURISTIC" value={String(node.data.heuristic_score)} color="var(--cyan)" />
+          <Chip label="HEURISTIC" value={Number(node.data.heuristic_score).toFixed(3).replace(/\.?0+$/, '')} color="var(--cyan)" />
           {node.data.ml_score !== undefined && (
             <Chip label="ML" value={`${(node.data.ml_score * 100).toFixed(1)}%`} color="#a78bfa" />
           )}

@@ -2,11 +2,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../store';
-import type { EmberMlFileResult } from '../store';
+import type { EmberMlFileResult, StegScanResult } from '../store';
 import {
   FolderOpen, FileSearch, X, AlertTriangle,
   CheckCircle, Loader, ChevronDown, ChevronRight,
   Shield, Zap, Tag, HardDrive, Clock, BrainCircuit,
+  Image, EyeOff,
 } from 'lucide-react';
 import type { ScanResult, ContextFlag, DetectionSignal } from '../types';
 import { CONTEXT_FLAG_LABEL, CONTEXT_FLAG_SEVERITY } from '../types';
@@ -428,8 +429,11 @@ function EmberMlRow({ record, index }: { record: EmberMlFileResult; index: numbe
       {record.skipped ? (
         <span style={{
           fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)',
-        }}>
-          unsupported
+        }} title={record.skipReason ?? undefined}>
+          {record.skipReason === 'file_unavailable' ? 'unavailable'
+           : record.skipReason === 'prediction_error' ? 'pred error'
+           : record.skipReason === 'batch_error' ? 'timed out'
+           : 'skipped'}
         </span>
       ) : (
         <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
@@ -595,6 +599,262 @@ function EmberMlPanel({
   );
 }
 
+// ─── Steganography result row ──────────────────────────────────────────────────
+
+function StegRow({ result, index }: { result: StegScanResult; index: number }) {
+  const [showDetail, setShowDetail] = useState(false);
+  const probPct = result.stegProb !== null ? Math.round(result.stegProb * 100) : null;
+  const verdictColor =
+    result.verdict === 'stego' ? 'var(--red)'
+    : result.verdict === 'clean' ? 'var(--green)'
+    : 'var(--text-dim)';
+
+  // LSB ratio: 0.50 ± 0.03 is the "stego zone"
+  const lsbPct = result.lsbOnesRatio !== null ? Math.round(result.lsbOnesRatio * 100) : null;
+  const lsbNearHalf = lsbPct !== null && Math.abs(lsbPct - 50) <= 5;
+
+  return (
+    <div style={{ borderBottom: '1px solid var(--border)' }}>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '1fr 28px 130px 90px 80px',
+        alignItems: 'center',
+        gap: 10,
+        padding: '9px 16px',
+        animation: `fadeUp 0.2s ease ${Math.min(index * 0.04, 0.4)}s both`,
+        cursor: (result.warning || result.error) ? 'pointer' : 'default',
+      }} onClick={() => (result.warning || result.error) && setShowDetail(d => !d)}>
+
+        {/* File name */}
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: 11,
+          color: result.verdict === 'error' ? 'var(--text-dim)' : 'var(--text)',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>
+          {result.fileName}
+          {result.warning && (
+            <span style={{
+              marginLeft: 6, fontFamily: 'var(--font-hud)', fontSize: 8,
+              color: 'var(--amber)',
+            }}>⚠</span>
+          )}
+        </span>
+
+        {/* EyeOff icon */}
+        <span style={{ textAlign: 'center', opacity: result.verdict === 'stego' ? 1 : 0.2 }}>
+          <EyeOff size={13} color={result.verdict === 'stego' ? 'var(--red)' : 'var(--text-dim)'} />
+        </span>
+
+        {/* Stego probability bar */}
+        {probPct !== null ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', width: `${probPct}%`,
+                background: probPct >= 80 ? 'var(--red)' : probPct >= 50 ? 'var(--amber)' : 'var(--green)',
+                borderRadius: 2, transition: 'width 0.4s ease',
+              }} />
+            </div>
+            <span style={{
+              fontFamily: 'var(--font-mono)', fontSize: 9,
+              color: verdictColor, textAlign: 'right',
+            }}>
+              {(result.stegProb! * 100).toFixed(1)}%
+            </span>
+          </div>
+        ) : (
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>
+            {result.error ? 'error' : '—'}
+          </span>
+        )}
+
+        {/* LSB ratio indicator */}
+        {lsbPct !== null ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            {/* Bar centred at 50% */}
+            <div style={{
+              position: 'relative', height: 3,
+              background: 'var(--border)', borderRadius: 2, overflow: 'hidden',
+            }}>
+              <div style={{
+                height: '100%', width: `${lsbPct}%`,
+                background: lsbNearHalf ? 'var(--amber)' : 'var(--text-dim)',
+                borderRadius: 2, transition: 'width 0.4s ease',
+              }} />
+              {/* 50% marker */}
+              <div style={{
+                position: 'absolute', top: 0, left: '50%',
+                width: 1, height: '100%', background: 'rgba(255,255,255,0.3)',
+              }} />
+            </div>
+            <span style={{
+              fontFamily: 'var(--font-mono)', fontSize: 9,
+              color: lsbNearHalf ? 'var(--amber)' : 'var(--text-dim)', textAlign: 'right',
+            }}>
+              LSB {lsbPct}%
+            </span>
+          </div>
+        ) : (
+          <span />
+        )}
+
+        {/* Verdict chip */}
+        {result.verdict === 'error' ? (
+          <span style={{
+            fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--red)',
+          }} title={result.error ?? undefined}>
+            error ▾
+          </span>
+        ) : (
+          <span style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            padding: '2px 10px',
+            background: result.verdict === 'stego' ? 'rgba(255,50,50,0.12)' : 'rgba(0,200,80,0.10)',
+            border: `1px solid ${verdictColor}60`,
+            borderRadius: 3,
+            fontFamily: 'var(--font-hud)', fontSize: 8,
+            color: verdictColor, letterSpacing: '0.07em',
+          }}>
+            {result.verdict === 'stego' ? 'STEGO' : 'CLEAN'}
+          </span>
+        )}
+      </div>
+
+      {/* Expandable detail: warning / error text */}
+      {showDetail && (result.warning || result.error) && (
+        <div style={{
+          padding: '6px 16px 10px 56px',
+          fontFamily: 'var(--font-mono)', fontSize: 9,
+          color: result.error ? 'var(--red)' : 'var(--amber)',
+          lineHeight: 1.5,
+        }}>
+          {result.error ?? result.warning}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Steganography panel ──────────────────────────────────────────────────────
+
+function StegPanel({
+  results,
+  running,
+}: {
+  results: StegScanResult[];
+  running: boolean;
+}) {
+  const stego   = results.filter(r => r.verdict === 'stego').length;
+  const clean   = results.filter(r => r.verdict === 'clean').length;
+  const errored = results.filter(r => r.verdict === 'error').length;
+
+  return (
+    <div style={{
+      background: 'var(--surface)',
+      border: '1px solid rgba(20,184,166,0.3)',
+      borderRadius: 8,
+      overflow: 'hidden',
+    }}>
+      {/* Header */}
+      <div style={{
+        padding: '10px 16px',
+        background: 'rgba(20,184,166,0.06)',
+        borderBottom: '1px solid rgba(20,184,166,0.2)',
+        display: 'flex', alignItems: 'center', gap: 12,
+      }}>
+        <EyeOff size={14} color="#14b8a6" />
+        <span style={{
+          fontFamily: 'var(--font-hud)', fontSize: 11, fontWeight: 700,
+          color: '#14b8a6', letterSpacing: '0.08em', flex: 1,
+        }}>
+          MIL STEGANOGRAPHY ANALYSIS
+          {running && (
+            <span style={{ fontWeight: 400, marginLeft: 8, color: 'var(--text-dim)' }}>
+              — scanning...
+            </span>
+          )}
+          {!running && results.length > 0 && (
+            <span style={{ fontWeight: 400, marginLeft: 8, color: 'var(--text-dim)' }}>
+              — {results.length} image{results.length !== 1 ? 's' : ''} analysed
+            </span>
+          )}
+        </span>
+
+        {results.length > 0 && (
+          <div style={{ display: 'flex', gap: 6 }}>
+            {stego > 0 && (
+              <span style={{
+                padding: '2px 8px',
+                background: 'rgba(255,50,50,0.12)', border: '1px solid rgba(255,50,50,0.4)',
+                borderRadius: 3, fontFamily: 'var(--font-hud)', fontSize: 8,
+                color: 'var(--red)', letterSpacing: '0.05em',
+              }}>
+                {stego} STEGO DETECTED
+              </span>
+            )}
+            {clean > 0 && (
+              <span style={{
+                padding: '2px 8px',
+                background: 'rgba(0,200,80,0.08)', border: '1px solid rgba(0,200,80,0.35)',
+                borderRadius: 3, fontFamily: 'var(--font-hud)', fontSize: 8,
+                color: 'var(--green)', letterSpacing: '0.05em',
+              }}>
+                {clean} CLEAN
+              </span>
+            )}
+            {errored > 0 && (
+              <span style={{
+                padding: '2px 8px',
+                background: 'var(--elevated)', border: '1px solid var(--border)',
+                borderRadius: 3, fontFamily: 'var(--font-hud)', fontSize: 8,
+                color: 'var(--text-dim)', letterSpacing: '0.05em',
+              }}>
+                {errored} ERROR
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Column headings */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '1fr 28px 130px 90px 80px',
+        gap: 10,
+        padding: '6px 16px',
+        borderBottom: '1px solid var(--border)',
+        background: 'var(--elevated)',
+      }}>
+        {['FILE', '', 'STEGO PROB', 'LSB RATIO', 'VERDICT'].map((h, i) => (
+          <span key={i} style={{
+            fontFamily: 'var(--font-hud)', fontSize: 8,
+            color: 'var(--text-dim)', letterSpacing: '0.08em',
+            textAlign: i === 1 ? 'center' : 'left',
+          }}
+          title={i === 3 ? 'Fraction of LSB=1 pixels — LSB steganography pushes this toward 50%' : undefined}>
+            {h}
+          </span>
+        ))}
+      </div>
+
+      {/* Rows */}
+      <div style={{ maxHeight: 240, overflowY: 'auto' }}>
+        {results.length === 0 && running && (
+          <div style={{
+            padding: '20px 16px', textAlign: 'center',
+            fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)',
+          }}>
+            Running model inference...
+          </div>
+        )}
+        {results.map((r, i) => (
+          <StegRow key={r.path} result={r} index={i} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Scanner component ───────────────────────────────────────────────────
 
 export default function Scanner() {
@@ -603,12 +863,17 @@ export default function Scanner() {
     lastScanDurationMs,
     scanFile, scanDirectory, scanAll, quickScan, clearScan,
     emberMlRunning, emberMlProgress, emberMlError, emberMlResults, applyEmberMl,
+    stegScanRunning, stegScanError, stegScanResults,
+    scanImagesSteg, clearStegScan, embedStegTest,
   } = useStore();
 
   const [tab, setTab] = useState<'threats' | 'all'>('threats');
   const [pathInput, setPathInput] = useState('');
   // Track which kind of scan is running so the spinner label is accurate.
   const [scanMode, setScanMode] = useState<'file' | 'directory' | 'all' | 'quick' | null>(null);
+
+  // Steg: selected image paths waiting to be scanned
+  const [stegPaths, setStegPaths] = useState<string[]>([]);
 
   // ── Live elapsed timer ───────────────────────────────────────────────────────
   const [elapsedSecs, setElapsedSecs] = useState(0);
@@ -667,6 +932,41 @@ export default function Scanner() {
       const path = await invoke<string | null>('open_dir_dialog');
       if (path) setPathInput(path);
     } catch {}
+  };
+
+  const handleBrowseImages = async () => {
+    try {
+      const paths = await invoke<string[] | null>('open_images_dialog');
+      if (paths && paths.length > 0) setStegPaths(paths);
+    } catch {}
+  };
+
+  const handleScanSteg = () => {
+    if (stegPaths.length === 0) return;
+    clearStegScan();
+    scanImagesSteg(stegPaths);
+  };
+
+  const handleClearSteg = () => {
+    setStegPaths([]);
+    clearStegScan();
+  };
+
+  // Generate a test stego image from the first selected PNG, then auto-scan it
+  const [embedBusy, setEmbedBusy] = useState(false);
+  const handleEmbedAndScan = async () => {
+    const srcPng = stegPaths.find(p => p.toLowerCase().endsWith('.png'));
+    if (!srcPng) return;
+    setEmbedBusy(true);
+    try {
+      const dstPath = await embedStegTest(srcPng);
+      if (dstPath) {
+        clearStegScan();
+        scanImagesSteg([dstPath]);
+      }
+    } finally {
+      setEmbedBusy(false);
+    }
   };
 
   const threats = scanResults.filter(r => r.is_threat);
@@ -1103,6 +1403,237 @@ export default function Scanner() {
           results={emberMlResults ?? []}
           running={emberMlRunning}
           progress={emberMlProgress}
+        />
+      )}
+
+      {/* ── Steganography Detection section ──────────────────────────────── */}
+      <div style={{
+        background: 'var(--surface)',
+        border: '1px solid rgba(20,184,166,0.25)',
+        borderRadius: 8,
+        overflow: 'hidden',
+      }}>
+        {/* Section header */}
+        <div style={{
+          padding: '10px 16px',
+          background: 'rgba(20,184,166,0.05)',
+          borderBottom: '1px solid rgba(20,184,166,0.15)',
+          display: 'flex', alignItems: 'center', gap: 10,
+        }}>
+          <EyeOff size={14} color="#14b8a6" />
+          <div style={{ flex: 1 }}>
+            <div style={{
+              fontFamily: 'var(--font-hud)', fontSize: 11, fontWeight: 700,
+              color: '#14b8a6', letterSpacing: '0.08em',
+            }}>
+              IMAGE STEGANOGRAPHY DETECTION
+            </div>
+            <div style={{
+              fontFamily: 'var(--font-mono)', fontSize: 9,
+              color: 'var(--text-dim)', marginTop: 2,
+            }}>
+              MIL-AttentionNet · SRM + EfficientNet-B0 · AUC 0.9999 — LSB embedding detection in PNG images
+            </div>
+          </div>
+        </div>
+
+        {/* Controls */}
+        <div style={{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+
+            {/* Browse Images */}
+            <button
+              onClick={handleBrowseImages}
+              disabled={stegScanRunning}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 7,
+                padding: '8px 14px',
+                background: 'var(--elevated)',
+                border: '1px solid var(--border)',
+                borderRadius: 6,
+                color: 'var(--text-dim)',
+                fontFamily: 'var(--font-hud)', fontSize: 10,
+                letterSpacing: '0.1em',
+                cursor: stegScanRunning ? 'not-allowed' : 'pointer',
+                opacity: stegScanRunning ? 0.5 : 1,
+                transition: 'all 0.15s',
+              }}
+              onMouseEnter={e => {
+                if (!stegScanRunning) {
+                  (e.currentTarget as HTMLButtonElement).style.borderColor = '#14b8a6';
+                  (e.currentTarget as HTMLButtonElement).style.color = '#14b8a6';
+                }
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)';
+                (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-dim)';
+              }}
+            >
+              <Image size={13} /> BROWSE IMAGES
+            </button>
+
+            {/* Selected count badge */}
+            {stegPaths.length > 0 && (
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: 4,
+                padding: '4px 10px',
+                background: 'rgba(20,184,166,0.08)',
+                border: '1px solid rgba(20,184,166,0.3)',
+                borderRadius: 4,
+                fontFamily: 'var(--font-mono)', fontSize: 10,
+                color: '#14b8a6',
+              }}>
+                {stegPaths.length} image{stegPaths.length !== 1 ? 's' : ''} selected
+              </span>
+            )}
+
+            {/* Scan Images */}
+            <button
+              onClick={handleScanSteg}
+              disabled={stegScanRunning || stegPaths.length === 0}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 7,
+                padding: '8px 16px',
+                background: (stegScanRunning || stegPaths.length === 0)
+                  ? 'rgba(20,184,166,0.04)'
+                  : 'rgba(20,184,166,0.12)',
+                border: '1px solid rgba(20,184,166,0.5)',
+                borderRadius: 6,
+                color: '#14b8a6',
+                fontFamily: 'var(--font-hud)', fontSize: 10,
+                letterSpacing: '0.1em', fontWeight: 700,
+                cursor: (stegScanRunning || stegPaths.length === 0) ? 'not-allowed' : 'pointer',
+                opacity: (stegScanRunning || stegPaths.length === 0) ? 0.5 : 1,
+                transition: 'all 0.15s',
+              }}
+              onMouseEnter={e => {
+                if (!stegScanRunning && stegPaths.length > 0) {
+                  const el = e.currentTarget as HTMLButtonElement;
+                  el.style.background = 'rgba(20,184,166,0.22)';
+                  el.style.boxShadow  = '0 0 12px rgba(20,184,166,0.2)';
+                }
+              }}
+              onMouseLeave={e => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.background = 'rgba(20,184,166,0.12)';
+                el.style.boxShadow  = 'none';
+              }}
+            >
+              {stegScanRunning
+                ? <Loader size={13} style={{ animation: 'spin 1s linear infinite' }} />
+                : <BrainCircuit size={13} />}
+              {stegScanRunning ? 'SCANNING...' : 'SCAN IMAGES'}
+            </button>
+
+            {/* Generate Test Stego — only when a PNG is selected */}
+            {stegPaths.some(p => p.toLowerCase().endsWith('.png')) && !stegScanRunning && (
+              <button
+                onClick={handleEmbedAndScan}
+                disabled={embedBusy}
+                title="Embed random LSB payload (0.4 bpp) into the first selected PNG and scan it — use this to verify the model is working"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 7,
+                  padding: '8px 14px',
+                  background: embedBusy ? 'rgba(234,179,8,0.04)' : 'rgba(234,179,8,0.08)',
+                  border: '1px solid rgba(234,179,8,0.4)',
+                  borderRadius: 6,
+                  color: '#eab308',
+                  fontFamily: 'var(--font-hud)', fontSize: 10,
+                  letterSpacing: '0.08em',
+                  cursor: embedBusy ? 'not-allowed' : 'pointer',
+                  opacity: embedBusy ? 0.5 : 1,
+                  transition: 'all 0.15s',
+                }}
+                onMouseEnter={e => {
+                  if (!embedBusy) {
+                    const el = e.currentTarget as HTMLButtonElement;
+                    el.style.background = 'rgba(234,179,8,0.16)';
+                    el.style.boxShadow  = '0 0 10px rgba(234,179,8,0.15)';
+                  }
+                }}
+                onMouseLeave={e => {
+                  const el = e.currentTarget as HTMLButtonElement;
+                  el.style.background = 'rgba(234,179,8,0.08)';
+                  el.style.boxShadow  = 'none';
+                }}
+              >
+                {embedBusy
+                  ? <Loader size={12} style={{ animation: 'spin 1s linear infinite' }} />
+                  : <EyeOff size={12} />}
+                GEN TEST STEGO
+              </button>
+            )}
+
+            {/* Clear */}
+            {(stegPaths.length > 0 || stegScanResults !== null) && !stegScanRunning && (
+              <button
+                onClick={handleClearSteg}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '8px 12px',
+                  background: 'var(--elevated)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                  color: 'var(--text-dim)',
+                  fontFamily: 'var(--font-hud)', fontSize: 10,
+                  letterSpacing: '0.1em',
+                  cursor: 'pointer',
+                  transition: 'all 0.15s',
+                }}
+                onMouseEnter={e => {
+                  (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border-hi)';
+                }}
+                onMouseLeave={e => {
+                  (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border)';
+                }}
+              >
+                <X size={11} /> CLEAR
+              </button>
+            )}
+          </div>
+
+          {/* Selected file list — compact preview */}
+          {stegPaths.length > 0 && !stegScanRunning && stegScanResults === null && (
+            <div style={{
+              maxHeight: 80, overflowY: 'auto',
+              background: 'var(--bg)', borderRadius: 4, padding: '6px 10px',
+              border: '1px solid var(--border)',
+            }}>
+              {stegPaths.map((p, i) => (
+                <div key={i} style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 10,
+                  color: 'var(--text-dim)', lineHeight: 1.6,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}>
+                  {p.split(/[\\/]/).pop()}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Error */}
+          {stegScanError && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '8px 12px',
+              background: 'rgba(255,50,50,0.07)',
+              border: '1px solid rgba(255,50,50,0.3)',
+              borderRadius: 4,
+            }}>
+              <AlertTriangle size={13} color="var(--red)" />
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--red)' }}>
+                {stegScanError}
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Steg results panel ─────────────────────────────────────────────── */}
+      {(stegScanRunning || (stegScanResults !== null && stegScanResults.length > 0)) && (
+        <StegPanel
+          results={stegScanResults ?? []}
+          running={stegScanRunning}
         />
       )}
 

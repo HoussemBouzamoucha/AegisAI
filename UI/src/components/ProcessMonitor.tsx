@@ -1,10 +1,11 @@
 // src/components/ProcessMonitor.tsx
 import { useState } from 'react';
 import { useStore } from '../store';
+import type { ProcessEmberResult } from '../store';
 import {
   RefreshCw, Cpu, Trash2, AlertTriangle, CheckCircle,
   Loader, Search, ChevronDown, ChevronRight, Shield, Zap,
-  Package, Hash,
+  Package, Hash, Brain, SkipForward, TrendingUp,
 } from 'lucide-react';
 import type { ProcessInfo } from '../types';
 
@@ -352,12 +353,106 @@ function StatCard({ label, value, color, sub }: {
   );
 }
 
+// ─── ML results panel ─────────────────────────────────────────────────────────
+
+function MlResultRow({ r }: { r: ProcessEmberResult }) {
+  const escalated = r.escalated;
+  const skipped   = r.skipped;
+  const score     = r.mlScore ?? 0;
+  const barW      = skipped ? 0 : Math.round(score * 100);
+  const barColor  = score >= 0.8 ? 'var(--red)' : score >= 0.5 ? 'var(--amber)' : 'var(--green)';
+
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: '60px 160px 1fr 80px 70px 90px',
+      alignItems: 'center',
+      gap: 12,
+      padding: '7px 16px',
+      borderBottom: '1px solid var(--border)',
+      background: escalated ? 'rgba(255,51,85,0.04)' : 'transparent',
+      borderLeft: escalated ? '2px solid var(--red)' : skipped ? '2px solid var(--border)' : '2px solid var(--green)',
+    }}>
+      {/* PID */}
+      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+        {r.pid}
+      </span>
+
+      {/* Process name */}
+      <span style={{
+        fontFamily: 'var(--font-mono)', fontSize: 11,
+        color: escalated ? 'var(--red)' : 'var(--text)',
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }}>
+        {r.name}
+      </span>
+
+      {/* Score bar */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        {skipped ? (
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)', display: 'flex', alignItems: 'center', gap: 4 }}>
+            <SkipForward size={9} /> {r.skipReason ?? 'skipped'}
+          </span>
+        ) : (
+          <>
+            <div style={{ flex: 1, height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden' }}>
+              <div style={{ width: `${barW}%`, height: '100%', background: barColor, borderRadius: 2, transition: 'width 0.4s' }} />
+            </div>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: barColor, minWidth: 36, textAlign: 'right' }}>
+              {(score * 100).toFixed(0)}%
+            </span>
+          </>
+        )}
+      </div>
+
+      {/* Model */}
+      <span style={{
+        fontFamily: 'var(--font-hud)', fontSize: 8, letterSpacing: '0.06em',
+        color: 'var(--text-dim)', textAlign: 'center',
+      }}>
+        {r.mlModel ?? '—'}
+      </span>
+
+      {/* Verdict */}
+      {skipped ? (
+        <span style={{ fontFamily: 'var(--font-hud)', fontSize: 9, color: 'var(--text-dim)', textAlign: 'center' }}>—</span>
+      ) : (
+        <span style={{
+          fontFamily: 'var(--font-hud)', fontSize: 9, letterSpacing: '0.06em',
+          color: r.mlVerdict === 'malicious' ? 'var(--red)' : 'var(--green)',
+          textAlign: 'center',
+          padding: '2px 6px',
+          background: r.mlVerdict === 'malicious' ? 'rgba(255,51,85,0.1)' : 'rgba(0,255,136,0.08)',
+          border: `1px solid ${r.mlVerdict === 'malicious' ? 'rgba(255,51,85,0.3)' : 'rgba(0,255,136,0.2)'}`,
+          borderRadius: 3,
+        }}>
+          {r.mlVerdict?.toUpperCase()}
+        </span>
+      )}
+
+      {/* Escalated badge */}
+      {escalated ? (
+        <span style={{
+          fontFamily: 'var(--font-hud)', fontSize: 8, letterSpacing: '0.06em',
+          color: 'var(--red)', textAlign: 'center',
+          display: 'flex', alignItems: 'center', gap: 3, justifyContent: 'center',
+        }}>
+          <TrendingUp size={9} /> ESCALATED
+        </span>
+      ) : (
+        <span style={{ color: 'var(--text-dim)', textAlign: 'center' }} />
+      )}
+    </div>
+  );
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export default function ProcessMonitor() {
   const {
     processes, processStats, processScanning,
     processError, scanProcesses, killProcess,
+    processEmberRunning, processEmberError, processEmberResults, applyProcessMl,
   } = useStore();
 
   const [search, setSearch] = useState('');
@@ -398,25 +493,52 @@ export default function ProcessMonitor() {
             Real-time process analysis · path · name · resource · cmdline · handles · modules
           </div>
         </div>
-        <button
-          onClick={scanProcesses}
-          disabled={processScanning}
-          style={{
-            display: 'flex', alignItems: 'center', gap: 8,
-            padding: '10px 20px',
-            background: 'var(--green-glow)',
-            border: '1px solid var(--border-md)',
-            borderRadius: 6,
-            color: 'var(--green)',
-            fontFamily: 'var(--font-hud)', fontSize: 11,
-            letterSpacing: '0.1em',
-            cursor: processScanning ? 'not-allowed' : 'pointer',
-            opacity: processScanning ? 0.6 : 1,
-          }}
-        >
-          <RefreshCw size={14} style={{ animation: processScanning ? 'spin 1s linear infinite' : 'none' }} />
-          {processScanning ? 'SCANNING...' : 'REFRESH'}
-        </button>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          {/* Apply ML button — only shown when there are suspicious processes with exe paths */}
+          {processes.some(p => p.threat_level === 'Suspicious' && p.exe_path) && (
+            <button
+              onClick={applyProcessMl}
+              disabled={processEmberRunning || processScanning}
+              title="Run EMBER2024 ML on suspicious process executables"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '10px 20px',
+                background: processEmberRunning ? 'rgba(156,39,176,0.1)' : 'rgba(156,39,176,0.08)',
+                border: '1px solid rgba(156,39,176,0.35)',
+                borderRadius: 6,
+                color: '#ce93d8',
+                fontFamily: 'var(--font-hud)', fontSize: 11,
+                letterSpacing: '0.1em',
+                cursor: (processEmberRunning || processScanning) ? 'not-allowed' : 'pointer',
+                opacity: (processEmberRunning || processScanning) ? 0.6 : 1,
+                transition: 'all 0.15s',
+              }}
+            >
+              <Brain size={14} style={{ animation: processEmberRunning ? 'spin 1s linear infinite' : 'none' }} />
+              {processEmberRunning ? 'RUNNING ML...' : 'APPLY ML'}
+            </button>
+          )}
+
+          <button
+            onClick={scanProcesses}
+            disabled={processScanning}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '10px 20px',
+              background: 'var(--green-glow)',
+              border: '1px solid var(--border-md)',
+              borderRadius: 6,
+              color: 'var(--green)',
+              fontFamily: 'var(--font-hud)', fontSize: 11,
+              letterSpacing: '0.1em',
+              cursor: processScanning ? 'not-allowed' : 'pointer',
+              opacity: processScanning ? 0.6 : 1,
+            }}
+          >
+            <RefreshCw size={14} style={{ animation: processScanning ? 'spin 1s linear infinite' : 'none' }} />
+            {processScanning ? 'SCANNING...' : 'REFRESH'}
+          </button>
+        </div>
       </div>
 
       {/* ── Stats row ───────────────────────────────────────────────────────── */}
@@ -454,6 +576,87 @@ export default function ProcessMonitor() {
             />
           </div>
         </>
+      )}
+
+      {/* ── ML results panel ────────────────────────────────────────────────── */}
+      {(processEmberResults || processEmberError || processEmberRunning) && (
+        <div style={{
+          background: 'var(--surface)', border: '1px solid rgba(156,39,176,0.3)',
+          borderRadius: 8, overflow: 'hidden',
+        }}>
+          {/* Panel header */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '10px 16px',
+            background: 'rgba(156,39,176,0.06)',
+            borderBottom: '1px solid rgba(156,39,176,0.2)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Brain size={13} color="#ce93d8" />
+              <span style={{
+                fontFamily: 'var(--font-hud)', fontSize: 10,
+                color: '#ce93d8', letterSpacing: '0.1em',
+              }}>
+                GRU-ATTENTION ML — SUSPICIOUS PROCESS EXECUTABLES (PE IMPORTS)
+              </span>
+              {processEmberResults && (
+                <span style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)',
+                }}>
+                  ({processEmberResults.filter(r => !r.skipped).length} analysed ·{' '}
+                  {processEmberResults.filter(r => r.escalated).length} escalated ·{' '}
+                  {processEmberResults.filter(r => r.skipped).length} skipped)
+                </span>
+              )}
+            </div>
+            {processEmberRunning && (
+              <Loader size={12} color="#ce93d8" style={{ animation: 'spin 1s linear infinite' }} />
+            )}
+          </div>
+
+          {/* Error state */}
+          {processEmberError && (
+            <div style={{
+              padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 8,
+            }}>
+              <AlertTriangle size={13} color="var(--red)" />
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--red)' }}>
+                ML error: {processEmberError}
+              </span>
+            </div>
+          )}
+
+          {/* Loading state */}
+          {processEmberRunning && !processEmberResults && (
+            <div style={{ padding: '16px', fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+              Loading GRU model and parsing PE imports for suspicious executables…
+            </div>
+          )}
+
+          {/* Results table */}
+          {processEmberResults && processEmberResults.length > 0 && (
+            <>
+              {/* Column headers */}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: '60px 160px 1fr 80px 70px 90px',
+                gap: 12, padding: '5px 16px',
+                background: 'var(--base)',
+                borderBottom: '1px solid var(--border)',
+              }}>
+                {['PID', 'PROCESS', 'ML SCORE', 'MODEL', 'VERDICT', ''].map(h => (
+                  <span key={h} style={{
+                    fontFamily: 'var(--font-hud)', fontSize: 8,
+                    color: 'var(--text-dim)', letterSpacing: '0.1em',
+                  }}>{h}</span>
+                ))}
+              </div>
+              <div style={{ maxHeight: 260, overflowY: 'auto' }}>
+                {processEmberResults.map(r => <MlResultRow key={r.pid} r={r} />)}
+              </div>
+            </>
+          )}
+        </div>
       )}
 
       {/* ── Process list ────────────────────────────────────────────────────── */}

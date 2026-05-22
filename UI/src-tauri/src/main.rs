@@ -347,6 +347,51 @@ async fn scan_file(
     Ok(ScanOutput { success: true, files: vec![file], statistics: stats, error: None })
 }
 
+/// Run the GRU-Attention process model on a batch of suspicious process entries.
+///
+/// Each entry must have `pid` (u32) and `exe_path` (string).
+/// The daemon parses the PE import table of each exe, filters it to the GRU
+/// vocabulary, and runs the GRU-Attention model via `process_bridge.py`.
+/// Returns a JSON array of one result per input entry.
+#[tauri::command]
+async fn apply_process_gru(
+    entries: Vec<serde_json::Value>,
+    state:   tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id": next_id(), "cmd": "apply-process-gru", "entries": entries,
+    });
+    // PyTorch cold-start (~15 s) + 2 s/exe × N + margin; floor 60 s.
+    let n = entries.len() as u64;
+    let timeout_secs = (30u64 + n * 5).max(60);
+    let json = daemon_request(&state, request, Duration::from_secs(timeout_secs))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json["results"].clone())
+}
+
+/// Run Ember2024 ML on a batch of paths in one Python subprocess.
+/// Returns a JSON array of `{ path, skipped, file_type, score, malicious }` entries
+/// (one per input path, in order).  Bypasses the YARA/heuristics score gate so
+/// that context-escalated Suspicious files are always analysed.
+#[tauri::command]
+async fn apply_ember_ml(
+    paths: Vec<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id": next_id(), "cmd": "apply-ember-ml", "paths": paths,
+    });
+    // Dynamic timeout: 180 s warmup (Python start + 5-model LightGBM load on slow machines)
+    // + 30 s per file (generous ceiling for large-file PE feature extraction).
+    // Hard floor of 300 s so single-file calls are never penalised.
+    // This prevents the Tauri-side timeout from firing before the daemon finishes
+    // when there are many suspicious files or model loading is slow.
+    let timeout_secs = (180u64 + paths.len() as u64 * 30).max(300);
+    let json = daemon_request(&state, request, Duration::from_secs(timeout_secs))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json["results"].clone())
+}
+
 #[tauri::command]
 async fn scan_directory(
     path: String,
@@ -858,6 +903,117 @@ async fn get_engine_status(
     }))
 }
 
+// ─── Steganography ML scan ────────────────────────────────────────────────────
+
+/// Run the MIL steganography detector on a list of image paths.
+///
+/// Calls `steg_inference.py --paths <p1> <p2> ...` and returns a JSON array
+/// of `{ path, stego_prob, is_stego, verdict, warning, error }` objects.
+/// Supported formats: PNG (best), BMP, TIFF; JPEG works but accuracy is reduced.
+#[tauri::command]
+async fn scan_images_steg(paths: Vec<String>) -> Result<serde_json::Value, String> {
+    if paths.is_empty() {
+        return Ok(serde_json::json!([]));
+    }
+
+    let script = PathBuf::from(
+        r"C:\Users\houss\Desktop\AegisAI\Antivirus_Engine\src\core\MIL_Steganography\steg_inference.py"
+    );
+
+    if !script.exists() {
+        return Err(format!("Steg inference script not found: {}", script.display()));
+    }
+
+    // Dynamic timeout: 120 s model cold-start + 20 s per image, floor 180 s.
+    let timeout_secs = (120u64 + paths.len() as u64 * 20).max(180);
+
+    for py in &["python", "python3", "py"] {
+        let mut cmd = std::process::Command::new(py);
+        cmd.arg(script.to_str().unwrap_or(""))
+           .arg("--paths");
+        for p in &paths {
+            cmd.arg(p);
+        }
+
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let trimmed = stdout.trim();
+                return serde_json::from_str(trimmed)
+                    .map_err(|e| format!("Invalid JSON from steg script: {} — raw: {}", e,
+                                         &trimmed[..trimmed.len().min(300)]));
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                    return Ok(v);
+                }
+                return Err(format!("Steg script error: {}", stderr.trim()));
+            }
+            Err(_) => continue,
+        }
+        let _ = timeout_secs; // suppress unused warning; timeout handled by OS process
+    }
+
+    Err("Python interpreter not found. Ensure Python 3 is installed and available in PATH.".to_string())
+}
+
+/// Open a file-picker dialog that accepts common image formats (multi-select).
+#[tauri::command]
+async fn open_images_dialog(app: tauri::AppHandle) -> Result<Option<Vec<String>>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let files = app.dialog()
+        .file()
+        .set_title("Select Images for Steganography Analysis")
+        .add_filter("Images", &["png", "bmp", "tiff", "tif", "jpg", "jpeg", "webp"])
+        .blocking_pick_files();
+    Ok(files.map(|list| list.into_iter().map(|p| p.to_string()).collect()))
+}
+
+/// Embed random LSB payload (0.4 bpp) into a PNG using the same method as the
+/// training data.  Creates a `_stego.png` copy next to the source file so the
+/// original is never modified.  Returns `{ dst_path, pixels_modified, ... }`.
+#[tauri::command]
+async fn embed_steg_test(src_path: String) -> Result<serde_json::Value, String> {
+    let script = PathBuf::from(
+        r"C:\Users\houss\Desktop\AegisAI\Antivirus_Engine\src\core\MIL_Steganography\steg_inference.py"
+    );
+    if !script.exists() {
+        return Err(format!("Steg script not found: {}", script.display()));
+    }
+
+    // Build dst path: same dir, same stem + "_stego.png"
+    let src = std::path::Path::new(&src_path);
+    let stem = src.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image");
+    let dst_path = src.parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(format!("{}_stego.png", stem))
+        .to_string_lossy()
+        .to_string();
+
+    for py in &["python", "python3", "py"] {
+        match std::process::Command::new(py)
+            .args([script.to_str().unwrap_or(""), "--embed", &src_path, &dst_path])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                return serde_json::from_str(stdout.trim())
+                    .map_err(|e| format!("Invalid JSON from embed script: {}", e));
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Embed script error: {}", stderr.trim()));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err("Python interpreter not found.".to_string())
+}
+
 // ─── Quick scan ───────────────────────────────────────────────────────────────
 
 /// Quick scan — delegates to the daemon's `quick-scan` command, which uses
@@ -979,6 +1135,8 @@ fn main() {
             scan_directory,
             scan_all,
             quick_scan,
+            apply_ember_ml,
+            apply_process_gru,
             scan_processes,
             scan_network,
             scan_memory,
@@ -987,6 +1145,10 @@ fn main() {
             // ── File dialogs ──────────────────────────────────────────────
             open_file_dialog,
             open_dir_dialog,
+            open_images_dialog,
+            // ── Steganography ML ──────────────────────────────────────────
+            scan_images_steg,
+            embed_steg_test,
             // ── Engine status / ML ────────────────────────────────────────
             check_engine,
             get_engine_status,
