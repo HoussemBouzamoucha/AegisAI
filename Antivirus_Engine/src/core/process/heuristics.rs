@@ -262,17 +262,50 @@ impl ProcessHeuristics {
 
 // ── Change #5 helper ──────────────────────────────────────────────────────────
 
-/// True for well-known development toolchain processes.
-/// These are intentionally excluded from full threat scoring because they
-/// dynamically load proc-macro DLLs, spawn child processes, and perform
-/// heavy file I/O — all patterns that overlap with malware heuristics.
-fn is_known_dev_process(name: &str) -> bool {
+/// True for well-known development toolchain processes and trusted multi-process
+/// applications (browsers, AegisAI own processes, build tools).
+///
+/// These legitimately exhibit patterns that overlap with malware heuristics:
+/// dynamic DLL loading, child process spawning, cross-process handles (browsers),
+/// and heavy file/network I/O (build tools, runtimes).
+///
+/// `pub` so `scanner.rs` can apply the same halving to module/handle scores.
+pub fn is_known_dev_process(name: &str) -> bool {
     let n = name.to_lowercase();
+
+    // Rust toolchain
     n.contains("rust-analyzer")
-        || n.contains("node")
-        || n.contains("npm")
-        || n.contains("python")
-        || n.contains("cargo")
+        || n.starts_with("cargo")
+        || n.starts_with("rustc")
+        // Node.js / web dev
+        || n.starts_with("node")
+        || n.starts_with("npm")
+        || n.starts_with("pnpm")
+        || n.starts_with("yarn")
+        || n.starts_with("vite")
+        || n.starts_with("webpack")
+        // Python ecosystem
+        || n.starts_with("python")
+        || n.starts_with("pip")
+        // Browsers — Chromium-based browsers hold renderer/GPU process handles
+        // and load sandboxing DLLs from user-profile directories.
+        || n.starts_with("brave")
+        || n.starts_with("chrome")
+        || n.starts_with("msedge")
+        || n.starts_with("firefox")
+        || n.starts_with("msedgewebview")
+        // Development tools
+        || n == "code.exe"
+        || n == "code - insiders.exe"
+        || n.starts_with("postman")
+        || n.starts_with("tauri")
+        // AegisAI self-protection: our own engine and UI import security APIs
+        // (VirtualQueryEx, OpenProcess, NtQuerySystemInformation) that look
+        // indistinguishable from malware to heuristic-only analysis.
+        || n.starts_with("antivirus")
+        || n.starts_with("aegisai")
+        // Multi-process gaming overlay
+        || n.starts_with("overwolf")
 }
 
 impl Default for ProcessHeuristics {

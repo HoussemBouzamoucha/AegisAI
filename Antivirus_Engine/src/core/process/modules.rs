@@ -158,7 +158,9 @@ fn is_module_suspicious(path: &str, name: &str) -> bool {
         path_lower.contains("\\tmp\\"),
         path_lower.contains("\\appdata\\local\\temp"),
         path_lower.contains("\\downloads\\"),
-        path_lower.contains("\\desktop\\"),
+        // NOTE: "\\desktop\\" intentionally omitted — Desktop is a common
+        // location for development projects (IDEs, build outputs, venvs).
+        // Flagging it causes high false-positive rates for devs.
 
         // Recycle bin / explicitly hidden paths.
         path_lower.contains("\\$recycle.bin"),

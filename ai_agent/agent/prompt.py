@@ -32,7 +32,9 @@ CRITICAL PATH (score {cp_score:.2f}): {cp_narrative}
 
 MALICIOUS ENTITIES:
 {entities_text}
-Respond with this JSON (3-5 ranked_actions, most reversible first):
+
+IMPORTANT: If MALICIOUS ENTITIES is "none" and ATTACK CHAINS is 0, you MUST set ranked_actions=[] and risk_level="Low". A high critical-path score from clean/suspicious-only nodes does NOT justify any action.
+Otherwise respond with 1-5 ranked_actions (most reversible first) targeting only entities listed above.
 {{"ranked_actions":[{{"action":"...","target":"...","entity_id":"...","pid":null,"justification":"...","reversible":true,"min_score_met":true,"confirm_required":false}}],"rationale":"...","risk_level":"Low|Medium|High|Critical","confidence":0.0,"pivot_suggestions":["..."]}}\
 """
 
@@ -74,7 +76,8 @@ CRITICAL PATH (score {cp_score:.2f}): {cp_narrative}
 REMAINING MALICIOUS ENTITIES:
 {entities_text}
 
-Respond with this JSON (0-5 ranked_actions; if no threats remain set ranked_actions=[] and investigation_closed=true):
+IMPORTANT: If REMAINING MALICIOUS ENTITIES is "none" and ATTACK CHAINS is 0, you MUST set ranked_actions=[], risk_level="Low", and investigation_closed=true.
+Otherwise respond with 1-5 ranked_actions (most reversible first) targeting only entities listed above:
 {{"ranked_actions":[{{"action":"...","target":"...","entity_id":"...","pid":null,"justification":"...","reversible":true,"min_score_met":true,"confirm_required":false}}],"rationale":"...","risk_level":"Low|Medium|High|Critical","confidence":0.0,"pivot_suggestions":["..."],"investigation_closed":false,"close_reason":null,"round_num":{round_num}}}\
 """
 

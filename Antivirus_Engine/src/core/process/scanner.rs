@@ -6,7 +6,7 @@
 //     → Stage 3: enumerate_modules()
 //     → ScanStatistics
 
-use crate::core::process::heuristics::ProcessHeuristics;
+use crate::core::process::heuristics::{is_known_dev_process, ProcessHeuristics};
 use crate::core::process::types::{
     enumerate_processes, DetectionSignal, ProcessInfo, ScanStatistics, ThreatLevel,
 };
@@ -80,12 +80,17 @@ impl ProcessScanner {
             }
 
             // Cross-process handle — code injection / hollowing indicator.
+            // Penalty reduced to +10 (was +25): multi-process applications
+            // (browsers, shells, debuggers) legitimately hold process handles
+            // to their child renderer / GPU / helper processes.  A score of +10
+            // still accumulates with other signals but won't push a single-signal
+            // clean process over the Suspicious threshold (20) on its own.
             if has_cross_process_handle(&handles) {
-                process.threat_score += 25;
+                process.threat_score += 10;
                 process.detection_signals.push(DetectionSignal::new(
                     "handle",
                     "Holds handle to another process object (possible injection)",
-                    25,
+                    10,
                 ));
             }
         }
@@ -122,6 +127,16 @@ impl ProcessScanner {
                     ));
                 }
             }
+        }
+
+        // ── Post-stage dev halving ────────────────────────────────────────
+        // Stage 1 (heuristics) already halved its own contribution for dev tools.
+        // Stages 2 (handles) and 3 (modules) add points after that halving,
+        // so we apply a second halving here to keep the combined total proportional.
+        // This prevents DLL loads from project directories or renderer process
+        // handles from pushing known-good tools over the Malicious threshold.
+        if is_known_dev_process(&process.name) {
+            process.threat_score /= 2;
         }
 
         // ── Final: re-evaluate threat level once all stages have scored ──

@@ -47,6 +47,46 @@ _REVERSIBILITY_RANK: dict[str, int] = {
     "isolate_network":   5,
 }
 
+# ─── Clean-graph gate ─────────────────────────────────────────────────────────
+
+def _is_clean_graph(correlate_result: dict) -> bool:
+    """
+    Return True when the graph has no evidence worth acting on.
+
+    A graph is considered clean when ALL of the following hold:
+      1. Zero attack chains detected.
+      2. Zero Malicious or Critical entities.
+      3. No Suspicious entity carries an active malicious domain flag
+         (has_malicious_network / has_malicious_memory / has_malicious_file).
+
+    NOTE: A high critical-path score alone is NOT a reliable threat signal.
+    A long chain of clean parent-child relationships (e.g. IDE → spawned
+    processes) can accumulate a high numeric score with zero threat indicators.
+    We therefore base the decision on threat labels and domain flags, not score.
+    """
+    nodes  = _node_map(correlate_result)
+    chains = _chains(correlate_result)
+
+    # Any attack chain is a potential threat signal — do not short-circuit.
+    if chains:
+        return False
+
+    for n in nodes.values():
+        level = n.get("threat_level", "Clean")
+        # Malicious / Critical always warrants a response.
+        if level in ("Malicious", "Critical"):
+            return False
+        # Suspicious + active domain flag is actionable; Suspicious alone is not.
+        if level == "Suspicious" and (
+            n.get("has_malicious_network")
+            or n.get("has_malicious_memory")
+            or n.get("has_malicious_file")
+        ):
+            return False
+
+    return True
+
+
 # ─── Violation ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -285,6 +325,38 @@ def validate(verdict: AgentVerdict, correlate_result: dict) -> list[Violation]:
                 ),
             ))
 
+    # ── R9: No actions without confirmed threat evidence ──────────────────────
+    # Actions must NOT be recommended when the graph contains no Malicious/Critical
+    # entities AND no attack chains — even if a Suspicious entity passes the numeric
+    # score threshold for some action.
+    #
+    # Rationale: the critical-path score can be high purely from graph topology
+    # (many parent-child edges between clean processes).  A Suspicious-only graph
+    # with no domain flags and no attack chains does not warrant containment.
+    # The only always-permitted action regardless of threat state is remove_block_ip
+    # (rollback).
+    has_malicious_entities = any(
+        n.get("threat_level") in ("Malicious", "Critical")
+        for n in nodes.values()
+    )
+    if not chains and not has_malicious_entities:
+        for i, action in enumerate(actions):
+            if action.action == "remove_block_ip":
+                continue  # rollback is always allowed
+            violations.append(Violation(
+                rule="R9",
+                message=(
+                    f"action[{i}] '{action.action}' has no supporting threat evidence — "
+                    "graph contains no Malicious/Critical entities and no attack chains. "
+                    "A high critical-path score from clean/suspicious-only nodes does not "
+                    "justify containment actions."
+                ),
+                fix=(
+                    f"Remove action[{i}] '{action.action}'. "
+                    "Set ranked_actions=[] and risk_level='Low' — no confirmed threats present."
+                ),
+            ))
+
     return violations
 
 
@@ -372,6 +444,28 @@ def refine(correlate_result: dict) -> AgentVerdict:
         the verdict's `warnings` field lists the outstanding rule violations
         so the UI can surface a caution indicator.
     """
+    # ── Pre-LLM clean-graph gate ──────────────────────────────────────────────
+    # Skip the LLM entirely when there is no actionable threat evidence.
+    # Sending a clean graph to the model wastes a round-trip and risks the model
+    # hallucinating actions based on the critical-path narrative alone.
+    if _is_clean_graph(correlate_result):
+        print(
+            "[reasoning] Clean-graph gate: no Malicious/Critical entities and no "
+            "attack chains — returning Low-risk verdict without calling the LLM.",
+            file=sys.stderr,
+        )
+        return AgentVerdict(
+            ranked_actions=[],
+            rationale=(
+                "No malicious or critical entities detected. All observed processes "
+                "are within normal operating parameters. The critical path reflects "
+                "normal parent-child process topology, not an attack chain."
+            ),
+            risk_level="Low",
+            confidence=1.0,
+            pivot_suggestions=[],
+        )
+
     # ── Round 1 ───────────────────────────────────────────────────────────────
     print("[reasoning] Round 1 — generating initial verdict...", file=sys.stderr)
     verdict = analyze(correlate_result)

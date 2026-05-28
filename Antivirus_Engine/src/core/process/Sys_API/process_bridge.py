@@ -203,6 +203,61 @@ def extract_pe_imports(data: bytes) -> list[str]:
         return []
 
 
+# ── Known-safe whitelist ───────────────────────────────────────────────────────
+# Executables whose PE import table reliably triggers GRU false positives because
+# they legitimately import the same security/process APIs as malware (antivirus
+# engines, debuggers, browsers, runtimes).
+#
+# Format: { exe_name_lower: path_keyword_lower | None }
+#   - path_keyword: substring the exe_path must contain (case-insensitive).
+#     Use None to match by name alone (only for executables with globally unique
+#     names where path verification adds no security benefit).
+#
+# This whitelist is intentionally narrow.  A process only bypasses GRU if BOTH
+# its name AND (when specified) its install-path keyword match.  Malware that
+# renames itself to "node.exe" but runs from %TEMP% is NOT matched here because
+# its path won't contain the expected install-directory keyword.
+
+KNOWN_SAFE_EXECUTABLES: dict[str, str | None] = {
+    # AegisAI self-protection — our own engine imports VirtualQueryEx, OpenProcess,
+    # NtQuerySystemInformation, etc., which are indistinguishable from malware APIs.
+    "antivirus.exe":                        "aegisai",
+    "aegisai-ui.exe":                       "aegisai",
+    # Rust IDE toolchain — proc-macro server imports many compiler-internal APIs.
+    "rust-analyzer.exe":                    ".rustup",
+    "rust-analyzer-proc-macro-srv.exe":     ".rustup",
+    "cargo.exe":                            ".rustup",
+    "rustc.exe":                            ".rustup",
+    # Node.js runtime — Electron / V8 imports mimic process-injection patterns.
+    "node.exe":                             "node",     # matches nodejs, nvm, node_modules paths
+    # Postman — network API testing tool; imports reflect/socket APIs heavily.
+    "postman agent.exe":                    "postman",
+    "postman.exe":                          "postman",
+    # VS Code (Electron) — same V8/Chromium import fingerprint as node.exe.
+    "code.exe":                             "microsoft vs code",
+    "code - insiders.exe":                  "vscode",
+    # Chromium-based browsers — import sandbox / inter-process APIs for child processes.
+    "brave.exe":                            "bravesoftware",
+    "chrome.exe":                           "google",
+    "msedge.exe":                           "microsoft\\edge",
+    "firefox.exe":                          "mozilla",
+    # Python interpreter — ML-model runners import ctypes / memory / thread APIs.
+    "python.exe":                           "python",   # matches Python3xx, conda, venv paths
+    "python3.exe":                          "python",
+}
+
+
+def _is_known_safe(exe_path: str) -> bool:
+    """Return True if the executable matches the known-safe whitelist."""
+    name = _os.path.basename(exe_path).lower()
+    if name not in KNOWN_SAFE_EXECUTABLES:
+        return False
+    keyword = KNOWN_SAFE_EXECUTABLES[name]
+    if keyword is None:
+        return True
+    return keyword in exe_path.lower()
+
+
 # ── Main scan function ─────────────────────────────────────────────────────────
 
 def scan_exe(exe_path: str) -> dict:
@@ -210,6 +265,22 @@ def scan_exe(exe_path: str) -> dict:
     Extract PE imports from `exe_path`, feed them to the GRU model, and
     return a result dict.
     """
+    # Fast-path: skip GRU for known-safe executables whose PE import tables
+    # reliably produce false positives (security tools, browsers, runtimes).
+    if _is_known_safe(exe_path):
+        return {
+            "exe_path":      exe_path,
+            "skipped":       False,
+            "reason":        None,
+            "probability":   0.0,
+            "label":         0,
+            "verdict":       "BENIGN",
+            "top_api_calls": [],
+            "trigger_chunk": None,
+            "api_count":     0,
+            "source":        "whitelist",
+        }
+
     if _IMPORT_ERROR:
         return {"exe_path": exe_path, "skipped": True, "reason": _IMPORT_ERROR}
 
