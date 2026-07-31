@@ -844,6 +844,149 @@ async fn export_incident_report(
     }))
 }
 
+/// List all entries in the AegisAI quarantine directory.
+///
+/// Returns an array of metadata objects read from `*.meta.json` sidecars.
+/// Each entry includes `original_path`, `sha256`, `quarantined_at`, `reason`,
+/// `quarantine_path`, and `quarantine_file_exists`.
+/// Returns an empty array if the quarantine directory does not exist yet.
+#[tauri::command]
+async fn list_quarantine() -> Result<serde_json::Value, String> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let quarantine_dir: PathBuf = {
+        let base = std::env::var("PROGRAMDATA")
+            .or_else(|_| std::env::var("TEMP"))
+            .unwrap_or_else(|_| "C:\\Temp".to_string());
+        PathBuf::from(base).join("AegisAI").join("quarantine")
+    };
+
+    if !quarantine_dir.exists() {
+        return Ok(serde_json::json!([]));
+    }
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+
+    let read_dir = fs::read_dir(&quarantine_dir)
+        .map_err(|e| format!("Cannot read quarantine directory: {e}"))?;
+
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+
+        // Attach the quarantine file path and existence flag
+        if let Some(sha256) = meta["sha256"].as_str() {
+            let q_path = quarantine_dir.join(format!("{sha256}.quarantined"));
+            meta["quarantine_path"] = serde_json::Value::String(
+                q_path.to_string_lossy().to_string(),
+            );
+            meta["quarantine_file_exists"] = serde_json::Value::Bool(q_path.exists());
+        }
+        entries.push(meta);
+    }
+
+    // Newest first
+    entries.sort_by(|a, b| {
+        let ta = a["quarantined_at"].as_u64().unwrap_or(0);
+        let tb = b["quarantined_at"].as_u64().unwrap_or(0);
+        tb.cmp(&ta)
+    });
+
+    Ok(serde_json::json!(entries))
+}
+
+/// Restore a quarantined file to its original path.
+///
+/// `sha256` — hash of the file to restore (locates `{sha256}.quarantined`).
+/// Reads `original_path` from the `.meta.json` sidecar.
+/// Removes both the `.quarantined` file and the `.meta.json` on success.
+/// Returns `{ success, restored_path }`.
+#[tauri::command]
+async fn restore_quarantine_file(sha256: String) -> Result<serde_json::Value, String> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let quarantine_dir: PathBuf = {
+        let base = std::env::var("PROGRAMDATA")
+            .or_else(|_| std::env::var("TEMP"))
+            .unwrap_or_else(|_| "C:\\Temp".to_string());
+        PathBuf::from(base).join("AegisAI").join("quarantine")
+    };
+
+    let q_file    = quarantine_dir.join(format!("{sha256}.quarantined"));
+    let meta_file = quarantine_dir.join(format!("{sha256}.meta.json"));
+
+    if !q_file.exists() {
+        return Err(format!("Quarantined file not found: {sha256}.quarantined"));
+    }
+
+    if !meta_file.exists() {
+        return Err("Metadata file not found — cannot determine original path".to_string());
+    }
+
+    let text = fs::read_to_string(&meta_file)
+        .map_err(|e| format!("Cannot read meta file: {e}"))?;
+    let meta: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Cannot parse meta file: {e}"))?;
+    let original_path = meta["original_path"]
+        .as_str()
+        .ok_or_else(|| "original_path missing from meta file".to_string())?
+        .to_string();
+
+    let dst = std::path::Path::new(&original_path);
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create restore directory: {e}"))?;
+    }
+
+    fs::rename(&q_file, dst)
+        .or_else(|_| fs::copy(&q_file, dst).and(fs::remove_file(&q_file)))
+        .map_err(|e| format!("Failed to restore file: {e}"))?;
+
+    let _ = fs::remove_file(&meta_file);
+
+    Ok(serde_json::json!({
+        "success":       true,
+        "restored_path": original_path,
+    }))
+}
+
+/// Permanently delete a quarantined file.
+///
+/// Removes both the `{sha256}.quarantined` file and its `.meta.json` sidecar.
+/// Use only when the file is confirmed malicious and must not be restored.
+/// Returns `{ success }`.
+#[tauri::command]
+async fn delete_quarantine_file(sha256: String) -> Result<serde_json::Value, String> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let quarantine_dir: PathBuf = {
+        let base = std::env::var("PROGRAMDATA")
+            .or_else(|_| std::env::var("TEMP"))
+            .unwrap_or_else(|_| "C:\\Temp".to_string());
+        PathBuf::from(base).join("AegisAI").join("quarantine")
+    };
+
+    let q_file    = quarantine_dir.join(format!("{sha256}.quarantined"));
+    let meta_file = quarantine_dir.join(format!("{sha256}.meta.json"));
+
+    if !q_file.exists() {
+        return Err(format!("Quarantined file not found: {sha256}.quarantined"));
+    }
+
+    fs::remove_file(&q_file)
+        .map_err(|e| format!("Failed to delete quarantined file: {e}"))?;
+    let _ = fs::remove_file(&meta_file);
+
+    Ok(serde_json::json!({ "success": true }))
+}
+
 /// Generate a simple UUID v4 without pulling in the `uuid` crate.
 ///
 /// Uses `SystemTime` entropy seeded from the lower 128 bits of timestamp +
@@ -1164,6 +1307,10 @@ fn main() {
             isolate_network,
             restore_network,
             export_incident_report,
+            // ── Quarantine management ─────────────────────────────────────
+            list_quarantine,
+            restore_quarantine_file,
+            delete_quarantine_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

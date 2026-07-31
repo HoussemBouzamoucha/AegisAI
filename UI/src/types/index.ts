@@ -6,7 +6,7 @@
 
 export type ThreatLevel = 'Clean' | 'Suspicious' | 'Malicious';
 export type ProcessThreat = 'Safe' | 'Suspicious' | 'Malicious' | 'Critical';
-export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history' | 'entities' | 'graph' | 'verdict';
+export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history' | 'entities' | 'graph' | 'verdict' | 'quarantine';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // File Classification
@@ -450,6 +450,19 @@ export interface CorrelateResult {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Quarantine
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface QuarantineEntry {
+  original_path:          string;
+  sha256:                 string;
+  quarantined_at:         number;   // Unix timestamp (seconds)
+  reason:                 string;
+  quarantine_path:        string;
+  quarantine_file_exists: boolean;
+}
 
 export const CONTEXT_FLAG_LABEL: Record<ContextFlag, string> = {
   ransom_note_nearby: 'Ransom note in directory',

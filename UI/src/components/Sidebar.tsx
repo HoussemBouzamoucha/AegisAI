@@ -1,4 +1,4 @@
-import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi, Activity, Share2, Layers, FileText } from 'lucide-react';
+import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi, Activity, Share2, Layers, FileText, Archive, WifiOff } from 'lucide-react';
 import { useStore } from '../store';
 import type { View } from '../types';
 
@@ -13,10 +13,15 @@ const NAV: { id: View; label: string; icon: React.ReactNode; }[] = [
   { id: 'entities',  label: 'ENTITIES',     icon: <Layers size={18} /> },
   { id: 'graph',     label: 'THREAT GRAPH',   icon: <Share2   size={18} /> },
   { id: 'verdict',   label: 'GRAPH VERDICT',  icon: <FileText size={18} /> },
+  { id: 'quarantine', label: 'QUARANTINE',   icon: <Archive  size={18} /> },
 ];
 
 export default function Sidebar() {
-  const { view, setView, scanStats, processStats, scanning, processScanning, networkScanning, memoryScanning } = useStore();
+  const {
+    view, setView, scanStats, processStats,
+    scanning, processScanning, networkScanning, memoryScanning,
+    networkIsolated, networkIsolating, restoreNetworkAction,
+  } = useStore();
 
   return (
     <nav style={{
@@ -104,6 +109,40 @@ export default function Sidebar() {
       )}
 
       <div style={{ flex: 1 }} />
+
+      {/* Network isolation emergency banner */}
+      {networkIsolated && (
+        <div style={{
+          margin: '0 12px 10px',
+          padding: '10px 12px',
+          background: 'rgba(255,51,85,0.09)',
+          border: '1px solid rgba(255,51,85,0.35)',
+          borderRadius: 6,
+          fontFamily: 'var(--font-mono)',
+          fontSize: 9,
+        }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            color: '#ff3355', fontWeight: 700, marginBottom: 6,
+          }}>
+            <WifiOff size={11} /> NETWORK ISOLATED
+          </div>
+          <button
+            onClick={restoreNetworkAction}
+            disabled={networkIsolating}
+            style={{
+              width: '100%', padding: '5px 0',
+              background: 'rgba(0,255,136,0.1)',
+              border: '1px solid rgba(0,255,136,0.35)',
+              borderRadius: 4, color: '#00ff88',
+              fontFamily: 'var(--font-mono)', fontSize: 9, fontWeight: 700,
+              cursor: networkIsolating ? 'not-allowed' : 'pointer',
+              opacity: networkIsolating ? 0.5 : 1,
+            }}>
+            {networkIsolating ? 'Restoring…' : 'Restore Network'}
+          </button>
+        </div>
+      )}
 
       {/* Status footer */}
       <div style={{

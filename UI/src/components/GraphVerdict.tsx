@@ -12,7 +12,7 @@
 //   is injected — the verdict text calls this out explicitly.
 
 import { useMemo, useState, useEffect, useRef, useCallback } from 'react';
-import { AlertTriangle, CheckCircle, Zap, GitMerge, ChevronDown, ChevronRight, Info, Clock, ShieldAlert, ShieldOff, Siren, Play, SkipForward } from 'lucide-react';
+import { AlertTriangle, CheckCircle, Zap, GitMerge, ChevronDown, ChevronRight, Info, Clock, ShieldAlert, ShieldOff, Siren, Play, SkipForward, FileText } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../store';
 import type {
@@ -1156,7 +1156,31 @@ export default function GraphVerdict() {
     correlateResult, correlating, correlateError,
     correlateEntities, correlateFromStore, abortCorrelate,
     processes, networkConnections, memoryRegions, scanResults, mlIdsResult,
+    actionsTaken,
   } = useStore();
+
+  // ── Export incident report ─────────────────────────────────────────────────
+  const [exporting,   setExporting]   = useState(false);
+  const [exportDone,  setExportDone]  = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  const handleExport = useCallback(async () => {
+    if (!correlateResult) return;
+    setExporting(true); setExportDone(false); setExportError(null);
+    try {
+      await invoke('export_incident_report', {
+        correlateResult,
+        actionsTaken: actionsTaken.map(a => ({ ...a })),
+        outputPath:   undefined,
+      });
+      setExportDone(true);
+      setTimeout(() => setExportDone(false), 3000);
+    } catch (e: any) {
+      setExportError(String(e));
+    } finally {
+      setExporting(false);
+    }
+  }, [correlateResult, actionsTaken]);
 
   // Whether there is enough store data to correlate without re-scanning
   const hasStoreData = processes.length > 0 || networkConnections.length > 0;
@@ -1514,10 +1538,43 @@ export default function GraphVerdict() {
               GRAPH VERDICT — {verdict.severity.toUpperCase()}
             </span>
           </div>
-          <div style={{ fontSize: 10, color: 'var(--text-dim)' }}>
-            {verdict.chains.length} attack chain{verdict.chains.length !== 1 ? 's' : ''} detected
-            &nbsp;·&nbsp;
-            {verdict.verdictNodes.length} entit{verdict.verdictNodes.length !== 1 ? 'ies' : 'y'} involved
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 10, color: 'var(--text-dim)' }}>
+              {verdict.chains.length} attack chain{verdict.chains.length !== 1 ? 's' : ''} detected
+              &nbsp;·&nbsp;
+              {verdict.verdictNodes.length} entit{verdict.verdictNodes.length !== 1 ? 'ies' : 'y'} involved
+            </span>
+
+            {/* Export report button */}
+            <button
+              onClick={handleExport}
+              disabled={exporting}
+              title="Export structured incident report to Documents\AegisAI\"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                padding: '3px 10px',
+                background: exportDone
+                  ? 'rgba(0,255,136,0.1)'
+                  : 'rgba(129,140,248,0.08)',
+                border: `1px solid ${exportDone ? 'rgba(0,255,136,0.35)' : 'rgba(129,140,248,0.3)'}`,
+                borderRadius: 4,
+                color: exportDone ? '#00ff88' : '#818cf8',
+                fontFamily: 'var(--font-mono)', fontSize: 9, fontWeight: 600,
+                cursor: exporting ? 'wait' : 'pointer',
+                opacity: exporting ? 0.6 : 1,
+              }}>
+              {exportDone
+                ? <><CheckCircle size={10} /> Saved</>
+                : <><FileText size={10} /> {exporting ? 'Exporting…' : 'Export Report'}</>}
+            </button>
+
+            {exportError && (
+              <span style={{
+                fontFamily: 'var(--font-mono)', fontSize: 8, color: '#ff3355',
+              }}>
+                {exportError}
+              </span>
+            )}
           </div>
         </div>
 

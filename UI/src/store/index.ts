@@ -141,6 +141,13 @@ interface AppState {
   runAgentReassessment: () => Promise<void>;
   resetInvestigation:   () => void;
 
+  // ── Network isolation ──────────────────────────────────────────────────────
+  networkIsolated:      boolean;
+  networkIsolating:     boolean;
+  networkIsolateError:  string | null;
+  isolateNetworkAction: () => Promise<void>;
+  restoreNetworkAction: () => Promise<void>;
+
   // ── Steganography ML ───────────────────────────────────────────────────────
   stegScanRunning:  boolean;
   stegScanError:    string | null;
@@ -756,6 +763,35 @@ export const useStore = create<AppState>((set, get) => ({
     agentReassessing:    false,
     agentReassessError:  null,
   }),
+
+  // ── Network isolation ──────────────────────────────────────────────────────
+  networkIsolated:     false,
+  networkIsolating:    false,
+  networkIsolateError: null,
+
+  isolateNetworkAction: async () => {
+    set({ networkIsolating: true, networkIsolateError: null });
+    try {
+      await invoke('isolate_network');
+      set({ networkIsolated: true });
+    } catch (e: any) {
+      set({ networkIsolateError: String(e) });
+    } finally {
+      set({ networkIsolating: false });
+    }
+  },
+
+  restoreNetworkAction: async () => {
+    set({ networkIsolating: true, networkIsolateError: null });
+    try {
+      await invoke('restore_network');
+      set({ networkIsolated: false });
+    } catch (e: any) {
+      set({ networkIsolateError: String(e) });
+    } finally {
+      set({ networkIsolating: false });
+    }
+  },
 
   // ── Steganography ML ───────────────────────────────────────────────────────
   stegScanRunning: false,

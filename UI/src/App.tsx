@@ -11,6 +11,7 @@ import History from './components/History';
 import EntityManager from './components/EntityManager';
 import ThreatGraph from './components/ThreatGraph';
 import GraphVerdict from './components/GraphVerdict';
+import QuarantineManager from './components/QuarantineManager';
 
 export default function App() {
   const { view, checkEngine } = useStore();
@@ -39,6 +40,7 @@ export default function App() {
           {view === 'entities'  && <EntityManager />}
           {view === 'graph'     && <ThreatGraph />}
           {view === 'verdict'   && <GraphVerdict />}
+          {view === 'quarantine' && <QuarantineManager />}
         </main>
       </div>
     </div>
