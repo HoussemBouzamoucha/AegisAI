@@ -6,6 +6,13 @@
 **/*.lib
 tofix.txt
 .claude
+CLAUDE.md
+memory/
+
+# MD files — keep only README.md
+*.md
+!README.md
+!Antivirus_Engine/yara_rules/**/*.md
 node_modules
 
 # API keys

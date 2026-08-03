@@ -616,6 +616,19 @@ export default function ThreatGraph() {
                         </g>
                       );
                     })()}
+
+                    {/* LOLBin badge — top-left, orange diamond */}
+                    {node.data.is_lolbin && (
+                      <g transform={`translate(${-NODE_R + 6}, ${-NODE_R + 6})`}>
+                        <rect x={-14} y={-8} width={28} height={16} rx={3}
+                          fill="#ff8c00" style={{ pointerEvents: 'none' }} />
+                        <text textAnchor="middle" dy="0.35em"
+                          fontFamily="'IBM Plex Mono', monospace" fontSize={7} fontWeight={700}
+                          fill="#000" style={{ pointerEvents: 'none' }}>
+                          LOLBin
+                        </text>
+                      </g>
+                    )}
                   </g>
                 );
               })}
@@ -879,6 +892,40 @@ function DetailPanel({ node, edges, nodeMap, onClose, criticalPath }: {
           )}
         </div>
 
+        {/* LOLBin + vector badges */}
+        {(node.data.is_lolbin || node.data.is_vector) && (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {node.data.is_lolbin && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                padding: '4px 10px', borderRadius: 4,
+                background: 'rgba(255,140,0,0.12)', border: '1px solid rgba(255,140,0,0.4)',
+              }}>
+                <span style={{ fontFamily: 'var(--font-hud)', fontSize: 9, fontWeight: 700, color: '#ff8c00', letterSpacing: '0.08em' }}>
+                  ⚠ LOLBin
+                </span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: 'rgba(255,140,0,0.7)' }}>
+                  living-off-the-land binary
+                </span>
+              </div>
+            )}
+            {node.data.is_vector && !node.data.is_lolbin && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                padding: '4px 10px', borderRadius: 4,
+                background: 'rgba(255,140,0,0.08)', border: '1px solid rgba(255,140,0,0.25)',
+              }}>
+                <span style={{ fontFamily: 'var(--font-hud)', fontSize: 9, fontWeight: 700, color: '#ff8c00', letterSpacing: '0.08em' }}>
+                  VECTOR
+                </span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: 'rgba(255,140,0,0.6)' }}>
+                  spawned a malicious child
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Sub-label (path / address) */}
         {node.data.sub_label && (
           <div style={{
@@ -1126,6 +1173,19 @@ function LegendPanel({ hasBackend, nodeCount, correlateResult, criticalPath }: {
           </span>
           <span style={{ fontFamily: 'var(--font-hud)', fontSize: 8, color: CRITICAL_COLOR, opacity: 0.6, flexShrink: 0 }}>
             overlay
+          </span>
+        </div>
+        <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{
+            padding: '1px 7px', borderRadius: 3,
+            background: 'rgba(255,140,0,0.12)', border: '1px solid rgba(255,140,0,0.35)',
+            fontFamily: 'var(--font-mono)', fontSize: 7.5, color: '#ff8c00', flexShrink: 0,
+          }}>
+            LOLBin
+          </div>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 8.5, color: 'var(--text-dim)' }}>
+            living-off-the-land vector
           </span>
         </div>
         <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
