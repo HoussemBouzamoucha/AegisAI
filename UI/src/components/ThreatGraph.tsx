@@ -11,6 +11,7 @@ import { buildProcessEntities, buildProcessEdges, orphanConnections, orphanFiles
 import { useStore } from '../store';
 import type { GraphNodeData, GraphEdgeData, UnifiedThreat, CriticalPath } from '../types';
 import { AgentVerdictPanel } from './AgentVerdict';
+import AutonomousLog from './AutonomousLog';
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
 
@@ -693,6 +694,7 @@ export default function ThreatGraph() {
 
         {/* Detail / legend panel */}
         <div style={{ width: 270, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12, overflowY: 'auto' }}>
+          <AutonomousLog />
           {selected
             ? <DetailPanel node={selected} edges={visEdges} nodeMap={nodeMap} onClose={() => setSelected(null)} criticalPath={criticalPath} />
             : <LegendPanel hasBackend={hasBackend} nodeCount={visNodes.length} correlateResult={correlateResult} criticalPath={criticalPath} />}

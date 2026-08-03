@@ -244,6 +244,38 @@ pub async fn run_analysis(correlate_result: &serde_json::Value) -> Result<AgentV
     parse_verdict(&stdout)
 }
 
+/// Narrative report pipeline: incident JSON → human-readable Markdown.
+///
+/// Spawns `python ai_agent/main.py`, sends a `generate_report` command
+/// envelope via stdin, and returns the Markdown string from the response.
+///
+/// The Markdown is written to `incident_{ts}_narrative.md` alongside the
+/// machine-readable `incident_{ts}.json` by the Tauri command caller.
+pub async fn generate_report(incident: &serde_json::Value) -> Result<String, String> {
+    let envelope = serde_json::json!({
+        "cmd":      "generate_report",
+        "incident": incident,
+    });
+
+    let input_json = serde_json::to_string(&envelope)
+        .map_err(|e| format!("Failed to serialise report envelope: {e}"))?;
+
+    let stdout = call_agent(&input_json)?;
+
+    // Parse the { "markdown": "..." } envelope
+    let raw: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Failed to parse report agent output as JSON: {e}\nOutput: {stdout}"))?;
+
+    if let Some(err) = raw["error"].as_str() {
+        return Err(format!("Report agent returned an error: {err}"));
+    }
+
+    raw["markdown"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("Report agent output missing 'markdown' field.\nOutput: {stdout}"))
+}
+
 /// Round 2+ pipeline: re-assess after user-executed containment actions.
 ///
 /// Wraps `correlate_result` + `actions_taken` + metadata into the protocol

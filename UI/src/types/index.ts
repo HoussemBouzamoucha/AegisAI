@@ -498,6 +498,25 @@ export interface RankedAction {
 }
 
 /**
+ * One action auto-executed by autonomous mode, with rollback state.
+ */
+export interface AutoExecutedAction {
+  id:           string;
+  action:       string;   // 'quarantine_file' | 'block_ip' | 'dump_memory'
+  target:       string;   // file path | IP | process label
+  entity_id:    string;
+  executedAt:   string;   // ISO-8601
+  result:       'pending' | 'success' | 'failed';
+  error?:       string;
+  reversible:   boolean;
+  // Rollback params stored at execution time
+  sha256?:      string;   // quarantine_file rollback
+  ruleName?:    string;   // block_ip rollback
+  rolledBack:   boolean;
+  rollbackError?: string;
+}
+
+/**
  * Records one action the user already executed — accumulated across rounds
  * and sent back to the agent on re-assessment so it never repeats itself.
  */

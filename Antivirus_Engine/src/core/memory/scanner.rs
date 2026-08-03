@@ -324,7 +324,7 @@ fn protection_to_string(protect: PAGE_PROTECTION_FLAGS) -> String {
 fn mem_is_readable(protect: PAGE_PROTECTION_FLAGS) -> bool {
     protect != PAGE_NOACCESS
 }
-
+ 
 #[cfg(windows)]
 fn mem_is_writable(protect: PAGE_PROTECTION_FLAGS) -> bool {
     matches!(

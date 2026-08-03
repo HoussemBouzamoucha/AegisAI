@@ -838,9 +838,29 @@ async fn export_incident_report(
     fs::write(&report_path, &json_str)
         .map_err(|e| format!("Cannot write report: {e}"))?;
 
+    // Derive the narrative .md path (same name, different extension).
+    let narrative_path = report_path.with_extension("md");
+
+    // Attempt to generate the human-readable Markdown narrative.
+    // This is best-effort: if the agent fails (no API key, network issue, etc.)
+    // the JSON report is still returned successfully.
+    let (narrative_ok, narrative_path_out, narrative_error) =
+        match crate::agent::generate_report(&report).await {
+            Ok(markdown) => {
+                match fs::write(&narrative_path, &markdown) {
+                    Ok(_)  => (true,  Some(narrative_path.to_string_lossy().into_owned()), None),
+                    Err(e) => (false, None, Some(format!("Cannot write narrative: {e}"))),
+                }
+            }
+            Err(e) => (false, None, Some(e)),
+        };
+
     Ok(serde_json::json!({
-        "success":     true,
-        "report_path": report_path.to_string_lossy(),
+        "success":          true,
+        "report_path":      report_path.to_string_lossy(),
+        "narrative_ok":     narrative_ok,
+        "narrative_path":   narrative_path_out,
+        "narrative_error":  narrative_error,
     }))
 }
 

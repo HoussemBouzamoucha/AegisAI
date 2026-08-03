@@ -8,6 +8,7 @@ import type {
   NetworkConnection, NetworkStats, NetworkScanResult,
   MemoryRegion, MemoryStats, MemoryScanResult as MemoryScanResultType,
   MlIdsResult, CorrelateResult, AgentVerdict, ExecutedAction,
+  AutoExecutedAction,
 } from '../types';
 
 // ─── Steganography scan result ───────────────────────────────────────────────
@@ -147,6 +148,16 @@ interface AppState {
   networkIsolateError:  string | null;
   isolateNetworkAction: () => Promise<void>;
   restoreNetworkAction: () => Promise<void>;
+
+  // ── Autonomous mode ────────────────────────────────────────────────────────
+  autonomousMode:         boolean;
+  setAutonomousMode:      (v: boolean) => void;
+  autoRunning:            boolean;
+  autoActionLog:          AutoExecutedAction[];
+  rollbackAutoAction:     (id: string) => Promise<void>;
+  rollbackAllAutoActions: () => Promise<void>;
+  clearAutoLog:           () => void;
+  _runAutonomousActions:  (result: CorrelateResult) => Promise<void>;
 
   // ── Steganography ML ───────────────────────────────────────────────────────
   stegScanRunning:  boolean;
@@ -640,6 +651,14 @@ export const useStore = create<AppState>((set, get) => ({
       if (correlateToken !== myToken) return; // cancelled while in flight
       if (!result.success) throw new Error(result.error ?? 'Correlation failed');
       set({ correlateResult: result });
+
+      // Autonomous mode: auto-run agent + execute safe actions when threats found
+      if (get().autonomousMode) {
+        const hasThreat = (result.graph?.nodes ?? []).some(
+          n => n.threat_level === 'Malicious' || n.threat_level === 'Critical',
+        );
+        if (hasThreat) get()._runAutonomousActions(result);
+      }
     } catch (e: any) {
       if (correlateToken !== myToken) return;
       set({ correlateError: String(e) });
@@ -763,6 +782,120 @@ export const useStore = create<AppState>((set, get) => ({
     agentReassessing:    false,
     agentReassessError:  null,
   }),
+
+  // ── Autonomous mode ────────────────────────────────────────────────────────
+  autonomousMode:  false,
+  autoRunning:     false,
+  autoActionLog:   [],
+
+  setAutonomousMode: (v) => set({ autonomousMode: v }),
+
+  clearAutoLog: () => set({ autoActionLog: [] }),
+
+  rollbackAutoAction: async (id) => {
+    const entry = get().autoActionLog.find(e => e.id === id);
+    if (!entry || entry.rolledBack || !entry.reversible || entry.result !== 'success') return;
+    try {
+      if (entry.action === 'quarantine_file' && entry.sha256) {
+        await invoke('restore_quarantine_file', { sha256: entry.sha256 });
+      } else if (entry.action === 'block_ip' && entry.ruleName) {
+        await invoke('remove_block_ip', { ruleName: entry.ruleName });
+      }
+      set(s => ({
+        autoActionLog: s.autoActionLog.map(e =>
+          e.id === id ? { ...e, rolledBack: true, rollbackError: undefined } : e,
+        ),
+      }));
+    } catch (e: any) {
+      set(s => ({
+        autoActionLog: s.autoActionLog.map(e =>
+          e.id === id ? { ...e, rollbackError: String(e) } : e,
+        ),
+      }));
+    }
+  },
+
+  rollbackAllAutoActions: async () => {
+    const reversible = get().autoActionLog.filter(
+      e => e.reversible && !e.rolledBack && e.result === 'success',
+    );
+    for (const entry of reversible) {
+      await get().rollbackAutoAction(entry.id);
+    }
+  },
+
+  _runAutonomousActions: async (result) => {
+    // Step 1 — run agent analysis to get ranked actions
+    set({
+      agentLoading: true, agentError: null, agentVerdict: null,
+      actionsTaken: [], currentRound: 1, previousThreatScore: 0, agentReassessError: null,
+    });
+    let verdict: AgentVerdict;
+    try {
+      verdict = await invoke<AgentVerdict>('run_agent_analysis', { correlateResult: result });
+      set({ agentVerdict: verdict, agentLoading: false });
+    } catch (e: any) {
+      set({ agentError: String(e), agentLoading: false });
+      return;
+    }
+
+    // Step 2 — execute only safe reversible actions (skip kill_process / isolate_network)
+    const safeActions = verdict.ranked_actions.filter(
+      a => a.reversible && !a.confirm_required,
+    );
+    if (safeActions.length === 0) return;
+
+    set({ autoRunning: true });
+
+    for (const action of safeActions) {
+      const logEntry: AutoExecutedAction = {
+        id:          crypto.randomUUID(),
+        action:      action.action,
+        target:      action.target,
+        entity_id:   action.entity_id,
+        executedAt:  new Date().toISOString(),
+        result:      'pending',
+        reversible:  action.reversible,
+        rolledBack:  false,
+      };
+      set(s => ({ autoActionLog: [...s.autoActionLog, logEntry] }));
+
+      const patch = (fields: Partial<AutoExecutedAction>) =>
+        set(s => ({
+          autoActionLog: s.autoActionLog.map(e =>
+            e.id === logEntry.id ? { ...e, ...fields } : e,
+          ),
+        }));
+
+      try {
+        if (action.action === 'quarantine_file') {
+          const r = await invoke<{ success: boolean; sha256?: string; error?: string }>(
+            'quarantine_file', { path: action.target },
+          );
+          patch({ result: r.success ? 'success' : 'failed', sha256: r.sha256, error: r.error });
+          if (r.success) get().recordExecutedAction({ action: action.action, target: action.target, entity_id: action.entity_id, executed_at: logEntry.executedAt, result: 'success', pid: action.pid });
+        } else if (action.action === 'block_ip') {
+          const r = await invoke<{ success: boolean; rule_name?: string; error?: string }>(
+            'block_ip', { remoteIp: action.target, direction: 'out' },
+          );
+          patch({ result: r.success ? 'success' : 'failed', ruleName: r.rule_name, error: r.error });
+          if (r.success) get().recordExecutedAction({ action: action.action, target: action.target, entity_id: action.entity_id, executed_at: logEntry.executedAt, result: 'success', pid: action.pid });
+        } else if (action.action === 'dump_memory' && action.pid != null) {
+          const r = await invoke<{ success: boolean; error?: string }>(
+            'dump_memory', { pid: action.pid },
+          );
+          patch({ result: r.success ? 'success' : 'failed', error: r.error });
+          if (r.success) get().recordExecutedAction({ action: action.action, target: action.target, entity_id: action.entity_id, executed_at: logEntry.executedAt, result: 'success', pid: action.pid });
+        } else {
+          patch({ result: 'failed', error: 'Unsupported action in autonomous mode' });
+        }
+      } catch (e: any) {
+        patch({ result: 'failed', error: String(e) });
+      }
+    }
+
+    set({ autoRunning: false });
+  },
 
   // ── Network isolation ──────────────────────────────────────────────────────
   networkIsolated:     false,

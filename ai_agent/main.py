@@ -34,6 +34,7 @@ except ImportError:
     pass  # python-dotenv not installed; key must be set in the shell
 
 from agent.reasoning import refine, refine_reassess
+from agent.report import generate_report
 from agent.schema import AgentVerdict
 
 
@@ -67,7 +68,14 @@ def run_stdin() -> None:
         _write_error(f"JSON parse error: {e}")
         return
 
-    if "correlate_result" in payload:
+    if payload.get("cmd") == "generate_report":
+        # Narrative report generation mode
+        incident = payload.get("incident")
+        if not incident:
+            _write_error("'generate_report' command requires an 'incident' key.")
+            return
+        _run_and_write_report(incident)
+    elif "correlate_result" in payload:
         # Round 2+ wrapper format
         correlate_result       = payload["correlate_result"]
         actions_taken          = payload.get("actions_taken", [])
@@ -88,6 +96,17 @@ def _run_and_write(correlate_result: dict) -> None:
         _write_error(str(e))
     except Exception as e:
         _write_error(f"Agent error: {e}")
+
+
+def _run_and_write_report(incident: dict) -> None:
+    """Generate a human-readable Markdown report from the incident JSON."""
+    try:
+        markdown = generate_report(incident)
+        print(json.dumps({"markdown": markdown}), flush=True)
+    except EnvironmentError as e:
+        _write_error(str(e))
+    except Exception as e:
+        _write_error(f"Report agent error: {e}")
 
 
 def _run_and_write_reassess(
