@@ -109,6 +109,53 @@ _MODEL_FILES = {
     "All":           "EMBER2024_all.model",        # anything unrecognised
 }
 
+# ── Ensemble wrapper ──────────────────────────────────────────────────────────
+
+class _EnsembleBooster:
+    """
+    Wraps a list of LightGBM Boosters (cross-validation ensemble) so that
+    `thrember.predict_sample` can call `.predict()` on it like a single model.
+    Predictions are averaged across all boosters.
+    """
+    def __init__(self, boosters: list):
+        self._boosters = boosters
+
+    def predict(self, data, **kwargs):
+        import numpy as np
+        preds = [b.predict(data, **kwargs) for b in self._boosters]
+        return np.mean(preds, axis=0)
+
+
+def _load_one_model(lgb, path: str):
+    """
+    Load a single model file in either native LightGBM text format or pickle.
+
+    Native format  → starts with b'tree' → lgb.Booster(model_file=path)
+    Pickle format  → starts with 0x80   → pickle.load()
+      • If the pickle contains a single Booster  → return it directly
+      • If the pickle contains a list of Boosters → return _EnsembleBooster
+    """
+    with open(path, "rb") as fh:
+        header = fh.read(1)
+
+    if header != b"\x80":
+        # Native LightGBM text format
+        return lgb.Booster(model_file=path)
+
+    # Pickle format
+    import pickle
+    with open(path, "rb") as fh:
+        obj = pickle.load(fh)
+
+    if isinstance(obj, lgb.Booster):
+        return obj
+
+    if isinstance(obj, list) and obj and isinstance(obj[0], lgb.Booster):
+        return _EnsembleBooster(obj)
+
+    raise ValueError(f"unrecognised pickle payload: {type(obj)}")
+
+
 # ── Load models once at startup ───────────────────────────────────────────────
 
 def _load_models():
@@ -119,7 +166,13 @@ def _load_models():
             path = os.path.join(MODELS_DIR, fname)
             if os.path.exists(path):
                 try:
-                    loaded[key] = lgb.Booster(model_file=path)
+                    loaded[key] = _load_one_model(lgb, path)
+                    if isinstance(loaded[key], _EnsembleBooster):
+                        import sys as _s
+                        _s.stderr.write(
+                            f"bridge: {key} loaded as ensemble "
+                            f"({len(loaded[key]._boosters)} boosters)\n"
+                        )
                 except Exception as exc:
                     failed.append(f"{key}: {exc}")
             else:

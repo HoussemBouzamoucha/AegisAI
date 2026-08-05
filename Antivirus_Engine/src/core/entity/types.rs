@@ -119,37 +119,48 @@ pub struct ProcessAttributes {
     pub pid:          u32,
     pub name:         String,
     pub exe_path:     Option<String>,
+    #[allow(dead_code)]
     pub command_line: Option<String>,
+    #[allow(dead_code)]
     pub user:         Option<String>,
+    #[allow(dead_code)]
     pub parent_pid:   Option<u32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FileAttributes {
     pub path:          String,
+    #[allow(dead_code)]
     pub hash:          Option<String>,
+    #[allow(dead_code)]
     pub category:      String,
+    #[allow(dead_code)]
     pub context_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NetworkAttributes {
     pub protocol:       String,
+    #[allow(dead_code)]
     pub local_address:  String,
     pub remote_address: String,
     pub state:          String,
+    #[allow(dead_code)]
     pub pid:            Option<u32>,
     pub process_name:   Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MemoryAttributes {
+    #[allow(dead_code)]
     pub pid:            u32,
     pub process_name:   String,
     pub region_start:   u64,
     pub region_size:    u64,
     pub protection:     String,
+    #[allow(dead_code)]
     pub is_executable:  bool,
+    #[allow(dead_code)]
     pub is_writable:    bool,
 }
 
@@ -191,6 +202,7 @@ pub struct AggregatedEntity {
     pub files:    Vec<EntityNode>,
 
     /// Merged detection signals from all sub-entities.
+    #[allow(dead_code)]
     pub detection_signals: Vec<DetectionSignal>,
 
     // Join keys used to draw inter-entity graph edges
@@ -215,6 +227,7 @@ pub struct AggregatedEntity {
 pub struct EntityNode {
     pub entity_id:         String,
     pub entity_type:       EntityType,
+    #[allow(dead_code)]
     pub timestamp:         u64,
     pub heuristic_score:   i32,
     pub ml_score:          Option<f32>,

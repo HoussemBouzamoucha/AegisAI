@@ -20,6 +20,7 @@ use super::types::{EdgeType, GraphEdge, GraphNode, ThreatGraph};
 
 // ─── GraphBuilder ─────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct GraphBuilder<'a> {
     manager: &'a EntityManager,
 }
@@ -324,6 +325,7 @@ pub fn aggregate_to_graph_node(e: &AggregatedEntity) -> GraphNode {
 
 /// Strip Windows executable extension for display labels only.
 /// Entity IDs keep the raw name so all lookups remain stable.
+#[allow(dead_code)]
 fn strip_exe_suffix(name: &str) -> String {
     for ext in &[".exe", ".EXE", ".dll", ".DLL", ".sys", ".SYS"] {
         if let Some(stem) = name.strip_suffix(ext) {
@@ -339,9 +341,11 @@ fn canonical_pair(a: &str, b: &str) -> (String, String) {
     else      { (b.to_string(), a.to_string()) }
 }
 
+#[allow(dead_code)]
 fn max_score(a: f32, b: f32) -> f32 { a.max(b) }
 
 /// Derive the most specific edge type for two entities that share a PID.
+#[allow(dead_code)]
 fn pid_edge_type(a: EntityType, b: EntityType) -> EdgeType {
     use EntityType::*;
     match (&a, &b) {
@@ -354,6 +358,7 @@ fn pid_edge_type(a: EntityType, b: EntityType) -> EdgeType {
 /// Convert a flat EntityNode into a GraphNode (legacy / backward-compat path).
 /// Sub-score fields default to zero; use `aggregate_to_graph_node` for the
 /// aggregated-entity graph.
+#[allow(dead_code)]
 pub fn entity_to_graph_node(entity: &EntityNode) -> GraphNode {
     let (label, sub_label) = derive_labels(entity);
     GraphNode {
@@ -381,6 +386,7 @@ pub fn entity_to_graph_node(entity: &EntityNode) -> GraphNode {
 }
 
 /// Derive human-readable labels from the type-specific entity attributes.
+#[allow(dead_code)]
 pub fn derive_labels(entity: &EntityNode) -> (String, Option<String>) {
     match &entity.attributes {
         EntityAttributes::Process(p) => (

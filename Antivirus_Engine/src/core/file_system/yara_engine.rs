@@ -11,12 +11,14 @@ use anyhow::Result;
 /// minutes on certain file contents (e.g. highly repetitive PE sections that
 /// trigger catastrophic backtracking).  5 s is generous for a real malware
 /// signature — if a rule needs longer it's too slow for real-time scanning.
+#[allow(dead_code)]
 const YARA_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A single YARA match result
 #[derive(Debug, Clone)]
 pub struct YaraMatch {
     pub rule_name: String,
+    #[allow(dead_code)]
     pub tags: Vec<String>,
     pub meta_description: Option<String>,
 }
@@ -120,6 +122,7 @@ impl YaraEngine {
     }
 
     /// Scan raw bytes directly (useful for memory scanning)
+    #[allow(dead_code)]
     pub fn scan_bytes(&self, data: &[u8]) -> Result<Vec<YaraMatch>> {
         let rules = match &self.rules {
             Some(r) => r,

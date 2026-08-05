@@ -17,7 +17,7 @@
 // in one subdirectory from escalating files in sibling directories.
 
 use crate::core::types::{
-    ContextFlag, DetectionSignal, FileCategory, ScanResult, ThreatLevel,
+    ContextFlag, DetectionSignal, ScanResult, ThreatLevel,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -359,6 +359,7 @@ impl Default for ContextAnalyzer {
 struct DirectoryFacts {
     total_files: usize,
     ransom_note_count: usize,
+    #[allow(dead_code)]
     ransom_note_paths: Vec<PathBuf>,
     ransomware_ext_ratio: f32,
     mass_modification_detected: bool,

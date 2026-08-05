@@ -8,7 +8,7 @@ import type {
   NetworkConnection, NetworkStats, NetworkScanResult,
   MemoryRegion, MemoryStats, MemoryScanResult as MemoryScanResultType,
   MlIdsResult, CorrelateResult, AgentVerdict, ExecutedAction,
-  AutoExecutedAction,
+  AutoExecutedAction, AutoAllowedActions,
 } from '../types';
 
 // ─── Steganography scan result ───────────────────────────────────────────────
@@ -152,6 +152,10 @@ interface AppState {
   // ── Autonomous mode ────────────────────────────────────────────────────────
   autonomousMode:         boolean;
   setAutonomousMode:      (v: boolean) => void;
+  autoAllowedActions:     AutoAllowedActions;
+  setAutoAllowedActions:  (v: AutoAllowedActions) => void;
+  emberMlEnabled:         boolean;
+  setEmberMlEnabled:      (v: boolean) => void;
   autoRunning:            boolean;
   autoActionLog:          AutoExecutedAction[];
   rollbackAutoAction:     (id: string) => Promise<void>;
@@ -785,10 +789,14 @@ export const useStore = create<AppState>((set, get) => ({
 
   // ── Autonomous mode ────────────────────────────────────────────────────────
   autonomousMode:  false,
+  autoAllowedActions: { quarantine_file: true, block_ip: true, dump_memory: true },
+  emberMlEnabled:  true,
   autoRunning:     false,
   autoActionLog:   [],
 
-  setAutonomousMode: (v) => set({ autonomousMode: v }),
+  setAutonomousMode:     (v) => set({ autonomousMode: v }),
+  setAutoAllowedActions: (v) => set({ autoAllowedActions: v }),
+  setEmberMlEnabled:     (v) => set({ emberMlEnabled: v }),
 
   clearAutoLog: () => set({ autoActionLog: [] }),
 
@@ -839,9 +847,11 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    // Step 2 — execute only safe reversible actions (skip kill_process / isolate_network)
+    // Step 2 — execute only safe reversible actions that are enabled in settings
+    const allowed = get().autoAllowedActions;
     const safeActions = verdict.ranked_actions.filter(
-      a => a.reversible && !a.confirm_required,
+      a => a.reversible && !a.confirm_required &&
+           (allowed as unknown as Record<string, boolean>)[a.action] !== false,
     );
     if (safeActions.length === 0) return;
 

@@ -6,7 +6,13 @@
 
 export type ThreatLevel = 'Clean' | 'Suspicious' | 'Malicious';
 export type ProcessThreat = 'Safe' | 'Suspicious' | 'Malicious' | 'Critical';
-export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history' | 'entities' | 'graph' | 'verdict' | 'quarantine';
+export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history' | 'entities' | 'graph' | 'verdict' | 'quarantine' | 'settings';
+
+export interface AutoAllowedActions {
+  quarantine_file: boolean;
+  block_ip:        boolean;
+  dump_memory:     boolean;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // File Classification

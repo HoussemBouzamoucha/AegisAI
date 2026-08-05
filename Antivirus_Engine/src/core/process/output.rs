@@ -7,6 +7,7 @@ use serde_json::json;
 use std::path::Path;
 use anyhow::Result;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputFormat {
     Json,
@@ -15,17 +16,20 @@ pub enum OutputFormat {
 
 // ─── Scan output ──────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct ScanOutput {
     pub processes:  Vec<ProcessInfo>,
     pub statistics: ScanStatistics,
 }
 
 impl ScanOutput {
+    #[allow(dead_code)]
     pub fn new(processes: Vec<ProcessInfo>, statistics: ScanStatistics) -> Self {
         Self { processes, statistics }
     }
 
     /// Serialize all processes to a pretty-printed JSON string.
+    #[allow(dead_code)]
     pub fn to_json(&self) -> Result<String> {
         let processes: Vec<serde_json::Value> = self.processes.iter()
             .map(serialize_process)
@@ -41,12 +45,14 @@ impl ScanOutput {
     }
 
     /// Write JSON to a file.
+    #[allow(dead_code)]
     pub fn write_json(&self, path: &Path) -> Result<()> {
         std::fs::write(path, self.to_json()?)?;
         Ok(())
     }
 
     /// Return only non-safe processes as JSON — used by the UI and daemon.
+    #[allow(dead_code)]
     pub fn to_json_threats_only(&self) -> Result<String> {
         let threats: Vec<serde_json::Value> = self.processes.iter()
             .filter(|p| p.threat_level != ThreatLevel::Safe)
@@ -63,6 +69,7 @@ impl ScanOutput {
     }
 
     /// Print a short summary to stderr.
+    #[allow(dead_code)]
     pub fn print_summary(&self) {
         let s = &self.statistics;
         eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -121,6 +128,7 @@ pub fn serialize_process(p: &ProcessInfo) -> serde_json::Value {
     })
 }
 
+#[allow(dead_code)]
 fn serialize_stats(s: &ScanStatistics) -> serde_json::Value {
     json!({
         "total_processes":      s.total_processes,

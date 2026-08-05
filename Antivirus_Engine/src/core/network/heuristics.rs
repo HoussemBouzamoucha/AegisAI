@@ -161,7 +161,7 @@ impl NetworkHeuristics {
         let mut signals: Vec<DetectionSignal> = Vec::new();
 
         let remote = connection.remote_address.to_lowercase();
-        let local  = connection.local_address.to_lowercase();
+        let _local  = connection.local_address.to_lowercase();
         let proc   = connection.process_name.as_deref().unwrap_or("").to_lowercase();
         let state  = connection.state.to_uppercase();
         let proto  = connection.protocol.to_lowercase();

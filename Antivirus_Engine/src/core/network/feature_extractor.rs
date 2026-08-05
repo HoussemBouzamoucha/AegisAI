@@ -35,7 +35,7 @@ use parking_lot::Mutex;
 use pcap::{Capture, Device};
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{BufWriter, Write},
     path::PathBuf,
     sync::{

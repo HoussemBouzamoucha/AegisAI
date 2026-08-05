@@ -1,4 +1,4 @@
-import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi, Activity, Share2, Layers, FileText, Archive, WifiOff, Zap } from 'lucide-react';
+import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi, Activity, Share2, Layers, FileText, Archive, WifiOff, Zap, Settings } from 'lucide-react';
 import { useStore } from '../store';
 import type { View } from '../types';
 
@@ -14,6 +14,7 @@ const NAV: { id: View; label: string; icon: React.ReactNode; }[] = [
   { id: 'graph',     label: 'THREAT GRAPH',   icon: <Share2   size={18} /> },
   { id: 'verdict',   label: 'GRAPH VERDICT',  icon: <FileText size={18} /> },
   { id: 'quarantine', label: 'QUARANTINE',   icon: <Archive  size={18} /> },
+  { id: 'settings',   label: 'SETTINGS',     icon: <Settings size={18} /> },
 ];
 
 export default function Sidebar() {
@@ -21,7 +22,7 @@ export default function Sidebar() {
     view, setView, scanStats, processStats,
     scanning, processScanning, networkScanning, memoryScanning,
     networkIsolated, networkIsolating, restoreNetworkAction,
-    autonomousMode, setAutonomousMode, autoRunning, autoActionLog,
+    autonomousMode, autoRunning, autoActionLog,
   } = useStore();
 
   return (
@@ -145,51 +146,37 @@ export default function Sidebar() {
         </div>
       )}
 
-      {/* Autonomous mode toggle */}
-      <div style={{
-        margin: '0 12px 8px',
-        padding: '10px 12px',
-        background: autonomousMode ? 'rgba(255,51,85,0.07)' : 'var(--elevated)',
-        border: `1px solid ${autonomousMode ? 'rgba(255,51,85,0.35)' : 'var(--border)'}`,
-        borderRadius: 6,
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: autonomousMode ? 6 : 0 }}>
-          <Zap size={11} color={autonomousMode ? '#ff3355' : 'var(--text-dim)'} />
+      {/* Autonomous mode status pill — click to open Settings */}
+      <button
+        onClick={() => setView('settings')}
+        style={{
+          margin: '0 12px 8px', padding: '8px 12px',
+          background: autonomousMode ? 'rgba(255,51,85,0.07)' : 'var(--elevated)',
+          border: `1px solid ${autonomousMode ? 'rgba(255,51,85,0.35)' : 'var(--border)'}`,
+          borderRadius: 6, cursor: 'pointer', textAlign: 'left', width: 'calc(100% - 24px)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+          <Zap size={10} color={autonomousMode ? '#ff3355' : 'var(--text-dim)'} />
           <span style={{
             fontFamily: 'var(--font-hud)', fontSize: 9, letterSpacing: '0.1em',
             color: autonomousMode ? '#ff3355' : 'var(--text-dim)', flex: 1,
           }}>
             AUTO MODE
           </span>
-          {/* Toggle pill */}
-          <button
-            onClick={() => setAutonomousMode(!autonomousMode)}
-            style={{
-              width: 32, height: 16, borderRadius: 8, border: 'none', padding: 0,
-              background: autonomousMode ? '#ff3355' : 'var(--border)',
-              cursor: 'pointer', position: 'relative', flexShrink: 0,
-              transition: 'background 0.2s',
-            }}
-          >
-            <div style={{
-              position: 'absolute', top: 2,
-              left: autonomousMode ? 18 : 2,
-              width: 12, height: 12, borderRadius: '50%',
-              background: '#fff',
-              transition: 'left 0.2s',
-            }} />
-          </button>
+          <span style={{
+            fontFamily: 'var(--font-mono)', fontSize: 8,
+            color: autonomousMode ? '#ff3355' : 'var(--text-dim)',
+          }}>
+            {autoRunning ? '⚡ running' : autonomousMode ? 'ON' : 'OFF'}
+          </span>
         </div>
-        {autonomousMode && (
-          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: 'rgba(255,51,85,0.7)', lineHeight: 1.5 }}>
-            {autoRunning
-              ? '⚡ Executing actions…'
-              : autoActionLog.length > 0
-                ? `${autoActionLog.filter(a => a.result === 'success').length} action${autoActionLog.filter(a => a.result === 'success').length !== 1 ? 's' : ''} taken`
-                : 'Will act on next correlate'}
+        {autonomousMode && autoActionLog.length > 0 && (
+          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 8, color: 'rgba(255,51,85,0.6)', marginTop: 3 }}>
+            {autoActionLog.filter(a => a.result === 'success').length} action(s) taken
           </div>
         )}
-      </div>
+      </button>
 
       {/* Status footer */}
       <div style={{

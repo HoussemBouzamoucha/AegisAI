@@ -17,7 +17,7 @@ use crate::core::file_system::context::ContextAnalyzer;
 use crate::core::file_system::heuristics::HeuristicAnalyzer;
 use crate::core::file_system::signature::SignatureDatabase;
 use crate::core::file_system::yara_engine::YaraEngine;
-use crate::core::types::{DetectionSignal, FileCategory, ScanResult, ThreatLevel};
+use crate::core::types::{DetectionSignal, ScanResult, ThreatLevel};
 use crate::core::utils::{compute_sha256, compute_sha256_from_bytes};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

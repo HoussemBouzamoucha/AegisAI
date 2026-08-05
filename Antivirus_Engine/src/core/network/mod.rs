@@ -5,4 +5,3 @@ pub mod feature_extractor;
 pub mod dpi;
 
 pub use scanner::NetworkScanner;
-pub use dpi::DpiEngine;

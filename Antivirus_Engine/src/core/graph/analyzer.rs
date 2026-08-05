@@ -280,6 +280,7 @@ impl GraphAnalyzer {
     }
 
     /// Detect all attack chains in `graph` and return them sorted by score.
+    #[allow(dead_code)]
     pub fn find_attack_chains(graph: &ThreatGraph) -> Vec<AttackChain> {
         let mut counter: u32 = 0;
         let mut chains = Vec::new();
@@ -447,6 +448,7 @@ impl GraphAnalyzer {
 
     // ── Pattern 1: ProcessInjection ───────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn detect_process_injection(graph: &ThreatGraph, counter: &mut u32) -> Vec<AttackChain> {
         let mut result = Vec::new();
 
@@ -489,6 +491,7 @@ impl GraphAnalyzer {
 
     // ── Pattern 2: C2Communication ────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn detect_c2_communication(graph: &ThreatGraph, counter: &mut u32) -> Vec<AttackChain> {
         let mut result = Vec::new();
 

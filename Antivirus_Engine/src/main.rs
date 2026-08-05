@@ -1214,7 +1214,36 @@ fn daemon_correlate(
             let t_exe = std::time::Instant::now();
             for (_, exe) in &exe_scan_candidates {
                 if let Ok(result) = file_scanner.scan_file(Path::new(exe.as_str())) {
+                    // Reconstruct the entity_id that ingest_file will use so we
+                    // can patch the Ember ML probability into the entity manager.
+                    // Format: "file:{sha256}" if hash present, else "file:{path}".
+                    let entity_id = match &result.hash {
+                        Some(h) => format!("file:{}", h),
+                        None    => format!("file:{}", result.path.display()),
+                    };
+
+                    // scan_file() runs Ember ML internally (Layer 4) for non-clean
+                    // files and records the score in a detection signal whose
+                    // description has the form:
+                    //   "EMBER2024_Win64 score 0.9234 (malicious)"
+                    // Extract the probability so it can be stored as ml_score.
+                    let ember_score: Option<f32> = result.detection_signals.iter()
+                        .find(|s| s.source == "ember_ml")
+                        .and_then(|s| {
+                            s.description
+                                .split("score ").nth(1)
+                                .and_then(|rest| rest.split_whitespace().next())
+                                .and_then(|p| p.parse::<f32>().ok())
+                        });
+
                     manager.ingest_file(&result);
+
+                    // Patch the Ember probability into the entity's ml_score so
+                    // combined_score = H×0.4 + ML×0.6 uses the file ML model.
+                    if let Some(score) = ember_score {
+                        manager.update_ml_score(&entity_id, score);
+                        eprintln!("CORRELATE: file ML score {:.4} patched for {}", score, entity_id);
+                    }
                 }
             }
             eprintln!("CORRELATE: exe file scans done in {}ms", t_exe.elapsed().as_millis());

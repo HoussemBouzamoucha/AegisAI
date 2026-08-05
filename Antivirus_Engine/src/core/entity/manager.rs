@@ -28,6 +28,7 @@ use super::types::{
 
 pub struct EntityManager {
     nodes:       DashMap<String, EntityNode>,
+    #[allow(dead_code)]
     window_secs: u64,
 }
 
@@ -355,6 +356,7 @@ impl EntityManager {
 
     /// All network entities connecting to the same remote IP — useful for
     /// detecting multiple processes communicating with the same C2 host.
+    #[allow(dead_code)]
     pub fn get_by_remote_ip(&self, ip: &str) -> Vec<EntityNode> {
         self.nodes
             .iter()
@@ -366,6 +368,7 @@ impl EntityManager {
     }
 
     /// All entities that reference the same file path.
+    #[allow(dead_code)]
     pub fn get_by_file_path(&self, path: &str) -> Vec<EntityNode> {
         let path_lower = path.to_lowercase();
         self.nodes
@@ -407,6 +410,7 @@ impl EntityManager {
     }
 
     /// Look up a single entity by its stable ID.
+    #[allow(dead_code)]
     pub fn get(&self, entity_id: &str) -> Option<EntityNode> {
         self.nodes.get(entity_id).map(|e| e.value().clone())
     }
@@ -415,6 +419,7 @@ impl EntityManager {
 
     /// Remove entities older than window_secs.
     /// Call this periodically (e.g., every 60 s) to bound memory usage.
+    #[allow(dead_code)]
     pub fn prune_expired(&self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -426,10 +431,12 @@ impl EntityManager {
     }
 
     /// Number of live nodes in the window.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

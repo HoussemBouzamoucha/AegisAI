@@ -19,5 +19,3 @@ pub mod api_parameters;
 pub mod API_feature_extractor;
 
 pub use scanner::ProcessScanner;
-pub use output::OutputFormat;
-pub use types::{ProcessInfo, ScanStatistics, ThreatLevel};

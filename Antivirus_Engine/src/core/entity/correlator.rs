@@ -122,6 +122,7 @@ impl<'a> EntityCorrelator<'a> {
     }
 
     /// All clusters that contain at least one threat-level entity.
+    #[allow(dead_code)]
     pub fn find_threat_clusters(&self) -> Vec<CorrelatedCluster> {
         self.find_all_clusters()
             .into_iter()
@@ -131,6 +132,7 @@ impl<'a> EntityCorrelator<'a> {
 
     /// Cluster for a specific PID — returns None if fewer than 2 entity types
     /// are present (a lone process node has no cross-scanner correlation).
+    #[allow(dead_code)]
     pub fn get_pid_cluster(&self, pid: u32) -> Option<CorrelatedCluster> {
         let members = self.manager.get_by_pid(pid);
         if members.len() < 2 {
@@ -140,6 +142,7 @@ impl<'a> EntityCorrelator<'a> {
     }
 
     /// Cluster for all entities connecting to a specific remote IP.
+    #[allow(dead_code)]
     pub fn get_remote_ip_cluster(&self, ip: &str) -> Option<CorrelatedCluster> {
         let members = self.manager.get_by_remote_ip(ip);
         if members.len() < 2 {
