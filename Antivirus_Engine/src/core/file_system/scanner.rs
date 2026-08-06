@@ -650,6 +650,76 @@ impl FileSystemScanner {
         Ok(loaded)
     }
 
+    /// Append signatures from a file into the current signature database.
+    ///
+    /// File format: one entry per line — `hash|hash_type|malware_name|severity[|family[|description]]`
+    /// Calls `SignatureDatabase::load_from_file` which internally uses `HashType::from_str`
+    /// and `ThreatSeverity::from_str` to parse each entry.
+    pub fn load_signatures_from_file(&mut self, path: &Path) -> Result<usize> {
+        self.signatures.load_from_file(path)
+    }
+
+    /// Clear the current signature database and reload it from a file.
+    ///
+    /// Uses `SignatureDatabase::empty()` to reset before loading so that the
+    /// resulting DB contains only the signatures from the file (no defaults).
+    pub fn reload_signatures_from_file(&mut self, path: &Path) -> Result<usize> {
+        let mut new_db = crate::core::file_system::signature::SignatureDatabase::empty();
+        let count = new_db.load_from_file(path)?;
+        self.signatures = new_db;
+        Ok(count)
+    }
+
+    /// Look up a hash against the current signature database.
+    ///
+    /// Returns the full `SignatureEntry` (including `hash_type`, `severity`, etc.)
+    /// so callers can serialise richer metadata than the plain name returned by
+    /// `check_hash`.
+    pub fn lookup_signature(&self, hash: &str) -> Option<&crate::core::file_system::signature::SignatureEntry> {
+        self.signatures.get_signature(hash)
+    }
+
+    /// Number of signatures currently loaded in the hash database.
+    pub fn signature_count(&self) -> usize {
+        self.signatures.signature_count()
+    }
+
+    /// Save the current signature database to a CSV file (enhanced format).
+    ///
+    /// Persists `hash_type.as_str()` and `severity.as_str()` for each entry so
+    /// the file can be reloaded with `load_signatures_from_file`.
+    pub fn save_signatures_to_file(&self, path: &Path) -> anyhow::Result<()> {
+        self.signatures.save_to_file(path)
+    }
+
+    /// Aggregate counts grouped by hash type, severity, and malware family.
+    ///
+    /// Uses `HashType::as_str()` and `ThreatSeverity::as_str()` as display keys
+    /// so callers can serialise the result without importing those enums directly.
+    pub fn signature_stats(&self) -> (
+        Vec<(String, usize)>,
+        Vec<(String, usize)>,
+        Vec<(String, usize)>,
+    ) {
+        let by_type = self.signatures.stats_by_hash_type();
+        let by_sev  = self.signatures.stats_by_severity();
+        let by_fam  = self.signatures.stats_by_family();
+
+        let type_vec: Vec<(String, usize)> = by_type
+            .iter()
+            .map(|(ht, &n)| (ht.as_str().to_string(), n))
+            .collect();
+        let sev_vec: Vec<(String, usize)> = by_sev
+            .iter()
+            .map(|(sv, &n)| (sv.as_str().to_string(), n))
+            .collect();
+        let fam_vec: Vec<(String, usize)> = by_fam
+            .into_iter()
+            .collect();
+
+        (type_vec, sev_vec, fam_vec)
+    }
+
     // ── Single file scan ──────────────────────────────────────────────────────
 
     pub fn scan_file(&self, path: &Path) -> Result<ScanResult> {
@@ -1107,13 +1177,13 @@ impl FileSystemScanner {
         None
     }
 
-    pub fn get_signatures_mut(&mut self) -> &mut SignatureDatabase { &mut self.signatures }
-    pub fn set_deep_scan(&mut self, enabled: bool)  { self.enable_deep_scan = enabled; }
-    pub fn set_multi_hash(&mut self, enabled: bool) { self.enable_multi_hash = enabled; }
-    pub fn set_yara(&mut self, enabled: bool)       { self.enable_yara = enabled; }
-    pub fn set_hash_db(&mut self, enabled: bool)    { self.enable_hash_db = enabled; }
-    pub fn yara_rules_loaded(&self) -> usize        { self.yara.rules_loaded }
-    pub fn yara_arc(&self) -> Arc<YaraEngine>       { Arc::clone(&self.yara) }
+    #[allow(dead_code)] pub fn get_signatures_mut(&mut self) -> &mut SignatureDatabase { &mut self.signatures }
+    #[allow(dead_code)] pub fn set_deep_scan(&mut self, enabled: bool)  { self.enable_deep_scan = enabled; }
+    #[allow(dead_code)] pub fn set_multi_hash(&mut self, enabled: bool) { self.enable_multi_hash = enabled; }
+    #[allow(dead_code)] pub fn set_yara(&mut self, enabled: bool)       { self.enable_yara = enabled; }
+    #[allow(dead_code)] pub fn set_hash_db(&mut self, enabled: bool)    { self.enable_hash_db = enabled; }
+    #[allow(dead_code)] pub fn yara_rules_loaded(&self) -> usize        { self.yara.rules_loaded }
+    #[allow(dead_code)] pub fn yara_arc(&self) -> Arc<YaraEngine>       { Arc::clone(&self.yara) }
 }
 
 impl Default for FileSystemScanner {

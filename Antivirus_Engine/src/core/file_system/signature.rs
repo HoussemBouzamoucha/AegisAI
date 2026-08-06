@@ -52,7 +52,10 @@ impl HashType {
             HashType::SHA512 => "sha512",
         }
     }
-    
+
+    /// Expected hex-string length for this hash type (MD5=32, SHA-1=40, SHA-256=64, SHA-512=128).
+    /// Provided for callers that need to validate hash input length before querying the DB.
+    #[allow(dead_code)]
     pub fn expected_length(&self) -> usize {
         match self {
             HashType::MD5 => 32,
@@ -103,6 +106,7 @@ pub struct SignatureDatabase {
     family_index: HashMap<String, Vec<String>>,
 }
 
+#[allow(dead_code)]
 impl SignatureDatabase {
     /// Create a new signature database with default signatures
     pub fn new() -> Self {
@@ -210,7 +214,8 @@ impl SignatureDatabase {
         self.signatures.insert(normalized_hash, entry);
     }
 
-    /// Add a simple signature (backward compatibility)
+    /// Add a simple signature (backward compatibility).
+    #[allow(dead_code)]
     pub fn add_signature(&mut self, hash: String, malware_name: String) {
         let hash_type = self.detect_hash_type(&hash);
         
@@ -239,6 +244,7 @@ impl SignatureDatabase {
     }
 
     /// Remove a signature from the database
+    #[allow(dead_code)]
     pub fn remove_signature(&mut self, hash: &str) -> Option<SignatureEntry> {
         let normalized_hash = hash.to_lowercase();
         
@@ -294,11 +300,13 @@ impl SignatureDatabase {
     }
 
     /// Check if the database is empty
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.signatures.is_empty()
     }
 
     /// Clear all signatures from the database
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.signatures.clear();
         self.family_index.clear();
@@ -450,6 +458,7 @@ impl SignatureDatabase {
     }
 
     /// Merge another signature database into this one
+    #[allow(dead_code)]
     pub fn merge(&mut self, other: &SignatureDatabase) {
         for entry in other.signatures.values() {
             self.add_signature_entry(entry.clone());
@@ -457,11 +466,13 @@ impl SignatureDatabase {
     }
 
     /// Get all signatures as a vector
+    #[allow(dead_code)]
     pub fn list_signatures(&self) -> Vec<SignatureEntry> {
         self.signatures.values().cloned().collect()
     }
 
     /// Search for signatures by malware name (case-insensitive partial match)
+    #[allow(dead_code)]
     pub fn search_by_name(&self, query: &str) -> Vec<SignatureEntry> {
         let query_lower = query.to_lowercase();
         
@@ -473,6 +484,7 @@ impl SignatureDatabase {
     }
     
     /// Search signatures by family
+    #[allow(dead_code)]
     pub fn search_by_family(&self, family: &str) -> Vec<SignatureEntry> {
         self.family_index
             .get(family)

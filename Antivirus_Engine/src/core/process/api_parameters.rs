@@ -9,6 +9,13 @@
 // This module is intentionally self-contained — it carries its own `ApiCall`
 // and `ApiParam` types so that `ApiFeatureExtractor` can import from here
 // without creating a circular dependency.
+//
+// NOTE: This module and `API_feature_extractor` are infrastructure for a live
+// ETW (Event Tracing for Windows) API-call consumer.  They are fully
+// implemented but require an ETW provider to feed `ApiCall` events at runtime —
+// a component not yet integrated into the daemon.  Until that integration
+// lands, suppress dead-code warnings for the entire module.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 

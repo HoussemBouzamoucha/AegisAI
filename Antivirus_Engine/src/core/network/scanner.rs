@@ -188,6 +188,7 @@ impl NetworkScanner {
     }
 
     /// Convenience wrapper — returns the connection list only (discards stats).
+    #[allow(dead_code)]
     pub fn scan_all_connections(&self) -> Result<Vec<NetworkConnection>> {
         let (connections, _) = self.scan()?;
         Ok(connections)

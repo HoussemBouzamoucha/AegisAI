@@ -26,11 +26,16 @@ pub struct GraphBuilder<'a> {
 }
 
 impl<'a> GraphBuilder<'a> {
+    /// Create a legacy flat-graph builder.
+    /// Prefer `build_from_aggregated()` for the current entity model.
+    #[allow(dead_code)]
     pub fn new(manager: &'a EntityManager) -> Self {
         Self { manager }
     }
 
     /// Build a ThreatGraph from all entities currently in the EntityManager window.
+    /// This is the legacy flat path — use `build_from_aggregated()` in new code.
+    #[allow(dead_code)]
     pub fn build(&self) -> ThreatGraph {
         let nodes = self.manager.get_all();
         let mut graph = ThreatGraph::new();

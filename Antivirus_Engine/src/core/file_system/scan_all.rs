@@ -425,6 +425,7 @@ pub struct ScanAllResult {
     /// Number of files served from the incremental cache (no re-scan needed).
     pub cached_hits: usize,
     /// When this scan was started.
+    #[allow(dead_code)]
     pub scan_time: SystemTime,
 }
 
@@ -657,6 +658,11 @@ impl SystemScanner {
 
     pub fn clear_cache(&self) {
         self.cache.lock().unwrap().clear();
+    }
+
+    /// Number of entries currently held in the incremental scan cache.
+    pub fn cache_size(&self) -> usize {
+        self.cache.lock().unwrap().len()
     }
 
     /// Flush the in-memory cache to disk so the next session starts warm.
@@ -1198,6 +1204,9 @@ pub struct ScanScheduler {
 }
 
 impl ScanScheduler {
+    /// Convenience constructor with default 6-hour interval.
+    /// Prefer `ScanScheduler::builder()` for configurable setups.
+    #[allow(dead_code)]
     pub fn new(scanner: SystemScanner) -> Self {
         Self::with_options(
             Arc::new(scanner),

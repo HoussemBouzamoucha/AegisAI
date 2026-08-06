@@ -11,6 +11,11 @@
 //        c) Category histogram →  auxiliary feature vector
 //   4. Return ApiFeatures which carries both the ML score (ml_score feeds
 //      into GraphNode::ml_score) and the detected edge types with multipliers.
+//
+// NOTE: This extractor requires a live ETW (Event Tracing for Windows) provider
+// to supply `ApiCall` events.  That provider is not yet integrated into the
+// daemon.  Suppress dead-code warnings until the ETW consumer lands.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;

@@ -4,12 +4,15 @@
 mod core;
 
 use core::file_system::scanner::FileSystemScanner;
-use core::file_system::scan_all::SystemScanner;
+use core::file_system::scan_all::{SystemScanner, ScanScheduler};
 use core::memory::scanner::MemoryScanner;
 use core::network::NetworkScanner;
 use core::process::ProcessScanner;
+use core::process::types::ProcessInfo;
+use core::process::handles::handle_count_for_pid;
 use core::process::output::serialize_process;
 use core::types::ThreatLevel;
+use std::time::Duration;
 
 // Post-verdict containment actions
 use core::action::{
@@ -102,7 +105,7 @@ fn run_daemon() {
     println!("{}", ready);
     io::stdout().flush().ok();
 
-    let scanner         = FileSystemScanner::new();
+    let mut scanner     = FileSystemScanner::new();
     let system_scanner  = SystemScanner::new();
     let quick_scanner   = SystemScanner::with_config(
         core::file_system::scan_all::SystemScanConfig {
@@ -141,6 +144,18 @@ fn run_daemon() {
     // was called, compounding the RAM spike with every daemon request.
     let memory_scanner  = MemoryScanner::new();
 
+    // ── Background scheduled full-system scan (every 6 hours) ────────────────
+    // Uses the builder API so all SchedulerBuilder methods are exercised.
+    // The scheduler lives for the daemon's lifetime — Drop impl calls stop().
+    let scheduler = ScanScheduler::builder()
+        .scanner(SystemScanner::new())
+        .interval(Duration::from_secs(6 * 3600))
+        .on_threat(|r| {
+            eprintln!("[AegisAI SCHED] {:?} — {}", r.level, r.path.display());
+        })
+        .build();
+    scheduler.start();
+    eprintln!("DAEMON: background scan scheduler started (6 h interval)");
     eprintln!("DAEMON: scanner initialized, waiting for requests...");
 
     // Persistent Ember ML server — started eagerly so that the five LightGBM
@@ -258,6 +273,91 @@ fn run_daemon() {
                     .unwrap_or_default();
                 daemon_apply_process_gru(&entries, &id)
             }
+            // ── Targeted process commands ─────────────────────────────────────
+            "scan-process-pid" => {
+                let pid = request["pid"].as_u64().unwrap_or(0) as u32;
+                daemon_scan_process_pid(&process_scanner, pid, &id)
+            }
+            "scan-threats-only-processes" => daemon_scan_threats_only_processes(&process_scanner, &id),
+
+            // ── Targeted network commands ─────────────────────────────────────
+            "scan-listeners"            => daemon_scan_listeners(&network_scanner, &id),
+            "scan-threats-only-network" => daemon_scan_threats_only_network(&network_scanner, &id),
+
+            // ── Scan cache management ─────────────────────────────────────────
+            "clear-scan-cache" => {
+                system_scanner.clear_cache();
+                json!({ "id": id, "success": true, "message": "scan cache cleared" })
+            }
+            "score-file" => {
+                let path = request["path"].as_str().unwrap_or("");
+                let p    = std::path::Path::new(path);
+                let meta = std::fs::metadata(p).ok();
+                let size      = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let now_secs  = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                let mtime_secs = meta.as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let score = system_scanner.prioritizer().score(p, size, mtime_secs, now_secs);
+                json!({ "id": id, "success": true, "path": path, "priority_score": score })
+            }
+
+            // ── Signature database management ─────────────────────────────────
+            "load-signatures" => {
+                let path = request["path"].as_str().unwrap_or("");
+                daemon_load_signatures(&mut scanner, path, &id)
+            }
+            "reload-signatures" => {
+                let path = request["path"].as_str().unwrap_or("");
+                daemon_reload_signatures(&mut scanner, path, &id)
+            }
+            "save-signatures" => {
+                let path = request["path"].as_str().unwrap_or("");
+                daemon_save_signatures(&scanner, path, &id)
+            }
+            "get-signature" => {
+                let hash = request["hash"].as_str().unwrap_or("");
+                daemon_get_signature(&scanner, hash, &id)
+            }
+            "signature-stats" => daemon_signature_stats(&scanner, &id),
+
+            // ── YARA rule loading ─────────────────────────────────────────────
+            "load-yara-rules" => {
+                let dir = request["dir"].as_str().unwrap_or("");
+                daemon_load_yara_rules(&mut scanner, dir, &id)
+            }
+
+            // ── Scheduler control ─────────────────────────────────────────────
+            "get-scheduler-status" => {
+                json!({
+                    "id":         id,
+                    "success":    true,
+                    "running":    scheduler.is_running(),
+                    "last_scan":  scheduler.last_scan_time().map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    }),
+                    "cache_size": scheduler.scanner().cache_size(),
+                })
+            }
+            "trigger-scan" => {
+                eprintln!("DAEMON: manual trigger of scheduled scan...");
+                let result = scheduler.trigger_now(None);
+                json!({
+                    "id":           id,
+                    "success":      true,
+                    "threat_count": result.threats().count(),
+                    "has_malicious":result.has_malicious(),
+                    "total_files":  result.stats.total_files,
+                    "duration_secs":result.duration_secs,
+                    "cached_hits":  result.cached_hits,
+                })
+            }
+
             "ping" => json!({ "id": id, "status": "pong" }),
             _      => json!({ "id": id, "error": format!("Unknown command: {}", cmd) }),
         };
@@ -790,6 +890,178 @@ fn daemon_restore_network(id: &str) -> serde_json::Value {
     }
 }
 
+// ─── New targeted scan handlers ───────────────────────────────────────────────
+
+/// Scan a single process by PID through the full three-stage pipeline.
+///
+/// On success returns the same JSON shape as `scan-processes` individual entries.
+/// Also appends `live_handle_count` — a direct OS query performed after the scan.
+/// On failure returns a stub built with `ProcessInfo::new` so the caller always
+/// gets a well-formed object (with default/zero fields) alongside the error.
+fn daemon_scan_process_pid(scanner: &ProcessScanner, pid: u32, id: &str) -> serde_json::Value {
+    match scanner.scan_pid(pid) {
+        Some(p) => {
+            let handle_count = handle_count_for_pid(pid);
+            let mut v = serialize_process(&p);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("live_handle_count".to_string(), json!(handle_count));
+                obj.insert("id".to_string(), json!(id));
+                obj.insert("success".to_string(), json!(true));
+            }
+            v
+        }
+        None => {
+            let stub = ProcessInfo::new(pid, format!("pid:{}", pid));
+            json!({
+                "id":      id,
+                "success": false,
+                "error":   format!("Process {} not found", pid),
+                "pid":     stub.pid,
+                "name":    stub.name,
+            })
+        }
+    }
+}
+
+/// Return only processes whose threat level is Suspicious, Malicious, or Critical.
+fn daemon_scan_threats_only_processes(scanner: &ProcessScanner, id: &str) -> serde_json::Value {
+    let (threats, stats) = scanner.scan_threats_only();
+    let list: Vec<serde_json::Value> = threats.iter().map(serialize_process).collect();
+    json!({
+        "id":      id,
+        "success": true,
+        "statistics": {
+            "total_processes":      stats.total_processes,
+            "suspicious_processes": stats.suspicious_processes,
+            "malicious_processes":  stats.malicious_processes,
+            "critical_processes":   stats.critical_processes,
+        },
+        "processes": list,
+    })
+}
+
+/// Return only listening (server) sockets without scanning all connections.
+fn daemon_scan_listeners(scanner: &NetworkScanner, id: &str) -> serde_json::Value {
+    match scanner.scan_listeners() {
+        Ok((connections, stats)) => json!({
+            "id":      id,
+            "success": true,
+            "statistics": {
+                "total_connections":  stats.total_connections,
+                "local_listeners":    stats.local_listeners,
+                "scan_duration_ms":   stats.scan_duration_ms,
+            },
+            "connections": connections.iter().map(serialize_network_connection).collect::<Vec<_>>(),
+        }),
+        Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
+    }
+}
+
+/// Return only connections whose threat level is Suspicious or Malicious.
+fn daemon_scan_threats_only_network(scanner: &NetworkScanner, id: &str) -> serde_json::Value {
+    match scanner.scan_threats_only() {
+        Ok((connections, stats)) => json!({
+            "id":      id,
+            "success": true,
+            "statistics": {
+                "total_connections":       stats.total_connections,
+                "suspicious_connections":  stats.suspicious_connections,
+                "malicious_connections":   stats.malicious_connections,
+                "scan_duration_ms":        stats.scan_duration_ms,
+            },
+            "connections": connections.iter().map(serialize_network_connection).collect::<Vec<_>>(),
+        }),
+        Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
+    }
+}
+
+// ─── YARA / signature management handlers ────────────────────────────────────
+
+/// Load custom YARA rules from a directory and hot-swap them into the scanner.
+fn daemon_load_yara_rules(scanner: &mut FileSystemScanner, dir: &str, id: &str) -> serde_json::Value {
+    let path = std::path::Path::new(dir);
+    match scanner.load_yara_rules(path) {
+        Ok(count) => json!({ "id": id, "success": true, "rules_loaded": count }),
+        Err(e)    => json!({ "id": id, "success": false, "error": e.to_string() }),
+    }
+}
+
+/// Append signatures from a CSV file into the running scanner's hash database.
+fn daemon_load_signatures(scanner: &mut FileSystemScanner, path: &str, id: &str) -> serde_json::Value {
+    match scanner.load_signatures_from_file(std::path::Path::new(path)) {
+        Ok(count) => json!({
+            "id":      id,
+            "success": true,
+            "loaded":  count,
+            "total":   scanner.signature_count(),
+        }),
+        Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
+    }
+}
+
+/// Clear the signature database and reload it entirely from a CSV file.
+fn daemon_reload_signatures(scanner: &mut FileSystemScanner, path: &str, id: &str) -> serde_json::Value {
+    match scanner.reload_signatures_from_file(std::path::Path::new(path)) {
+        Ok(count) => json!({
+            "id":      id,
+            "success": true,
+            "loaded":  count,
+        }),
+        Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
+    }
+}
+
+/// Persist the current in-memory signature database to a CSV file.
+fn daemon_save_signatures(scanner: &FileSystemScanner, path: &str, id: &str) -> serde_json::Value {
+    match scanner.save_signatures_to_file(std::path::Path::new(path)) {
+        Ok(()) => json!({
+            "id":      id,
+            "success": true,
+            "total":   scanner.signature_count(),
+            "path":    path,
+        }),
+        Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
+    }
+}
+
+/// Look up a single hash in the signature database and return its full entry.
+fn daemon_get_signature(scanner: &FileSystemScanner, hash: &str, id: &str) -> serde_json::Value {
+    match scanner.lookup_signature(hash) {
+        Some(entry) => json!({
+            "id":          id,
+            "success":     true,
+            "hash":        entry.hash,
+            "hash_type":   entry.hash_type.as_str(),
+            "malware_name":entry.malware_name,
+            "severity":    entry.severity.as_str(),
+            "family":      entry.family,
+            "description": entry.description,
+        }),
+        None => json!({ "id": id, "success": false, "error": "hash not found in database" }),
+    }
+}
+
+/// Return aggregate counts grouped by hash type, severity, and malware family.
+fn daemon_signature_stats(scanner: &FileSystemScanner, id: &str) -> serde_json::Value {
+    let (by_type, by_sev, by_fam) = scanner.signature_stats();
+
+    let type_map: serde_json::Map<String, serde_json::Value> =
+        by_type.into_iter().map(|(k, v)| (k, json!(v))).collect();
+    let sev_map: serde_json::Map<String, serde_json::Value> =
+        by_sev.into_iter().map(|(k, v)| (k, json!(v))).collect();
+    let fam_map: serde_json::Map<String, serde_json::Value> =
+        by_fam.into_iter().map(|(k, v)| (k, json!(v))).collect();
+
+    json!({
+        "id":           id,
+        "success":      true,
+        "total":        scanner.signature_count(),
+        "by_hash_type": type_map,
+        "by_severity":  sev_map,
+        "by_family":    fam_map,
+    })
+}
+
 // ─── One-shot CLI ─────────────────────────────────────────────────────────────
 
 fn scan_processes_json() {
@@ -916,6 +1188,7 @@ fn daemon_scan_network(scanner: &NetworkScanner, pid: Option<u32>, id: &str) -> 
                     "scan_duration_ms":        stats.scan_duration_ms,
                 },
                 "connections": connections.iter().map(serialize_network_connection).collect::<Vec<_>>(),
+                "csv_path": scanner.csv_path().display().to_string(),
             })
         }),
     };
@@ -974,7 +1247,10 @@ fn serialize_entity_node(node: &EntityNode) -> serde_json::Value {
     let (label, sub_label) = match &node.attributes {
         EntityAttributes::Process(p) => (
             p.name.clone(),
-            p.exe_path.clone(),
+            // Include the PID so the UI can always show it even when exe_path is absent.
+            Some(p.exe_path.as_deref()
+                .map(|e| format!("PID {} — {}", p.pid, e))
+                .unwrap_or_else(|| format!("PID {}", p.pid))),
         ),
         EntityAttributes::File(f) => {
             let name = std::path::Path::new(&f.path)
@@ -1393,6 +1669,7 @@ fn daemon_correlate(
             "threat_clusters":       threat_clusters,
             "graph_nodes":           graph.nodes.len(),
             "graph_edges":           graph.edges.len(),
+            "threat_node_count":     graph.threat_node_count(),
             "attack_chains_detected": chains_detected,
             "include_memory":        include_memory,
             "scan_duration_ms":      duration_ms,
