@@ -5,6 +5,7 @@ mod core;
 
 use core::file_system::scanner::FileSystemScanner;
 use core::file_system::scan_all::{SystemScanner, ScanScheduler};
+use core::file_system::realtime::RealTimeWatcher;
 use core::memory::scanner::MemoryScanner;
 use core::network::NetworkScanner;
 use core::process::ProcessScanner;
@@ -157,6 +158,9 @@ fn run_daemon() {
     scheduler.start();
     eprintln!("DAEMON: background scan scheduler started (6 h interval)");
     eprintln!("DAEMON: scanner initialized, waiting for requests...");
+
+    // Real-time file watcher — created on first "start-realtime" command.
+    let mut rt_watcher: Option<RealTimeWatcher> = None;
 
     // Persistent Ember ML server — started eagerly so that the five LightGBM
     // models are loaded in the background while the daemon is otherwise idle.
@@ -355,6 +359,78 @@ fn run_daemon() {
                     "total_files":  result.stats.total_files,
                     "duration_secs":result.duration_secs,
                     "cached_hits":  result.cached_hits,
+                })
+            }
+
+            // ── Real-time file watcher ────────────────────────────────────
+            "start-realtime" => {
+                if rt_watcher.as_ref().map(|w| w.is_running()).unwrap_or(false) {
+                    json!({ "id": id, "success": true, "already_running": true })
+                } else {
+                    let dirs: Vec<std::path::PathBuf> = request["dirs"]
+                        .as_array()
+                        .map(|arr| arr.iter()
+                            .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                            .collect())
+                        .unwrap_or_else(|| {
+                            // Default: watch common write-heavy locations.
+                            vec![
+                                std::path::PathBuf::from(
+                                    std::env::var("USERPROFILE").unwrap_or_default()
+                                ).join("Downloads"),
+                                std::path::PathBuf::from(
+                                    std::env::var("TEMP").unwrap_or_default()
+                                ),
+                            ]
+                        });
+                    let auto_q = request["auto_quarantine"].as_bool().unwrap_or(false);
+                    let mut watcher = RealTimeWatcher::new(auto_q);
+                    match watcher.start(dirs.clone()) {
+                        Ok(()) => {
+                            let dir_strs: Vec<String> = dirs.iter()
+                                .map(|d| d.display().to_string())
+                                .collect();
+                            rt_watcher = Some(watcher);
+                            json!({
+                                "id":       id,
+                                "success":  true,
+                                "watching": dir_strs,
+                                "auto_quarantine": auto_q,
+                            })
+                        }
+                        Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
+                    }
+                }
+            }
+            "stop-realtime" => {
+                if let Some(w) = rt_watcher.take() {
+                    drop(w); // Drop triggers RealTimeWatcher::stop()
+                    json!({ "id": id, "success": true, "was_running": true })
+                } else {
+                    json!({ "id": id, "success": true, "was_running": false })
+                }
+            }
+            "realtime-status" => {
+                let running  = rt_watcher.as_ref().map(|w| w.is_running()).unwrap_or(false);
+                let dirs: Vec<String> = rt_watcher.as_ref()
+                    .map(|w| w.watched_dirs().iter().map(|d| d.display().to_string()).collect())
+                    .unwrap_or_default();
+                let threats: Vec<serde_json::Value> = rt_watcher.as_ref()
+                    .map(|w| w.drain_threats().into_iter().map(|e| json!({
+                        "path":           e.path.display().to_string(),
+                        "level":          e.level.as_str(),
+                        "reason":         e.reason,
+                        "hash":           e.hash,
+                        "timestamp_secs": e.timestamp_secs,
+                        "quarantined":    e.quarantined,
+                    })).collect())
+                    .unwrap_or_default();
+                json!({
+                    "id":           id,
+                    "success":      true,
+                    "running":      running,
+                    "watched_dirs": dirs,
+                    "threats":      threats,
                 })
             }
 

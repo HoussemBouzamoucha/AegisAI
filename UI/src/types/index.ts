@@ -8,6 +8,21 @@ export type ThreatLevel = 'Clean' | 'Suspicious' | 'Malicious';
 export type ProcessThreat = 'Safe' | 'Suspicious' | 'Malicious' | 'Critical';
 export type View = 'dashboard' | 'scanner' | 'processes' | 'network' | 'memory' | 'history' | 'entities' | 'graph' | 'verdict' | 'quarantine' | 'settings';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Real-Time File Protection
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A threat event detected by the real-time file watcher. */
+export interface RealTimeThreat {
+  path:           string;
+  level:          ThreatLevel;
+  reason:         string;
+  hash:           string | null;
+  timestamp_secs: number;
+  /** True when the file was automatically quarantined by the daemon. */
+  quarantined:    boolean;
+}
+
 export interface AutoAllowedActions {
   quarantine_file: boolean;
   block_ip:        boolean;

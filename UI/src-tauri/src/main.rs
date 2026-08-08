@@ -711,6 +711,69 @@ async fn isolate_network(
     Ok(json)
 }
 
+// ─── Real-Time File Protection ────────────────────────────────────────────────
+
+/// Start the real-time file watcher.
+///
+/// `dirs` — list of directory paths to watch (UTF-8 strings).
+///         Defaults to `%USERPROFILE%\Downloads` and `%TEMP%` when omitted.
+/// `auto_quarantine` — if true, Malicious files are auto-quarantined on detection.
+///
+/// Returns `{ success, watching: [...paths] }`.
+#[tauri::command]
+async fn start_realtime_watcher(
+    dirs:            Option<Vec<String>>,
+    auto_quarantine: Option<bool>,
+    state:           tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let mut req = serde_json::json!({
+        "id":  next_id(),
+        "cmd": "start-realtime",
+        "auto_quarantine": auto_quarantine.unwrap_or(false),
+    });
+    if let Some(d) = dirs {
+        req["dirs"] = serde_json::Value::Array(
+            d.into_iter().map(serde_json::Value::String).collect(),
+        );
+    }
+    let json = daemon_request(&state, req, Duration::from_secs(10))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
+/// Stop the real-time file watcher.
+///
+/// Returns `{ success, was_running }`.
+#[tauri::command]
+async fn stop_realtime_watcher(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id":  next_id(),
+        "cmd": "stop-realtime",
+    });
+    let json = daemon_request(&state, request, Duration::from_secs(10))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
+/// Poll the real-time watcher status and drain any pending threat events.
+///
+/// Returns `{ running, watched_dirs, threats: [...] }`.
+/// Call this every 2 s from the UI while the watcher is enabled.
+#[tauri::command]
+async fn get_realtime_status(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "id":  next_id(),
+        "cmd": "realtime-status",
+    });
+    let json = daemon_request(&state, request, Duration::from_secs(5))?;
+    if let Some(err) = json["error"].as_str() { return Err(err.to_string()); }
+    Ok(json)
+}
+
 /// Re-enable all network interfaces that were disabled by `isolate_network`.
 #[tauri::command]
 async fn restore_network(
@@ -1331,6 +1394,10 @@ fn main() {
             list_quarantine,
             restore_quarantine_file,
             delete_quarantine_file,
+            // ── Real-time file protection ─────────────────────────────────
+            start_realtime_watcher,
+            stop_realtime_watcher,
+            get_realtime_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

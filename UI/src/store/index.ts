@@ -8,7 +8,7 @@ import type {
   NetworkConnection, NetworkStats, NetworkScanResult,
   MemoryRegion, MemoryStats, MemoryScanResult as MemoryScanResultType,
   MlIdsResult, CorrelateResult, AgentVerdict, ExecutedAction,
-  AutoExecutedAction, AutoAllowedActions,
+  AutoExecutedAction, AutoAllowedActions, RealTimeThreat,
 } from '../types';
 
 // ─── Steganography scan result ───────────────────────────────────────────────

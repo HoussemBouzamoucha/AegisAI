@@ -54,7 +54,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Memory",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",           # required by MiniDumpWriteDump gate
-    "Win32_Storage_FileSystem",      # required by MiniDumpWriteDump gate
+    "Win32_Storage_FileSystem",      # required by MiniDumpWriteDump gate + realtime watcher
+    "Win32_System_IO",               # OVERLAPPED, GetOverlappedResult (realtime watcher)
     "Wdk_Foundation",
     "Wdk_System_SystemInformation",
     "Wdk_System_SystemServices",
