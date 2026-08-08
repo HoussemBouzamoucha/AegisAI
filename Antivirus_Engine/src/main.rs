@@ -374,14 +374,18 @@ fn run_daemon() {
                             .collect())
                         .unwrap_or_else(|| {
                             // Default: watch common write-heavy locations.
-                            vec![
+                            let mut dirs = vec![
                                 std::path::PathBuf::from(
                                     std::env::var("USERPROFILE").unwrap_or_default()
                                 ).join("Downloads"),
                                 std::path::PathBuf::from(
                                     std::env::var("TEMP").unwrap_or_default()
                                 ),
-                            ]
+                            ];
+                            // Test/dev directory — Defender-excluded safe drop zone.
+                            let test_dir = std::path::PathBuf::from(r"C:\TestAV");
+                            if test_dir.is_dir() { dirs.push(test_dir); }
+                            dirs
                         });
                     let auto_q = request["auto_quarantine"].as_bool().unwrap_or(false);
                     let mut watcher = RealTimeWatcher::new(auto_q);

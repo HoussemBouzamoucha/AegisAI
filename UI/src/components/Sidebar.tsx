@@ -1,4 +1,4 @@
-import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi, Activity, Share2, Layers, FileText, Archive, WifiOff, Zap, Settings } from 'lucide-react';
+import { LayoutDashboard, FolderSearch, Cpu, ClockIcon, Wifi, Activity, Share2, Layers, FileText, Archive, WifiOff, Zap, Settings, Eye } from 'lucide-react';
 import { useStore } from '../store';
 import type { View } from '../types';
 
@@ -23,6 +23,7 @@ export default function Sidebar() {
     scanning, processScanning, networkScanning, memoryScanning,
     networkIsolated, networkIsolating, restoreNetworkAction,
     autonomousMode, autoRunning, autoActionLog,
+    realtimeRunning, realtimeThreats,
   } = useStore();
 
   return (
@@ -145,6 +146,49 @@ export default function Sidebar() {
           </button>
         </div>
       )}
+
+      {/* Real-time watcher status / threat count */}
+      <button
+        onClick={() => setView('settings')}
+        style={{
+          margin: '0 12px 8px', padding: '8px 12px',
+          background: realtimeThreats.length > 0
+            ? 'rgba(255,136,0,0.07)'
+            : realtimeRunning
+              ? 'rgba(0,255,255,0.05)'
+              : 'var(--elevated)',
+          border: `1px solid ${realtimeThreats.length > 0
+            ? 'rgba(255,136,0,0.35)'
+            : realtimeRunning
+              ? 'rgba(0,255,255,0.25)'
+              : 'var(--border)'}`,
+          borderRadius: 6, cursor: 'pointer', textAlign: 'left', width: 'calc(100% - 24px)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+          <Eye size={10} color={realtimeRunning ? 'var(--cyan)' : 'var(--text-dim)'} />
+          <span style={{
+            fontFamily: 'var(--font-hud)', fontSize: 9, letterSpacing: '0.1em',
+            color: realtimeRunning ? 'var(--cyan)' : 'var(--text-dim)', flex: 1,
+          }}>
+            REALTIME
+          </span>
+          <span style={{
+            fontFamily: 'var(--font-mono)', fontSize: 8,
+            color: realtimeRunning ? 'var(--cyan)' : 'var(--text-dim)',
+          }}>
+            {realtimeRunning ? 'ON' : 'OFF'}
+          </span>
+        </div>
+        {realtimeThreats.length > 0 && (
+          <div style={{
+            fontFamily: 'var(--font-mono)', fontSize: 8,
+            color: 'var(--amber)', marginTop: 3,
+          }}>
+            ⚠ {realtimeThreats.length} threat{realtimeThreats.length !== 1 ? 's' : ''} caught
+          </div>
+        )}
+      </button>
 
       {/* Autonomous mode status pill — click to open Settings */}
       <button

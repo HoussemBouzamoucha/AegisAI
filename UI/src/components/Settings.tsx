@@ -1,4 +1,5 @@
-import { Zap, Brain, ScanLine, Shield } from 'lucide-react';
+import { useState } from 'react';
+import { Zap, Brain, ScanLine, Shield, Eye, ChevronDown, ChevronUp } from 'lucide-react';
 import { useStore } from '../store';
 import type { AutoAllowedActions } from '../types';
 
@@ -173,7 +174,11 @@ export default function Settings() {
     autonomousMode, setAutonomousMode,
     autoAllowedActions, setAutoAllowedActions,
     emberMlEnabled, setEmberMlEnabled,
+    realtimeRunning, realtimeThreats, realtimeError,
+    startRealtime, stopRealtime,
   } = useStore();
+
+  const [expandedThreat, setExpandedThreat] = useState<number | null>(null);
 
   function toggleAction(key: keyof AutoAllowedActions) {
     setAutoAllowedActions({ ...autoAllowedActions, [key]: !autoAllowedActions[key] });
@@ -243,6 +248,201 @@ export default function Settings() {
 
               <InfoBox>
                 Kill process and network isolation always require manual confirmation and are never executed automatically.
+              </InfoBox>
+            </Card>
+
+            {/* Real-Time Protection */}
+            <Card icon={<Eye size={14} />} title="REAL-TIME PROTECTION" accentColor="var(--cyan)">
+              <SettingRow
+                label="On-Access File Watcher"
+                description="Watches Downloads, Desktop, Temp, and AppData for new or modified files. Each file is scanned through the full pipeline; Malicious files are auto-quarantined."
+              >
+                <Toggle
+                  checked={realtimeRunning}
+                  onChange={v => v ? startRealtime() : stopRealtime()}
+                />
+              </SettingRow>
+
+              {realtimeError && (
+                <div style={{
+                  fontFamily: 'var(--font-mono)', fontSize: 10,
+                  color: 'var(--red)', lineHeight: 1.5,
+                }}>
+                  {realtimeError}
+                </div>
+              )}
+
+              {realtimeThreats.length > 0 && (
+                <>
+                  <Divider />
+                  <SectionLabel>
+                    SESSION THREATS — {realtimeThreats.length} CAUGHT
+                  </SectionLabel>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {realtimeThreats.map((threat, i) => {
+                      const isMalicious = threat.level === 'Malicious';
+                      const accentColor = isMalicious ? 'var(--red)' : 'var(--amber)';
+                      const accentRgb   = isMalicious ? '255,51,85' : '255,136,0';
+                      const filename    = threat.path.split(/[\\/]/).pop() ?? threat.path;
+                      const ts          = new Date(threat.timestamp_secs * 1000).toLocaleTimeString();
+                      const isOpen      = expandedThreat === i;
+
+                      return (
+                        <div key={i} style={{
+                          border: `1px solid rgba(${accentRgb},${isOpen ? '0.35' : '0.2'})`,
+                          borderLeft: `3px solid ${accentColor}`,
+                          borderRadius: 6,
+                          overflow: 'hidden',
+                          background: isOpen ? `rgba(${accentRgb},0.04)` : 'transparent',
+                          transition: 'background 0.15s',
+                        }}>
+                          {/* Row header — always visible */}
+                          <button
+                            onClick={() => setExpandedThreat(isOpen ? null : i)}
+                            style={{
+                              width: '100%', display: 'flex', alignItems: 'center', gap: 8,
+                              padding: '8px 10px',
+                              background: 'none', border: 'none', cursor: 'pointer',
+                              textAlign: 'left',
+                            }}
+                          >
+                            {/* Level dot */}
+                            <div style={{
+                              width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
+                              background: accentColor,
+                              boxShadow: `0 0 5px ${accentColor}`,
+                            }} />
+
+                            {/* Filename */}
+                            <span style={{
+                              fontFamily: 'var(--font-mono)', fontSize: 11,
+                              color: 'var(--text-bright)', flex: 1,
+                              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                            }}>
+                              {filename}
+                            </span>
+
+                            {/* Level badge */}
+                            <span style={{
+                              fontFamily: 'var(--font-mono)', fontSize: 8,
+                              color: accentColor,
+                              background: `rgba(${accentRgb},0.1)`,
+                              border: `1px solid rgba(${accentRgb},0.3)`,
+                              borderRadius: 3, padding: '1px 5px', flexShrink: 0,
+                            }}>
+                              {threat.level.toUpperCase()}
+                            </span>
+
+                            {/* Time */}
+                            <span style={{
+                              fontFamily: 'var(--font-mono)', fontSize: 9,
+                              color: 'var(--text-dim)', flexShrink: 0,
+                            }}>
+                              {ts}
+                            </span>
+
+                            {/* Chevron */}
+                            <span style={{ color: 'var(--text-dim)', flexShrink: 0 }}>
+                              {isOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                            </span>
+                          </button>
+
+                          {/* Expanded detail panel */}
+                          {isOpen && (
+                            <div style={{
+                              padding: '0 10px 10px 24px',
+                              display: 'flex', flexDirection: 'column', gap: 8,
+                              borderTop: `1px solid rgba(${accentRgb},0.15)`,
+                              paddingTop: 10,
+                            }}>
+                              {/* Reason */}
+                              <div>
+                                <div style={{
+                                  fontFamily: 'var(--font-hud)', fontSize: 8,
+                                  letterSpacing: '0.12em', color: 'var(--text-dim)',
+                                  marginBottom: 3,
+                                }}>
+                                  DETECTION REASON
+                                </div>
+                                <div style={{
+                                  fontFamily: 'var(--font-body)', fontSize: 12,
+                                  color: 'var(--text)', lineHeight: 1.6,
+                                }}>
+                                  {threat.reason || '—'}
+                                </div>
+                              </div>
+
+                              {/* Full path */}
+                              <div>
+                                <div style={{
+                                  fontFamily: 'var(--font-hud)', fontSize: 8,
+                                  letterSpacing: '0.12em', color: 'var(--text-dim)',
+                                  marginBottom: 3,
+                                }}>
+                                  FULL PATH
+                                </div>
+                                <div style={{
+                                  fontFamily: 'var(--font-mono)', fontSize: 10,
+                                  color: 'var(--text)', wordBreak: 'break-all', lineHeight: 1.5,
+                                }}>
+                                  {threat.path}
+                                </div>
+                              </div>
+
+                              {/* Hash */}
+                              {threat.hash && (
+                                <div>
+                                  <div style={{
+                                    fontFamily: 'var(--font-hud)', fontSize: 8,
+                                    letterSpacing: '0.12em', color: 'var(--text-dim)',
+                                    marginBottom: 3,
+                                  }}>
+                                    SHA-256
+                                  </div>
+                                  <div style={{
+                                    fontFamily: 'var(--font-mono)', fontSize: 9,
+                                    color: 'var(--text)', wordBreak: 'break-all',
+                                  }}>
+                                    {threat.hash}
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Quarantine status */}
+                              <div style={{ display: 'flex', gap: 6 }}>
+                                {threat.quarantined && (
+                                  <span style={{
+                                    fontFamily: 'var(--font-mono)', fontSize: 8,
+                                    color: 'var(--green)',
+                                    background: 'rgba(0,255,136,0.08)',
+                                    border: '1px solid rgba(0,255,136,0.25)',
+                                    borderRadius: 3, padding: '2px 7px',
+                                  }}>
+                                    ✓ AUTO-QUARANTINED
+                                  </span>
+                                )}
+                                <span style={{
+                                  fontFamily: 'var(--font-mono)', fontSize: 8,
+                                  color: 'var(--text-dim)',
+                                  background: 'var(--elevated)',
+                                  border: '1px solid var(--border)',
+                                  borderRadius: 3, padding: '2px 7px',
+                                }}>
+                                  {new Date(threat.timestamp_secs * 1000).toLocaleString()}
+                                </span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+
+              <InfoBox>
+                Race window: ~milliseconds between file write and scan (userspace). For zero-gap protection a kernel minifilter driver would be required.
               </InfoBox>
             </Card>
 
@@ -320,6 +520,7 @@ export default function Settings() {
                 <StatusDot ok label="Network IDS (XGBoost)" value="active" />
                 <StatusDot ok label="Process GRU"           value="active" />
                 <StatusDot ok label="Memory Scanner"        value="active" />
+                <StatusDot ok={realtimeRunning} label="Real-Time Watcher" value={realtimeRunning ? 'active' : 'off'} />
                 <StatusDot ok label="AI Agent"              value="connected" />
               </div>
             </Card>

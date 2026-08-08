@@ -142,6 +142,14 @@ interface AppState {
   runAgentReassessment: () => Promise<void>;
   resetInvestigation:   () => void;
 
+  // ── Real-time file protection ──────────────────────────────────────────────
+  realtimeRunning:   boolean;
+  realtimeThreats:   RealTimeThreat[];
+  realtimeError:     string | null;
+  startRealtime:     (dirs?: string[]) => Promise<void>;
+  stopRealtime:      () => Promise<void>;
+  addRealtimeThreat: (threat: RealTimeThreat) => void;
+
   // ── Network isolation ──────────────────────────────────────────────────────
   networkIsolated:      boolean;
   networkIsolating:     boolean;
@@ -906,6 +914,35 @@ export const useStore = create<AppState>((set, get) => ({
 
     set({ autoRunning: false });
   },
+
+  // ── Real-time file protection ──────────────────────────────────────────────
+  realtimeRunning:   false,
+  realtimeThreats:   [],
+  realtimeError:     null,
+
+  startRealtime: async (dirs) => {
+    set({ realtimeError: null });
+    try {
+      const args: Record<string, unknown> = {};
+      if (dirs) args.dirs = dirs;
+      await invoke('start_realtime_watcher', args);
+      set({ realtimeRunning: true });
+    } catch (e: any) {
+      set({ realtimeError: String(e) });
+    }
+  },
+
+  stopRealtime: async () => {
+    try {
+      await invoke('stop_realtime_watcher');
+      set({ realtimeRunning: false });
+    } catch (e: any) {
+      set({ realtimeError: String(e) });
+    }
+  },
+
+  addRealtimeThreat: (threat) =>
+    set(s => ({ realtimeThreats: [threat, ...s.realtimeThreats].slice(0, 100) })),
 
   // ── Network isolation ──────────────────────────────────────────────────────
   networkIsolated:     false,
