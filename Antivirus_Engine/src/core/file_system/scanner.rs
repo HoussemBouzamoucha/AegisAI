@@ -599,6 +599,11 @@ pub struct FileSystemScanner {
     /// Saves one full file read per file.  Intended for quick scans where the
     /// hash DB is unlikely to match and per-file I/O is the bottleneck.
     enable_hash_db: bool,
+    /// When `true`, skip the `run_ember_ml` subprocess call inside `scan_file()`.
+    /// Set this when the daemon owns a persistent `EmberServer` — the daemon
+    /// applies Ember results separately via `analyze_batch` so there is no need
+    /// for the scanner to also spawn a one-shot Python subprocess per file.
+    pub skip_ember_subprocess: bool,
 }
 
 impl FileSystemScanner {
@@ -617,6 +622,7 @@ impl FileSystemScanner {
             enable_deep_scan,
             enable_yara,
             enable_hash_db: true,
+            skip_ember_subprocess: false,
         }
     }
 
@@ -639,6 +645,7 @@ impl FileSystemScanner {
             enable_deep_scan,
             enable_yara,
             enable_hash_db: true,
+            skip_ember_subprocess: false,
         }
     }
 
@@ -846,9 +853,10 @@ impl FileSystemScanner {
         };
 
         // ── Layer 4: Ember2024 ML (gated — Suspicious/Malicious only) ─────────
-        // Runs only on single-file scans so the Python subprocess cost does not
-        // degrade directory or system-wide scan throughput.
-        if level != ThreatLevel::Clean {
+        // Skipped when `skip_ember_subprocess` is set — the daemon manages a
+        // persistent EmberServer and applies Ember results after the scan
+        // returns, avoiding a per-file Python subprocess spawn.
+        if level != ThreatLevel::Clean && !self.skip_ember_subprocess {
             if let Some(ember) = run_ember_ml(path) {
                 all_signals.push(DetectionSignal::new(
                     "ember_ml",
@@ -1178,12 +1186,13 @@ impl FileSystemScanner {
     }
 
     #[allow(dead_code)] pub fn get_signatures_mut(&mut self) -> &mut SignatureDatabase { &mut self.signatures }
-    #[allow(dead_code)] pub fn set_deep_scan(&mut self, enabled: bool)  { self.enable_deep_scan = enabled; }
-    #[allow(dead_code)] pub fn set_multi_hash(&mut self, enabled: bool) { self.enable_multi_hash = enabled; }
-    #[allow(dead_code)] pub fn set_yara(&mut self, enabled: bool)       { self.enable_yara = enabled; }
-    #[allow(dead_code)] pub fn set_hash_db(&mut self, enabled: bool)    { self.enable_hash_db = enabled; }
-    #[allow(dead_code)] pub fn yara_rules_loaded(&self) -> usize        { self.yara.rules_loaded }
-    #[allow(dead_code)] pub fn yara_arc(&self) -> Arc<YaraEngine>       { Arc::clone(&self.yara) }
+    #[allow(dead_code)] pub fn set_deep_scan(&mut self, enabled: bool)        { self.enable_deep_scan = enabled; }
+    #[allow(dead_code)] pub fn set_multi_hash(&mut self, enabled: bool)       { self.enable_multi_hash = enabled; }
+    #[allow(dead_code)] pub fn set_yara(&mut self, enabled: bool)             { self.enable_yara = enabled; }
+    #[allow(dead_code)] pub fn set_hash_db(&mut self, enabled: bool)          { self.enable_hash_db = enabled; }
+    #[allow(dead_code)] pub fn set_skip_ember_subprocess(&mut self, skip: bool) { self.skip_ember_subprocess = skip; }
+    #[allow(dead_code)] pub fn yara_rules_loaded(&self) -> usize              { self.yara.rules_loaded }
+    #[allow(dead_code)] pub fn yara_arc(&self) -> Arc<YaraEngine>             { Arc::clone(&self.yara) }
 }
 
 impl Default for FileSystemScanner {

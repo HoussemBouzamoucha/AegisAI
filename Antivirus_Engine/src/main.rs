@@ -172,6 +172,9 @@ fn run_daemon() {
         crate::core::file_system::scanner::EmberServer::start();
     if ember_server.is_some() {
         eprintln!("DAEMON: Ember ML server starting (models loading in background)...");
+        // Suppress the per-file subprocess fallback in scan_file() — the daemon
+        // applies Ember centrally via analyze_batch after each scan.
+        scanner.skip_ember_subprocess = true;
     } else {
         eprintln!("DAEMON: Ember ML server unavailable — will use fallback batch mode");
     }
@@ -198,13 +201,13 @@ fn run_daemon() {
         let response = match cmd {
             "scan-file"      => {
                 let path = request["path"].as_str().unwrap_or("");
-                daemon_scan_file(&scanner, Path::new(path), &id)
+                daemon_scan_file(&scanner, Path::new(path), &id, &mut ember_server)
             }
-            "scan-all"       => daemon_scan_all(&system_scanner, &id),
-            "quick-scan"     => daemon_scan_all(&quick_scanner, &id),
+            "scan-all"       => daemon_scan_all(&system_scanner, &id, &mut ember_server),
+            "quick-scan"     => daemon_scan_all(&quick_scanner, &id, &mut ember_server),
             "scan-dir"       => {
                 let path = request["path"].as_str().unwrap_or("");
-                daemon_scan_dir(&scanner, Path::new(path), &id)
+                daemon_scan_dir(&scanner, Path::new(path), &id, &mut ember_server)
             }
             "scan-processes" => daemon_scan_processes(&process_scanner, &id),
             "scan-network"   => daemon_scan_network(
@@ -510,9 +513,119 @@ fn serialize_memory_region(r: &crate::core::memory::scanner::MemoryRegion) -> se
     })
 }
 
+// ─── Ember ML helpers ─────────────────────────────────────────────────────────
+
+use crate::core::file_system::scanner::EmberResult;
+use std::collections::HashMap;
+
+/// Run Ember ML on a single path via the persistent server.
+///
+/// (Re)starts the server if it has died.  Falls back to `run_ember_ml_batch`
+/// (one-shot subprocess) when the server cannot be started at all.
+/// Returns `None` when the file type is unsupported or inference failed.
+fn ember_one_path(
+    path:   &Path,
+    server: &mut Option<crate::core::file_system::scanner::EmberServer>,
+) -> Option<EmberResult> {
+    use crate::core::file_system::scanner::{EmberServer, run_ember_ml_batch};
+
+    // (Re)start server if absent or crashed.
+    if server.as_mut().map(|s| !s.is_alive()).unwrap_or(true) {
+        *server = EmberServer::start();
+    }
+
+    let results = match server.as_mut() {
+        Some(s) => {
+            let r = s.analyze_batch(&[path]);
+            if !s.is_alive() { *server = None; }
+            r
+        }
+        None => run_ember_ml_batch(&[path]),
+    };
+
+    results.into_iter().next().and_then(|(_, r)| r.ok())
+}
+
+/// Run Ember ML on every non-clean result in a scan batch.
+///
+/// Returns a map from path → `EmberResult` for all files where inference
+/// succeeded.  Clean files are skipped — Ember is only useful as a tiebreaker
+/// or escalation signal for files that already triggered YARA / heuristics.
+fn ember_batch_results(
+    results: &[crate::core::types::ScanResult],
+    server:  &mut Option<crate::core::file_system::scanner::EmberServer>,
+) -> HashMap<std::path::PathBuf, EmberResult> {
+    use crate::core::file_system::scanner::{EmberServer, run_ember_ml_batch};
+
+    let non_clean: Vec<&Path> = results.iter()
+        .filter(|r| r.level != crate::core::types::ThreatLevel::Clean)
+        .map(|r| r.path.as_path())
+        .collect();
+
+    if non_clean.is_empty() {
+        return HashMap::new();
+    }
+
+    eprintln!("EMBER: running ML on {} non-clean file(s)", non_clean.len());
+
+    // (Re)start server if absent or crashed.
+    if server.as_mut().map(|s| !s.is_alive()).unwrap_or(true) {
+        *server = EmberServer::start();
+        if server.is_none() {
+            eprintln!("EMBER SERVER: could not start, falling back to batch subprocess");
+        }
+    }
+
+    let batch_results = match server.as_mut() {
+        Some(s) => {
+            let r = s.analyze_batch(&non_clean);
+            if !s.is_alive() { *server = None; }
+            r
+        }
+        None => run_ember_ml_batch(&non_clean),
+    };
+
+    batch_results.into_iter()
+        .filter_map(|(path, res)| res.ok().map(|e| (path, e)))
+        .collect()
+}
+
+/// Merge an `EmberResult` (if any) into a serialized file JSON object.
+///
+/// Adds `ember_ml: {file_type, score, malicious}`.
+/// Escalates `level` from Suspicious → Malicious when Ember concurs.
+/// Blends `confidence_score` upward.
+fn enrich_with_ember(
+    mut v:      serde_json::Value,
+    result:     &crate::core::types::ScanResult,
+    ember_map:  &HashMap<std::path::PathBuf, EmberResult>,
+) -> serde_json::Value {
+    if let Some(ember) = ember_map.get(&result.path) {
+        v["ember_ml"] = json!({
+            "file_type": ember.file_type,
+            "score":     ember.score,
+            "malicious": ember.malicious,
+        });
+        if ember.malicious && result.level == crate::core::types::ThreatLevel::Suspicious {
+            v["level"]     = json!("Malicious");
+            v["is_threat"] = json!(true);
+        }
+        if let Some(cur) = v["confidence_score"].as_f64() {
+            let ember_conf = 0.60 + (ember.score as f64 * 0.35).min(0.35);
+            v["confidence_score"] = json!(cur.max(ember_conf));
+        }
+    }
+    v
+}
+
 // ─── Daemon handlers ──────────────────────────────────────────────────────────
 
-fn daemon_scan_file(scanner: &FileSystemScanner, path: &Path, id: &str) -> serde_json::Value {
+fn daemon_scan_file(
+    scanner: &FileSystemScanner,
+    path:    &Path,
+    id:      &str,
+    server:  &mut Option<crate::core::file_system::scanner::EmberServer>,
+) -> serde_json::Value {
     if !path.exists() {
         return json!({ "id": id, "error": "File does not exist" });
     }
@@ -521,18 +634,53 @@ fn daemon_scan_file(scanner: &FileSystemScanner, path: &Path, id: &str) -> serde
             let mut v = serialize_result(&result);
             v["id"]      = json!(id);
             v["success"] = json!(true);
+            // ── Ember ML enrichment ───────────────────────────────────────────
+            // Run the persistent server on this file if it is non-clean.
+            // `scan_file()` skips the subprocess path when `skip_ember_subprocess`
+            // is set, so Ember is applied here exactly once.
+            if result.level != crate::core::types::ThreatLevel::Clean {
+                if let Some(ember) = ember_one_path(path, server) {
+                    v["ember_ml"] = json!({
+                        "file_type": ember.file_type,
+                        "score":     ember.score,
+                        "malicious": ember.malicious,
+                    });
+                    // Escalate level when Ember agrees this is malicious.
+                    if ember.malicious && result.level == crate::core::types::ThreatLevel::Suspicious {
+                        v["level"]    = json!("Malicious");
+                        v["is_threat"] = json!(true);
+                    }
+                    // Blend Ember confidence upward.
+                    if let Some(cur) = v["confidence_score"].as_f64() {
+                        let ember_conf = 0.60 + (ember.score as f64 * 0.35).min(0.35);
+                        v["confidence_score"] = json!(cur.max(ember_conf));
+                    }
+                }
+            }
             v
         }
         Err(e) => json!({ "id": id, "success": false, "error": e.to_string() }),
     }
 }
 
-fn daemon_scan_dir(scanner: &FileSystemScanner, path: &Path, id: &str) -> serde_json::Value {
+fn daemon_scan_dir(
+    scanner: &FileSystemScanner,
+    path:    &Path,
+    id:      &str,
+    server:  &mut Option<crate::core::file_system::scanner::EmberServer>,
+) -> serde_json::Value {
     if !path.exists() {
         return json!({ "id": id, "error": "Directory does not exist" });
     }
     let (results, stats) = scanner.scan_directory_with_stats(path, true);
-    let files: Vec<serde_json::Value> = results.iter().map(serialize_result).collect();
+
+    // Batch Ember on all non-clean results using the persistent server.
+    let ember_map = ember_batch_results(&results, server);
+
+    let files: Vec<serde_json::Value> = results.iter()
+        .map(|r| enrich_with_ember(serialize_result(r), r, &ember_map))
+        .collect();
+
     json!({
         "id":      id,
         "success": true,
@@ -557,7 +705,11 @@ fn daemon_scan_dir(scanner: &FileSystemScanner, path: &Path, id: &str) -> serde_
 /// - Applies the incremental mtime+size cache — unchanged files from the last
 ///   scan are served instantly without re-reading disk.
 /// - Sorts the queue by risk score before dispatching, so threats surface first.
-fn daemon_scan_all(scanner: &SystemScanner, id: &str) -> serde_json::Value {
+fn daemon_scan_all(
+    scanner: &SystemScanner,
+    id:      &str,
+    server:  &mut Option<crate::core::file_system::scanner::EmberServer>,
+) -> serde_json::Value {
     eprintln!("DAEMON scan-all: starting system scan (thread pool + cache)");
 
     // Wrap in catch_unwind so a panic in the scan pipeline returns a JSON error
@@ -574,8 +726,13 @@ fn daemon_scan_all(scanner: &SystemScanner, id: &str) -> serde_json::Value {
         }
     };
 
+    // Batch Ember on all non-clean results.  The parallel scan workers use
+    // `scan_bytes_direct` which has no Ember layer; this post-scan pass adds
+    // ML scoring to every suspicious/malicious file in a single server round-trip.
+    let ember_map = ember_batch_results(&result.results, server);
+
     let files: Vec<serde_json::Value> = result.results.iter()
-        .map(serialize_result)
+        .map(|r| enrich_with_ember(serialize_result(r), r, &ember_map))
         .collect();
 
     let total_size_mb = result.stats.total_size_scanned as f64 / 1024.0 / 1024.0;
