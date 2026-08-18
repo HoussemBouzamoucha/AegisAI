@@ -20,7 +20,18 @@ Action thresholds (never recommend below these combined_score values):
   block_ip=0.60  quarantine_file=0.70  dump_memory=0.75  kill_process=0.65  check_persistence=0.50  isolate_network=0.85
 
 Ordering: reversible before irreversible → block_ip < quarantine_file < dump_memory < kill_process < isolate_network
-confirm_required=true for kill_process and isolate_network only.\
+confirm_required=true for kill_process and isolate_network only.
+
+technical_suggestions: 3–5 MITRE-mapped steps for the SOC analyst (human-in-the-loop; NOT automated commands).
+Each entry must include:
+  "keyword"   — short technical label using DFIR/SOC vocabulary (include MITRE ID inline if known),
+                e.g. "T1055 – Reflective DLL Injection", "T1003.001 – LSASS Credential Dump",
+                     "ETW Telemetry Gap – Kernel Callback Suppression"
+  "mitre_id"  — MITRE ATT&CK ID string or null
+  "reasoning" — one sentence: what specifically to investigate, which tool to use, and why it applies here
+  "priority"  — "critical" | "high" | "medium"
+Only emit technical_suggestions when there is real threat evidence (attack chains or Malicious entities).
+Empty list if risk_level is Low.\
 """
 
 # ─── Human message ────────────────────────────────────────────────────────────
@@ -33,9 +44,9 @@ CRITICAL PATH (score {cp_score:.2f}): {cp_narrative}
 MALICIOUS ENTITIES:
 {entities_text}
 
-IMPORTANT: If MALICIOUS ENTITIES is "none" and ATTACK CHAINS is 0, you MUST set ranked_actions=[] and risk_level="Low". A high critical-path score from clean/suspicious-only nodes does NOT justify any action.
-Otherwise respond with 1-5 ranked_actions (most reversible first) targeting only entities listed above.
-{{"ranked_actions":[{{"action":"...","target":"...","entity_id":"...","pid":null,"justification":"...","reversible":true,"min_score_met":true,"confirm_required":false}}],"rationale":"...","risk_level":"Low|Medium|High|Critical","confidence":0.0,"pivot_suggestions":["..."]}}\
+IMPORTANT: If MALICIOUS ENTITIES is "none" and ATTACK CHAINS is 0, you MUST set ranked_actions=[], technical_suggestions=[], and risk_level="Low". A high critical-path score from clean/suspicious-only nodes does NOT justify any action.
+Otherwise respond with 1-5 ranked_actions (most reversible first) targeting only entities listed above, plus 3-5 technical_suggestions for the SOC analyst.
+{{"ranked_actions":[{{"action":"...","target":"...","entity_id":"...","pid":null,"justification":"...","reversible":true,"min_score_met":true,"confirm_required":false}}],"rationale":"...","risk_level":"Low|Medium|High|Critical","confidence":0.0,"pivot_suggestions":["..."],"technical_suggestions":[{{"keyword":"T1055 – Process Injection","mitre_id":"T1055","reasoning":"...","priority":"high"}}]}}\
 """
 
 PROMPT = ChatPromptTemplate.from_messages([
@@ -59,7 +70,15 @@ Action thresholds (never recommend below these combined_score values):
   block_ip=0.60  quarantine_file=0.70  dump_memory=0.75  kill_process=0.65  check_persistence=0.50  isolate_network=0.85
 
 Ordering: reversible before irreversible → block_ip < quarantine_file < dump_memory < check_persistence < kill_process < isolate_network
-confirm_required=true for kill_process and isolate_network only.\
+confirm_required=true for kill_process and isolate_network only.
+
+technical_suggestions: Update these based on remaining threats. 3–5 MITRE-mapped steps for the SOC analyst.
+Each entry must include:
+  "keyword"   — short technical label (include MITRE ID inline), e.g. "T1021.002 – SMB Lateral Movement"
+  "mitre_id"  — MITRE ATT&CK ID or null
+  "reasoning" — one sentence: what specifically to investigate post-action, referencing what has changed
+  "priority"  — "critical" | "high" | "medium"
+Empty list if investigation_closed=true.\
 """
 
 REASSESS_HUMAN_TEMPLATE = """\
@@ -76,9 +95,9 @@ CRITICAL PATH (score {cp_score:.2f}): {cp_narrative}
 REMAINING MALICIOUS ENTITIES:
 {entities_text}
 
-IMPORTANT: If REMAINING MALICIOUS ENTITIES is "none" and ATTACK CHAINS is 0, you MUST set ranked_actions=[], risk_level="Low", and investigation_closed=true.
-Otherwise respond with 1-5 ranked_actions (most reversible first) targeting only entities listed above:
-{{"ranked_actions":[{{"action":"...","target":"...","entity_id":"...","pid":null,"justification":"...","reversible":true,"min_score_met":true,"confirm_required":false}}],"rationale":"...","risk_level":"Low|Medium|High|Critical","confidence":0.0,"pivot_suggestions":["..."],"investigation_closed":false,"close_reason":null,"round_num":{round_num}}}\
+IMPORTANT: If REMAINING MALICIOUS ENTITIES is "none" and ATTACK CHAINS is 0, you MUST set ranked_actions=[], technical_suggestions=[], risk_level="Low", and investigation_closed=true.
+Otherwise respond with 1-5 ranked_actions (most reversible first) targeting only entities listed above, plus updated technical_suggestions:
+{{"ranked_actions":[{{"action":"...","target":"...","entity_id":"...","pid":null,"justification":"...","reversible":true,"min_score_met":true,"confirm_required":false}}],"rationale":"...","risk_level":"Low|Medium|High|Critical","confidence":0.0,"pivot_suggestions":["..."],"technical_suggestions":[{{"keyword":"T1055 – Process Injection","mitre_id":"T1055","reasoning":"...","priority":"high"}}],"investigation_closed":false,"close_reason":null,"round_num":{round_num}}}\
 """
 
 REASSESS_PROMPT = ChatPromptTemplate.from_messages([

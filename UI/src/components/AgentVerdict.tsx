@@ -7,7 +7,7 @@
 import { useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../store';
-import type { RankedAction, ExecutedAction } from '../types';
+import type { RankedAction, ExecutedAction, TechnicalSuggestion } from '../types';
 
 // ─── Colour maps ──────────────────────────────────────────────────────────────
 
@@ -36,6 +36,12 @@ const ACTION_ICON: Record<string, string> = {
   check_persistence: '🔍',
   isolate_network:   '🔌',
   remove_block_ip:   '↩',
+};
+
+const PRIORITY_COLOR: Record<string, string> = {
+  critical: '#ff3355',
+  high:     '#ffb300',
+  medium:   '#00d4ff',
 };
 
 const CLOSE_REASON_LABEL: Record<string, string> = {
@@ -259,6 +265,87 @@ function ActionCard({
           {status === 'running' ? 'executing…' : status === 'error' ? 'RETRY' : 'EXECUTE'}
         </button>
       )}
+    </div>
+  );
+}
+
+// ─── Technical suggestion card ────────────────────────────────────────────────
+
+function TechnicalCard({ suggestion, index }: { suggestion: TechnicalSuggestion; index: number }) {
+  const color = PRIORITY_COLOR[suggestion.priority] ?? '#00d4ff';
+  return (
+    <div style={{
+      background: 'var(--elevated)',
+      border: `1px solid ${color}22`,
+      borderLeft: `3px solid ${color}`,
+      borderRadius: 6,
+      padding: '7px 10px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 4,
+    }}>
+      {/* Header row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        {/* Priority badge */}
+        <span style={{
+          fontFamily: 'var(--font-hud)',
+          fontSize: 7,
+          fontWeight: 700,
+          color,
+          background: `${color}18`,
+          border: `1px solid ${color}44`,
+          borderRadius: 3,
+          padding: '1px 5px',
+          textTransform: 'uppercase',
+          letterSpacing: '0.06em',
+          flexShrink: 0,
+        }}>
+          {suggestion.priority}
+        </span>
+        {/* MITRE ID chip */}
+        {suggestion.mitre_id && (
+          <span style={{
+            fontFamily: 'var(--font-mono)',
+            fontSize: 8,
+            color: '#a78bfa',
+            background: 'rgba(167,139,250,0.1)',
+            border: '1px solid rgba(167,139,250,0.25)',
+            borderRadius: 3,
+            padding: '1px 5px',
+            flexShrink: 0,
+          }}>
+            {suggestion.mitre_id}
+          </span>
+        )}
+        {/* Index */}
+        <span style={{
+          fontFamily: 'var(--font-hud)',
+          fontSize: 8,
+          color: 'var(--text-dim)',
+          marginLeft: 'auto',
+        }}>
+          #{index + 1}
+        </span>
+      </div>
+      {/* Keyword */}
+      <div style={{
+        fontFamily: 'var(--font-mono)',
+        fontSize: 9,
+        fontWeight: 700,
+        color: 'var(--text-bright)',
+        lineHeight: 1.3,
+      }}>
+        {suggestion.keyword}
+      </div>
+      {/* Reasoning */}
+      <div style={{
+        fontFamily: 'var(--font-mono)',
+        fontSize: 8.5,
+        color: 'var(--text-dim)',
+        lineHeight: 1.5,
+      }}>
+        {suggestion.reasoning}
+      </div>
     </div>
   );
 }
@@ -555,6 +642,24 @@ export function AgentVerdictPanel() {
                 ? 'No further actions recommended.'
                 : 'No containment actions recommended.'}
             </div>
+          )}
+
+          {/* Technical suggestions — SOC analyst playbook */}
+          {agentVerdict.technical_suggestions && agentVerdict.technical_suggestions.length > 0 && (
+            <>
+              <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
+              <div style={{
+                fontFamily: 'var(--font-hud)',
+                fontSize: 8,
+                color: 'var(--text-dim)',
+                letterSpacing: '0.08em',
+              }}>
+                TECHNICAL PLAYBOOK ({agentVerdict.technical_suggestions.length})
+              </div>
+              {agentVerdict.technical_suggestions.map((s, i) => (
+                <TechnicalCard key={i} suggestion={s} index={i} />
+              ))}
+            </>
           )}
 
           {/* Re-assess button — shown after any action executed and investigation not closed */}

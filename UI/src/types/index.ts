@@ -550,6 +550,21 @@ export interface ExecutedAction {
   pid:         number | null;
 }
 
+/**
+ * A MITRE-mapped, SOC-analyst-level investigative recommendation.
+ * These are human-in-the-loop steps (forensics, threat hunting, detection
+ * engineering) — NOT automated commands like ranked_actions.
+ */
+export interface TechnicalSuggestion {
+  /** Short technical label with DFIR/SOC vocabulary, MITRE ID inline when known */
+  keyword:   string;
+  /** MITRE ATT&CK technique ID, e.g. "T1055" or null */
+  mitre_id:  string | null;
+  /** One sentence for the analyst: what to look for, which tool, and why */
+  reasoning: string;
+  priority:  'critical' | 'high' | 'medium';
+}
+
 export interface AgentVerdict {
   /** 0–5 actions ordered from most reversible to least reversible */
   ranked_actions:    RankedAction[];
@@ -562,6 +577,8 @@ export interface AgentVerdict {
   pivot_suggestions: string[];
   /** Non-empty when the micro-loop hit its cap without resolving all rule violations */
   warnings:          string[];
+  /** 3–5 MITRE-mapped, SOC-analyst-level technical action suggestions */
+  technical_suggestions: TechnicalSuggestion[];
   // ── Level 2 fields ──────────────────────────────────────────────────────────
   /** True when the agent determines no further action is needed */
   investigation_closed: boolean;

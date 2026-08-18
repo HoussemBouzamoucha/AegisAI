@@ -12,6 +12,37 @@
 from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
+# ─── Technical suggestion (SOC analyst layer) ─────────────────────────────────
+
+class TechnicalSuggestion(BaseModel):
+    """
+    A MITRE-mapped, human-action recommendation for a SOC analyst.
+
+    Distinct from RankedAction (automation layer): these are investigative /
+    forensic steps that require a human analyst — threat hunting, log queries,
+    tooling suggestions, detection engineering.
+    """
+    keyword: str = Field(
+        description=(
+            "Short technical label using SOC/DFIR vocabulary, "
+            "e.g. 'T1055 – Reflective DLL Injection via VirtualAllocEx'"
+        )
+    )
+    mitre_id: Optional[str] = Field(
+        default=None,
+        description="MITRE ATT&CK ID, e.g. 'T1055' or 'T1547.001'"
+    )
+    reasoning: str = Field(
+        description=(
+            "One sentence for a SOC analyst: what to look for, "
+            "which tool or technique to apply, and why it matters here"
+        )
+    )
+    priority: Literal["critical", "high", "medium"] = Field(
+        default="medium",
+        description="Analyst priority: critical | high | medium"
+    )
+
 
 # ─── Hardcoded action metadata ────────────────────────────────────────────────
 
@@ -123,6 +154,17 @@ class AgentVerdict(BaseModel):
     pivot_suggestions: list[str] = Field(
         default_factory=list,
         description="0–3 one-sentence suggestions for targeted follow-up scans"
+    )
+    technical_suggestions: list[TechnicalSuggestion] = Field(
+        default_factory=list,
+        description=(
+            "3–5 MITRE-mapped, SOC-analyst-level technical action suggestions. "
+            "Each entry names a specific investigative technique (with ATT&CK ID), "
+            "explains why it applies to this incident in one sentence, "
+            "and is prioritised critical|high|medium. "
+            "These are human-analyst steps (forensics, threat hunting, detection "
+            "engineering) — not automated commands."
+        )
     )
     warnings: list[str] = Field(
         default_factory=list,
