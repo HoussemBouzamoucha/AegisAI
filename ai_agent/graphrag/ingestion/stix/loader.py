@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 from config.logging import get_logger
-from .config.settings import settings
+from config.settings import settings
 
 logger = get_logger(__name__)
 
