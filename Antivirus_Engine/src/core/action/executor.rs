@@ -102,6 +102,7 @@ pub fn quarantine_file(path: &str) -> QuarantineResult {
     }
 
     // 1. Hash the file before moving it.
+    
     let sha256 = match file_sha256(src) {
         Ok(h)  => h,
         Err(e) => return QuarantineResult {
